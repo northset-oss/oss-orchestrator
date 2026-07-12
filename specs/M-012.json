@@ -1,0 +1,41 @@
+{
+  "mission_id": "M-012",
+  "candidate": "nodejs/doc-kit#897",
+  "target_repo": "https://github.com/nodejs/doc-kit",
+  "issue_url": "https://github.com/nodejs/doc-kit/issues/897",
+  "base_commit": "11d012a9956fc778a024a37488f0783e4b1cf90f",
+  "code_prompt": "doc-kit (@node-core/doc-kit) currently loads a config file only when the user passes --config-file: in src/utils/configuration/index.mjs, loadConfigFile(filePath) returns importFromURL(filePath) when a path is given and {} otherwise, and createRunConfiguration calls loadConfigFile(options.configFile). Issue #897 (labeled 'good first issue') asks it to ALSO auto-detect a `doc-kit.config.mjs` file in the current working directory when no --config-file is provided — a tight, dependency-free happy path. Do NOT add cosmiconfig, auto-config-loader, or ANY new dependency. Requirements: (1) When options.configFile is provided, use it exactly as today — an explicit config path always wins. (2) When options.configFile is NOT provided, look for `doc-kit.config.mjs` in process.cwd(); if it exists, load it through the existing importFromURL loader; if it does not exist, keep today's behavior (an empty {} config). (3) Preserve the existing loadConfigFile contract so the current 'should return empty object for falsy paths' test still passes — put the cwd auto-detection where it does not break that test (e.g. resolve the effective path in createRunConfiguration before calling loadConfigFile, rather than changing loadConfigFile's falsy handling). Add unit tests in src/utils/configuration/__tests__/index.test.mjs in the SAME style as the existing tests (node:test with mock.module and the --experimental-test-module-mocks flag): assert that (a) a present doc-kit.config.mjs is auto-detected and loaded when no configFile is given, (b) an explicit configFile still takes precedence over an auto-detected file, and (c) when neither is present the config falls back to empty. Mock node:fs (existence check) and ../../loaders.mjs importFromURL — do not touch the real filesystem or the network in tests. Follow the repo's ESM conventions and existing code style, and keep the JSDoc accurate. If the repo uses changesets (.changeset/ directory), add one minimal changeset entry describing the change. Make the MINIMAL focused change; do not touch unrelated files and do not change version numbers. IMPORTANT: if automatic doc-kit.config.mjs detection is already implemented on the current tree, leave it unmodified and say so. TEST-ENV PITFALL (must handle): this configuration module graph transitively imports @actions/core, whose summary.js does `import { constants, promises } from 'fs'`. If your test mocks node:fs, you MUST preserve the real fs exports and override ONLY existsSync — e.g. `import * as nodeFs from 'node:fs'` at the top, then `mock.module('node:fs', { namedExports: { ...nodeFs, existsSync: mockExistsSync } })`. A narrow fs mock (existsSync only) crashes the whole suite with \"The requested module 'fs' does not provide an export named 'constants'\". Verify the config test file runs green under exactly: node --test --experimental-test-module-mocks src/utils/configuration/__tests__/index.test.mjs",
+  "executor": {
+    "image": "node:22-bookworm",
+    "install_commands": [
+      "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm_config_cache=/workspace/.npmcache npm ci --no-audit --no-fund --loglevel=error"
+    ],
+    "commands": [
+      "node --test --experimental-test-module-mocks src/utils/configuration/__tests__/index.test.mjs"
+    ],
+    "limits": {
+      "cpus": 4,
+      "memory_mb": 4096,
+      "pids": 1024,
+      "wall_clock_seconds_per_command": 1800,
+      "output_bytes_per_stream": 2000000
+    }
+  },
+  "receipt": {
+    "external_counterparty": "nodejs/doc-kit maintainers",
+    "repo_policy_snapshot": {
+      "url": "https://github.com/nodejs/doc-kit/blob/main/CONTRIBUTING.md",
+      "checked_at": "2026-07-12T00:00:00Z",
+      "ai_policy_summary": "MIT license under the Node.js org. Commits require a DCO Signed-off-by trailer. Project uses changesets for versioning and node:test as the check gate; follow CONTRIBUTING for PR conventions."
+    },
+    "commands_declared": [
+      "node --test --experimental-test-module-mocks src/utils/configuration/__tests__/index.test.mjs"
+    ],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification.",
+      "The declared network-off check runs only the configuration unit test (src/utils/configuration/__tests__/index.test.mjs) on node:22 after a disclosed online npm ci. It does not run the full test suite, eslint, prettier, or the TypeScript/JSDoc type-check gates that upstream CI also runs."
+    ]
+  }
+}

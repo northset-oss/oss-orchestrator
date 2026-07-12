@@ -5,8 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  assertOssCommitIdentity,
   codexConfigText,
   manualShipLines,
+  OSS_IDENTITY,
   parseArgs,
   prepareMissionDir,
   resultExitCode,
@@ -132,6 +134,25 @@ test('Codex profile denies host reads and disables integrations and network', ()
   assert.doesNotMatch(text, /":tmpdir" = "deny"/);
   assert.match(text, /":slash_tmp" = "deny"/);
   assert.doesNotMatch(text, /sandbox_mode/);
+});
+
+test('OSS commit identity is the enforced single source of truth', () => {
+  assert.equal(OSS_IDENTITY.email, 'aeziz@northset.ai');
+  assert.equal(OSS_IDENTITY.name, 'Aysajan Eziz');
+});
+
+test('assertOssCommitIdentity fails closed on the host identity or a missing DCO sign-off', () => {
+  const good = {
+    authorEmail: 'aeziz@northset.ai',
+    committerEmail: 'aeziz@northset.ai',
+    body: 'Signed-off-by: Aysajan Eziz <aeziz@northset.ai>',
+  };
+  assert.doesNotThrow(() => assertOssCommitIdentity(good));
+  // the exact recurring bug: the clone inherited the host's personal gmail identity
+  assert.throws(() => assertOssCommitIdentity({ ...good, authorEmail: 'aysajan1986@gmail.com' }), /identity must be aeziz@northset\.ai/);
+  assert.throws(() => assertOssCommitIdentity({ ...good, committerEmail: 'aysajan1986@gmail.com' }), /identity must be aeziz@northset\.ai/);
+  // committed without -s
+  assert.throws(() => assertOssCommitIdentity({ ...good, body: '' }), /DCO sign-off/);
 });
 
 test('--receipt selects the ship pass and refuses flags that would corrupt a scanned mission', () => {
