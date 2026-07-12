@@ -105,6 +105,13 @@ ships UNREVIEWED code to a real maintainer while both gates report OK (fires on 
 12. **Clarify red-first = out-of-band owner verification, NOT a receipt gate** (receipt attests the
     green run only; executor can't capture red). (M5)
 13. **Candidate uniqueness enforced at insert; INV-3 counts OUR OWN same-account PR as skip.** (M4)
+    **+ Recheck MUST scan the issue-timeline cross-references for prior CLOSED competing PRs, not
+    just an open-PR text search.** REAL 2026-07-12 miss (A-003): prettier#19588 had an identical
+    prior PR #19589 (paranoa233, "Fixes #19588") closed the day before; our open-PR-only check read
+    "0 prior PRs" (wrong) and we contributed a duplicate that core maintainer @fisker silently
+    closed in 30 min. A silently-closed identical external fix = strong SKIP-or-ASK signal
+    (maintainer likely owns/reworks the issue). The thorough timeline check (used for blockly#2510)
+    must be applied to EVERY candidate, including clean-looking ones (0 comments ≠ no history).
 14. **Base-SHA freshness TTL** — bind + check target base before auth/open; base moved → back to
     verify (+ owner review if material). (Codex#15)
 15. **Track detached Codex subprocess/session for resume** (no double-spawn). (M8)
