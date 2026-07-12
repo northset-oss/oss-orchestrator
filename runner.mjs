@@ -163,7 +163,7 @@ function run(cmd, args, { cwd, env, input, logPath, label } = {}) {
 }
 function sha256(buf) { return 'sha256:' + createHash('sha256').update(buf).digest('hex'); }
 
-function parseCandidate(value) {
+export function parseCandidate(value) {
   const m = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/.exec(value ?? '');
   if (!m) throw new Error(`invalid candidate ${JSON.stringify(value)}; expected owner/repo#123`);
   return {owner: m[1], repo: m[2], issue: Number(m[3])};
@@ -279,7 +279,7 @@ export function timelineCrossReferences(pages) {
 }
 
 // bounded-concurrency pool
-async function pool(items, limit, worker) {
+export async function pool(items, limit, worker) {
   const results = new Array(items.length);
   let next = 0;
   async function lane() {
@@ -295,7 +295,7 @@ async function pool(items, limit, worker) {
 // ---------------------------------------------------------------- mission steps
 // Each step throws on a hard failure; the driver catches and records a status.
 
-async function recheck(spec, log) {
+export async function recheck(spec, log) {
   const {owner, repo, issue: num} = parseCandidate(spec.candidate);
   const issue = await ghJson(['api', `repos/${owner}/${repo}/issues/${num}`,
     '--jq', '{number,state,title,html_url,assignee:.assignee.login,labels:[.labels[].name],created_at,updated_at,body}']);
