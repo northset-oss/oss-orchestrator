@@ -1,0 +1,42 @@
+{
+  "mission_id": "M-011",
+  "candidate": "prometheus/client_js#539",
+  "target_repo": "https://github.com/prometheus/client_js",
+  "issue_url": "https://github.com/prometheus/client_js/issues/539",
+  "base_commit": "c51c2cd36f6a14e32fa305a164ccded7c250612a",
+  "code_prompt": "prom-client's cluster metrics aggregation (lib/metricAggregators.js and lib/cluster.js) aggregates values in the order workers respond to the GET_METRICS_REQ message. Because floating-point addition is not associative, summing the same histogram/counter values in different orders yields slightly different results (e.g. 1.4765105 vs 1.4765104999999998), which can trigger a false 'reset' detection in Prometheus and corrupt graphs. Make the aggregation DETERMINISTIC: aggregate per-metric sample contributions in a stable, canonical order that does not depend on worker response order (e.g. sort the contributions by a stable key such as label-set/metric name before summing), so the aggregated result is identical regardless of the order in which workers respond. Add a jest test (in test/aggregatorsTest.js or test/clusterTest.js) that aggregates the same set of values presented in two DIFFERENT orders and asserts the two aggregated results are strictly equal. Keep the change minimal and follow the repo's existing conventions and code style. IMPORTANT: if aggregation is already order-independent on current main, do not force a change — leave the tree unmodified and say so.",
+  "executor": {
+    "image": "node:22-bookworm",
+    "install_commands": [
+      "npm_config_cache=/workspace/.npmcache npm install --no-audit --no-fund --loglevel=error",
+      "npm run test-unit"
+    ],
+    "commands": [
+      "npm run test-unit"
+    ],
+    "limits": {
+      "cpus": 4,
+      "memory_mb": 4096,
+      "pids": 1024,
+      "wall_clock_seconds_per_command": 1800,
+      "output_bytes_per_stream": 2000000
+    }
+  },
+  "receipt": {
+    "external_counterparty": "prometheus/client_js maintainers",
+    "repo_policy_snapshot": {
+      "url": "https://github.com/prometheus/client_js/blob/main/CONTRIBUTING.md",
+      "checked_at": "2026-07-12T00:00:00Z",
+      "ai_policy_summary": "Apache-2.0. Prometheus projects require DCO sign-off (Signed-off-by) on commits. Follow CONTRIBUTING for PR conventions; jest unit tests are the check gate."
+    },
+    "commands_declared": [
+      "npm run test-unit"
+    ],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification.",
+      "The declared network-off check runs the prom-client jest unit suite on node:22 after a disclosed online phase-A npm ci. It does not run lint, prettier, or the TypeScript type-check gates that upstream CI also runs."
+    ]
+  }
+}

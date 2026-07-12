@@ -1,0 +1,43 @@
+{
+  "_comment": "LEAN mission spec. Copy to specs/M-0NN.json (drop the .example) and fill for a real candidate. The runner: rechecks the issue -> clones at base_commit -> Codex codes from code_prompt -> verify+build receipt locally. It STOPS before any push/fork/PR. Values below are the real M-009 prettier mission, shown as a worked example.",
+  "mission_id": "M-010",
+  "candidate": "prettier/prettier#19588",
+  "target_repo": "https://github.com/prettier/prettier",
+  "issue_url": "https://github.com/prettier/prettier/issues/19588",
+  "base_commit": "41a8b99bb8d7d68c00d90d5b8fbaed20511d4cfd",
+  "code_prompt": "Markdown formatting is not idempotent for an escaped semicolon guarding an HTML entity in a link URL: `[test](/hello?foo&quot\\;bar)` loses its backslash on the second pass and resolves as an entity. Preserve the escaped form so formatting is idempotent. Add a regression fixture under tests/format/markdown and a changelog_unreleased entry per CONTRIBUTING.",
+  "executor": {
+    "image": "node:22-bookworm",
+    "install_commands": [
+      "node .yarn/releases/yarn-4.17.1.cjs install",
+      "node .yarn/releases/yarn-4.17.1.cjs jest tests/format/markdown"
+    ],
+    "commands": [
+      "node .yarn/releases/yarn-4.17.1.cjs jest tests/format/markdown"
+    ],
+    "limits": {
+      "cpus": 4,
+      "memory_mb": 6144,
+      "pids": 2048,
+      "wall_clock_seconds_per_command": 1800,
+      "output_bytes_per_stream": 4000000
+    }
+  },
+  "receipt": {
+    "external_counterparty": "prettier/prettier maintainers",
+    "repo_policy_snapshot": {
+      "url": "https://github.com/prettier/prettier/blob/main/CONTRIBUTING.md",
+      "checked_at": "2026-07-12T02:30:00Z",
+      "ai_policy_summary": "No CLA or DCO required (MIT). CONTRIBUTING requires updating Jest snapshots and adding a changelog_unreleased entry. CI: yarn test (multiple Node), yarn lint (ESLint, TS typecheck, prettier self-check, changelog lint)."
+    },
+    "commands_declared": [
+      "node .yarn/releases/yarn-4.17.1.cjs jest tests/format/markdown"
+    ],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification.",
+      "The declared network-off check runs Prettier's Markdown Jest suite on Node 22 via the vendored Yarn, after a disclosed online phase-A install. It does not run the full repo test/lint matrix."
+    ]
+  }
+}

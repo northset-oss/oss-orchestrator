@@ -1,0 +1,42 @@
+{
+  "mission_id": "M-010",
+  "candidate": "clap-rs/clap#3360",
+  "target_repo": "https://github.com/clap-rs/clap",
+  "issue_url": "https://github.com/clap-rs/clap/issues/3360",
+  "base_commit": "4a35e3bcabf7b6326e646f88ef9cf312ac0fa2da",
+  "code_prompt": "clap_mangen (the man-page generator) does not render the per-value help text of an argument's PossibleValues in the generated man page — those help strings currently only appear in shell completions, not in `man`. Add rendering of each possible value's help to the man-page output for arguments that have possible values, using clap v4's CURRENT PossibleValue API (e.g. PossibleValue::get_name() and get_help()); do not hide values marked hidden. Follow the existing man-rendering conventions in clap_mangen/src/render.rs. Add or update a clap_mangen snapshot/golden test (clap_mangen/tests) that includes an argument whose possible values carry help text, so the test fails before your change and passes after. IMPORTANT: reconfirm the current v4 PossibleValue/Command API before coding; if rendering possible-value help is ALREADY implemented on current main, do not force a change — leave the tree unmodified and say so.",
+  "executor": {
+    "image": "rust:1-bookworm",
+    "install_commands": [
+      "CARGO_HOME=/workspace/.cargo cargo fetch",
+      "CARGO_HOME=/workspace/.cargo cargo test -p clap_mangen"
+    ],
+    "commands": [
+      "CARGO_HOME=/workspace/.cargo cargo test -p clap_mangen --offline"
+    ],
+    "limits": {
+      "cpus": 4,
+      "memory_mb": 6144,
+      "pids": 2048,
+      "wall_clock_seconds_per_command": 1800,
+      "output_bytes_per_stream": 4000000
+    }
+  },
+  "receipt": {
+    "external_counterparty": "clap-rs/clap maintainers",
+    "repo_policy_snapshot": {
+      "url": "https://github.com/clap-rs/clap/blob/master/CONTRIBUTING.md",
+      "checked_at": "2026-07-12T00:00:00Z",
+      "ai_policy_summary": "MIT/Apache-2.0 dual license. Check CONTRIBUTING for commit/PR conventions and whether man snapshots are regenerated via a documented command."
+    },
+    "commands_declared": [
+      "CARGO_HOME=/workspace/.cargo cargo test -p clap_mangen --offline"
+    ],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification.",
+      "The declared network-off check runs the clap_mangen test package on a rust:1-bookworm toolchain after a disclosed online phase-A fetch/build. It does not run clap's full workspace test/lint matrix."
+    ]
+  }
+}
