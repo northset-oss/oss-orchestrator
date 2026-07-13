@@ -5,37 +5,19 @@
 //
 // This is owner-built live integration (gh/git/docker/northset-oss) — Codex cannot run these to test.
 
-import {spawn} from 'node:child_process';
-import {createHash} from 'node:crypto';
 import {cp, mkdir, readFile, rm, stat, writeFile} from 'node:fs/promises';
 import path from 'node:path';
-import {OSS_IDENTITY, parseCandidate} from './runner.mjs';
+import {
+  OSS_IDENTITY, assertOssCommitIdentity, canonical, git, manifestDigest, parseCandidate, prBody, run,
+  sha256,
+} from './core.mjs';
 
 const NORTHSET_OSS = '/Users/aeziz-local/northset-oss';
 const VERIFICATION_REPO = 'northset-oss/verification-pilot';
 const FORK_OWNER = 'AysajanE';
 
-function exec(cmd, args, {cwd, input, timeoutMs, env} = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, {cwd, env: env ?? process.env, stdio: ['pipe', 'pipe', 'pipe']});
-    let out = '', err = '';
-    const timer = timeoutMs ? setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, timeoutMs) : null;
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
-    child.on('close', (code) => { if (timer) clearTimeout(timer); resolve({code, stdout: out, stderr: err}); });
-    child.on('error', (e) => { if (timer) clearTimeout(timer); resolve({code: 127, stdout: out, stderr: `${err}\n${e.message}`}); });
-    if (input !== undefined) { child.stdin.write(input); child.stdin.end(); }
-  });
-}
-const git = (cwd, ...a) => exec('git', ['-C', cwd, ...a]);
 async function exists(p) { try { await stat(p); return true; } catch { return false; } }
 async function must(label, r) { if (r.code !== 0) throw new Error(`${label} failed: ${(r.stderr || r.stdout).trim().split('\n').slice(-3).join(' ')}`); return r; }
-const sha256 = (buf) => `sha256:${createHash('sha256').update(buf).digest('hex')}`;
-function canonical(v) {
-  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
-  if (v && typeof v === 'object') return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`;
-  return JSON.stringify(v);
-}
 
 // Resumable journal: records which irreversible steps already succeeded so a re-run never repeats them.
 async function loadJournal(file) { try { return JSON.parse(await readFile(file, 'utf8')); } catch { return {}; } }
@@ -77,14 +59,14 @@ function missionInput(spec, receipt, dirs) {
 async function buildAttestableReceipt(spec, receipt, authorRepo, dirs, log) {
   await rm(dirs.executorBase, {recursive: true, force: true});
   await rm(dirs.staging, {recursive: true, force: true});
-  await must('clone executor-base', await exec('git', ['clone', '--local', '--no-hardlinks', authorRepo, dirs.executorBase]));
+  await must('clone executor-base', await run('git', ['clone', '--local', '--no-hardlinks', authorRepo, dirs.executorBase]));
   await must('checkout base', await git(dirs.executorBase, 'checkout', '--detach', spec.base_commit));
   await git(dirs.executorBase, 'reset', '--hard', spec.base_commit);
-  await exec('git', ['-C', dirs.executorBase, 'clean', '-ffdx']);
+  await run('git', ['-C', dirs.executorBase, 'clean', '-ffdx']);
   await rm(path.join(dirs.executorBase, '.git', 'hooks'), {recursive: true, force: true}).catch(() => {});
   await writeFile(dirs.input, JSON.stringify(missionInput(spec, receipt, dirs), null, 2));
   await log('building attestable receipt (northset-oss run-mission.mjs; Docker; --require-success)…');
-  const r = await exec('node', [path.join(NORTHSET_OSS, 'bin', 'run-mission.mjs'), dirs.input,
+  const r = await run('node', [path.join(NORTHSET_OSS, 'bin', 'run-mission.mjs'), dirs.input,
     '--missions-dir', dirs.staging, '--require-success', '--json'], {timeoutMs: 30 * 60 * 1000});
   let parsed = null; try { parsed = JSON.parse(r.stdout); } catch {}
   if (r.code !== 0 || !parsed?.ok) throw new Error(`receipt build failed: ${parsed?.message ?? r.stderr.trim().split('\n').slice(-2).join(' ')}`);
@@ -94,11 +76,11 @@ async function buildAttestableReceipt(spec, receipt, authorRepo, dirs, log) {
 // Add the built mission to northset-oss, push (triggers attest CI), wait, verify, record the attestation.
 async function publishToLedger(spec, built, dirs, journal, jfile, log) {
   const id = spec.mission_id;
-  const oss = (...a) => exec('git', ['-C', NORTHSET_OSS, ...a]);
+  const oss = (...a) => run('git', ['-C', NORTHSET_OSS, ...a]);
   const now = '2026-07-13T00:00:00Z';
   const rebuild = async () => {
-    await must('ledger build', await exec('node', [path.join(NORTHSET_OSS, 'bin', 'ledger.mjs'), 'build', '--missions-dir', 'missions', '--out', 'missions/index.json', '--now', now], {cwd: NORTHSET_OSS}));
-    await must('ledger render', await exec('node', [path.join(NORTHSET_OSS, 'bin', 'ledger.mjs'), 'render', '--index', 'missions/index.json', '--out', 'site/index.html', '--now', now], {cwd: NORTHSET_OSS}));
+    await must('ledger build', await run('node', [path.join(NORTHSET_OSS, 'bin', 'ledger.mjs'), 'build', '--missions-dir', 'missions', '--out', 'missions/index.json', '--now', now], {cwd: NORTHSET_OSS}));
+    await must('ledger render', await run('node', [path.join(NORTHSET_OSS, 'bin', 'ledger.mjs'), 'render', '--index', 'missions/index.json', '--out', 'site/index.html', '--now', now], {cwd: NORTHSET_OSS}));
   };
   if (!journal.mission_pushed) {
     await must('sync northset-oss', await oss('pull', '--ff-only'));
@@ -117,7 +99,7 @@ async function publishToLedger(spec, built, dirs, journal, jfile, log) {
   if (!journal.attested) {
     await log('waiting for attest-bundle CI…');
     const runId = await pollRunFor(headSha, log);
-    await must('attest CI', {code: (await exec('gh', ['run', 'view', String(runId), '--repo', VERIFICATION_REPO, '--json', 'conclusion', '--jq', '.conclusion==\"success\"'])).stdout.trim() === 'true' ? 0 : 1, stdout: '', stderr: 'attest CI did not succeed'});
+    await must('attest CI', {code: (await run('gh', ['run', 'view', String(runId), '--repo', VERIFICATION_REPO, '--json', 'conclusion', '--jq', '.conclusion==\"success\"'])).stdout.trim() === 'true' ? 0 : 1, stdout: '', stderr: 'attest CI did not succeed'});
     journal.attested = true; await saveJournal(jfile, journal);
   }
   if (!journal.ledger_recorded) {
@@ -137,7 +119,7 @@ async function publishToLedger(spec, built, dirs, journal, jfile, log) {
 
 async function pollRunFor(headSha, log) {
   for (let i = 0; i < 60; i++) {
-    const r = await exec('gh', ['run', 'list', '--repo', VERIFICATION_REPO, '--workflow', 'attest-bundle.yml', '--limit', '5',
+    const r = await run('gh', ['run', 'list', '--repo', VERIFICATION_REPO, '--workflow', 'attest-bundle.yml', '--limit', '5',
       '--json', 'databaseId,status,conclusion,headSha', '--jq', `.[] | select(.headSha==\"${headSha}\")`]);
     const line = r.stdout.trim().split('\n').filter(Boolean)[0];
     if (line) {
@@ -154,27 +136,27 @@ async function forkPushPR(spec, receipt, authorRepo, prBodyFile, journal, jfile,
   const branch = `northset/${spec.mission_id}`;
   const commit = receipt.commit_oid;
   if (!journal.forked) {
-    if ((await exec('gh', ['repo', 'view', `${FORK_OWNER}/${repo}`, '--json', 'name'])).code !== 0) {
-      await must('fork', await exec('gh', ['repo', 'fork', `${owner}/${repo}`, '--clone=false', '--default-branch-only']));
-      for (let i = 0; i < 8 && (await exec('gh', ['repo', 'view', `${FORK_OWNER}/${repo}`, '--json', 'name'])).code !== 0; i++) await new Promise((r) => setTimeout(r, 3000));
+    if ((await run('gh', ['repo', 'view', `${FORK_OWNER}/${repo}`, '--json', 'name'])).code !== 0) {
+      await must('fork', await run('gh', ['repo', 'fork', `${owner}/${repo}`, '--clone=false', '--default-branch-only']));
+      for (let i = 0; i < 8 && (await run('gh', ['repo', 'view', `${FORK_OWNER}/${repo}`, '--json', 'name'])).code !== 0; i++) await new Promise((r) => setTimeout(r, 3000));
     }
     journal.forked = true; await saveJournal(jfile, journal);
   }
   if (!journal.pushed) {
     await git(authorRepo, 'remote', 'get-url', 'fork').then((r) => r.code === 0 ? null : git(authorRepo, 'remote', 'add', 'fork', `https://github.com/${FORK_OWNER}/${repo}.git`));
     await must('push fork', await git(authorRepo, 'push', 'fork', `${commit}:refs/heads/${branch}`));
-    const forkSha = (await exec('gh', ['api', `repos/${FORK_OWNER}/${repo}/git/refs/heads/${branch}`, '--jq', '.object.sha'])).stdout.trim();
+    const forkSha = (await run('gh', ['api', `repos/${FORK_OWNER}/${repo}/git/refs/heads/${branch}`, '--jq', '.object.sha'])).stdout.trim();
     if (forkSha !== commit) throw new Error(`fork branch OID ${forkSha} != reviewed ${commit}`);
     journal.pushed = true; await saveJournal(jfile, journal);
     await log(`pushed reviewed commit ${commit.slice(0, 12)} to ${FORK_OWNER}:${branch}`);
   }
   if (!journal.pr_opened) {
-    const base = (await exec('gh', ['api', `repos/${owner}/${repo}`, '--jq', '.default_branch'])).stdout.trim();
+    const base = (await run('gh', ['api', `repos/${owner}/${repo}`, '--jq', '.default_branch'])).stdout.trim();
     const title = await prTitle(spec, path.dirname(prBodyFile)); // exact title bound by the manifest
-    const created = await must('pr create', await exec('gh', ['pr', 'create', '--repo', `${owner}/${repo}`, '--base', base,
+    const created = await must('pr create', await run('gh', ['pr', 'create', '--repo', `${owner}/${repo}`, '--base', base,
       '--head', `${FORK_OWNER}:${branch}`, '--title', title, '--body-file', prBodyFile]));
     const url = created.stdout.trim().split('\n').filter((l) => l.startsWith('http')).pop();
-    const view = JSON.parse((await must('pr view', await exec('gh', ['pr', 'view', url, '--repo', `${owner}/${repo}`, '--json', 'number,headRefOid,body,url'])).then((r) => r)).stdout);
+    const view = JSON.parse((await must('pr view', await run('gh', ['pr', 'view', url, '--repo', `${owner}/${repo}`, '--json', 'number,headRefOid,body,url'])).then((r) => r)).stdout);
     if (view.headRefOid !== commit) throw new Error(`opened PR head ${view.headRefOid} != reviewed ${commit}`);
     if (!view.body.includes('northset-oss.github.io/verification-pilot')) throw new Error('opened PR body is missing the receipt footer');
     journal.pr_opened = true; journal.pr_url = view.url; await saveJournal(jfile, journal);
@@ -197,7 +179,7 @@ async function manifestOf(spec, ready) {
     receipt_subject: receipt, pr_title: await prTitle(spec, ready), pr_body: await readFile(path.join(ready, 'pr_body.md'), 'utf8'),
     repo: receipt.repo, planned_actions: ['fork', 'push', 'attest', 'open-pr', 'append-ledger'],
   };
-  return {receipt, manifest: sha256(Buffer.from(canonical([subject])))};
+  return {receipt, manifest: manifestDigest([subject])};
 }
 
 // Entry point. missionDir = the prepared runs/<id> dir (has ready-pack/ + author-workspace/repo).

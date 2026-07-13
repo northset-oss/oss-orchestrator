@@ -1,0 +1,23 @@
+{
+  "mission_id": "M-015",
+  "candidate": "prometheus/client_js#582",
+  "target_repo": "https://github.com/prometheus/client_js",
+  "issue_url": "https://github.com/prometheus/client_js/issues/582",
+  "base_commit": "7c54cc43cc5443e79d92ff4b9b732c2b091b6517",
+  "code_prompt": "prom-client accepts an array of strings as a label value at runtime (e.g. a `handler` label rendered as `handler=\"/a,/b\"`), but its TypeScript types reject it: the label-values type only allows `string | number`, so `.inc({ handler: ['/a', '/b'] })` fails to type-check even though it works at runtime (issue #582). Fix the label-value typing in `index.d.ts` so a label value may also be a string array (keep `string | number` and add the array form) — mirror however prom-client actually stringifies arrays; do not broaden the type more than needed. Add a case to `test/typescript.ts` that uses an array-valued label so `tsc --project .` proves the type now accepts it. Keep the change minimal and backward-compatible; do not change runtime behavior or version numbers. Run `npm run compile-typescript && npm run test-unit` and iterate until both pass.",
+  "executor": {
+    "image": "node:22-bookworm",
+    "install_commands": [
+      "npm_config_cache=/workspace/.npmcache npm install --no-audit --no-fund --loglevel=error"
+    ],
+    "commands": [
+      "npm run compile-typescript && npm run test-unit"
+    ],
+    "limits": {
+      "cpus": 4,
+      "memory_mb": 4096,
+      "pids": 1024,
+      "wall_clock_seconds_per_command": 1800
+    }
+  }
+}

@@ -1,15 +1,14 @@
 #!/usr/bin/env node
-// OSS orchestrator v2 — increment 1. `prepare` plans/runs the author + verifier boundary and stops
-// at one content-bound review board. `ship` deliberately remains an increment-2 stub.
+// Canonical OSS orchestrator. `prepare` runs the author + fresh verifier boundary and stops at one
+// content-bound review board; `ship` takes an explicitly approved ready-pack to ledger + PR.
 
-import {createHash} from 'node:crypto';
-import {spawn} from 'node:child_process';
 import {appendFile, cp, mkdir, readFile, readdir, rm, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {
-  OSS_IDENTITY, assertOssCommitIdentity, parseCandidate, pool, prBody, recheck, validateSpecs,
-} from './runner.mjs';
+  OSS_IDENTITY, assertOssCommitIdentity, canonical, git, manifestDigest, parseCandidate, pool, prBody,
+  recheck, run, sha256, validateSpecs,
+} from './core.mjs';
 
 const OSS_FILE = fileURLToPath(import.meta.url);
 const HERE = path.dirname(OSS_FILE);
@@ -22,18 +21,6 @@ const DEFAULTS = {
   only: null,
   dryRun: false,
 };
-
-function sha256(value) {
-  return `sha256:${createHash('sha256').update(value).digest('hex')}`;
-}
-
-function canonical(value) {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
-}
 
 function changedPath(entry) {
   return typeof entry === 'string' ? entry : entry.path;
@@ -97,35 +84,6 @@ export function buildReceipt(input) {
     verifier_version: input.verifier_version,
     changed_file_classes: input.changed_file_classes,
   };
-}
-
-export function manifestDigest(readyPacks) {
-  const subjects = readyPacks.map((pack) => ({
-    diff: pack.diff,
-    commit_oid: pack.commit_oid,
-    receipt_subject: pack.receipt_subject,
-    pr_title: pack.pr_title,
-    pr_body: pack.pr_body,
-    repo: pack.repo,
-    planned_actions: pack.planned_actions,
-  })).sort((a, b) => canonical(a).localeCompare(canonical(b)));
-  return sha256(Buffer.from(canonical(subjects), 'utf8'));
-}
-
-export function assertBindingChain({patch_sha256, tested_tree_oid, commit_oid, pushed_oid, pr_head_oid}) {
-  if (!/^sha256:[0-9a-f]{64}$/i.test(patch_sha256 ?? '')) throw new Error('binding chain has invalid patch_sha256');
-  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(tested_tree_oid ?? '')) throw new Error('binding chain has invalid tested_tree_oid');
-  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(commit_oid ?? '')) throw new Error('binding chain has invalid commit_oid');
-  if (pushed_oid !== undefined && pushed_oid !== commit_oid) {
-    throw new Error(`binding mismatch: pushed_oid ${pushed_oid} != commit_oid ${commit_oid}`);
-  }
-  if (pr_head_oid !== undefined && pr_head_oid !== commit_oid) {
-    throw new Error(`binding mismatch: pr_head_oid ${pr_head_oid} != commit_oid ${commit_oid}`);
-  }
-  if (pushed_oid !== undefined && pr_head_oid !== undefined && pushed_oid !== pr_head_oid) {
-    throw new Error(`binding mismatch: pr_head_oid ${pr_head_oid} != pushed_oid ${pushed_oid}`);
-  }
-  return true;
 }
 
 function limits(spec) {
@@ -193,20 +151,6 @@ function verifierPlan(spec, dirs) {
     'sh', '-lc', shellCommand(commands)], check};
 }
 
-// --- live execution helpers (owner-built; Codex cannot run Docker to test these) ---
-function exec(cmd, args, {cwd, input, timeoutMs} = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, {cwd, stdio: ['pipe', 'pipe', 'pipe']});
-    let out = '', err = '';
-    const timer = timeoutMs ? setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, timeoutMs) : null;
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
-    child.on('close', (code) => { if (timer) clearTimeout(timer); resolve({code, stdout: out, stderr: err}); });
-    child.on('error', (e) => { if (timer) clearTimeout(timer); resolve({code: 127, stdout: out, stderr: `${err}\n${e.message}`}); });
-    if (input !== undefined) { child.stdin.write(input); child.stdin.end(); }
-  });
-}
-const git = (cwd, ...args) => exec('git', ['-C', cwd, ...args]);
 const wallMs = (spec) => (spec.executor.limits?.wall_clock_seconds_per_command ?? 1800) * 1000;
 
 // A throwaway CODEX_HOME (copied auth + minimal config). Network stays ON for the author phase; the
@@ -266,7 +210,7 @@ export async function runAuthorContainer(spec, dirs, {dryRun = false, log} = {})
     '--mount', `type=bind,src=${dirs.authorWorkspace},dst=/workspace`,
     '--workdir', '/workspace', spec.executor.image, 'sh', '-lc', setup];
   if (log) await log('author container: clone + install + Codex fix/iterate (network on)…');
-  const r = await exec('docker', args, {timeoutMs: wallMs(spec) * 2});
+  const r = await run('docker', args, {timeoutMs: wallMs(spec) * 2});
   await rm(codexHome, {recursive: true, force: true}); // scrub the auth immediately
   if (r.code !== 0) throw new Error(`author container exited ${r.code}: ${r.stderr.trim().split('\n').slice(-2).join(' ')}`);
   return {repoDir: path.join(dirs.authorWorkspace, 'repo')};
@@ -297,15 +241,15 @@ async function setupVerifierWorkspace(spec, dirs, authorRepoDir, patch) {
   const clean = path.join(dirs.verifierWorkspace, 'clean');
   await rm(dirs.verifierWorkspace, {recursive: true, force: true});
   await mkdir(dirs.verifierWorkspace, {recursive: true, mode: 0o700});
-  await exec('git', ['clone', '--local', '--no-hardlinks', authorRepoDir, clean]);
+  await run('git', ['clone', '--local', '--no-hardlinks', authorRepoDir, clean]);
   await git(clean, 'checkout', '--detach', spec.base_commit);
   await git(clean, 'reset', '--hard', spec.base_commit);
-  await exec('git', ['-C', clean, 'clean', '-ffdx']);
+  await run('git', ['-C', clean, 'clean', '-ffdx']);
   // Apply ONLY the committed patch to the clean base on the TRUSTED host (never in the container and
   // never the author's tree) — this is the integrity boundary. The container then only RUNS the check.
   const patchFile = path.join(dirs.verifierWorkspace, 'fix.patch');
   await writeFile(patchFile, patch, 'utf8');
-  const applied = await exec('git', ['-C', clean, 'apply', patchFile]);
+  const applied = await run('git', ['-C', clean, 'apply', patchFile]);
   if (applied.code !== 0) throw new Error(`committed patch does not apply to clean base: ${applied.stderr.trim().split('\n').slice(-2).join(' ')}`);
   // verbatimSymlinks: keep node_modules/.bin/* as RELATIVE symlinks — the default rewrites them to
   // absolute host paths that dangle inside the container (jest: not found). ENOENT = repo has no deps.
@@ -328,7 +272,7 @@ export async function runVerifierContainer(spec, dirs, patch, {dryRun = false, a
     '--mount', `type=bind,src=${dirs.verifierWorkspace},dst=/workspace`, '--workdir', '/workspace',
     spec.executor.image, 'sh', '-lc', commands];
   if (log) await log('verifier container: clean base + committed patch + spec-pinned check (network OFF)…');
-  const r = await exec('docker', args, {timeoutMs: wallMs(spec)});
+  const r = await run('docker', args, {timeoutMs: wallMs(spec)});
   return {exit: r.code, output: `${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ''}`};
 }
 

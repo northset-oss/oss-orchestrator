@@ -2,13 +2,46 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import test from 'node:test';
 import {
-  assertBindingChain, buildReceipt, classifyChangedFiles, manifestDigest, runAuthorContainer,
-  runVerifierContainer,
+  buildReceipt, classifyChangedFiles, runAuthorContainer, runVerifierContainer,
 } from './oss.mjs';
-import {OSS_IDENTITY, RECEIPT_FOOTER, assertOssCommitIdentity, prBody} from './runner.mjs';
+import {
+  OSS_IDENTITY, RECEIPT_FOOTER, assertBindingChain, assertOssCommitIdentity, manifestDigest, prBody,
+  timelineApiArgs, timelineCrossReferences, validateSpecs,
+} from './core.mjs';
 
 const oid = (char) => char.repeat(40);
 const digest = (char) => `sha256:${char.repeat(64)}`;
+
+function spec(overrides = {}) {
+  return {
+    mission_id: 'M-010',
+    candidate: 'owner/repo#123',
+    target_repo: 'https://github.com/owner/repo',
+    issue_url: 'https://github.com/owner/repo/issues/123',
+    base_commit: oid('a'),
+    code_prompt: 'Make the smallest tested fix.',
+    executor: {
+      image: 'node:22-bookworm',
+      install_commands: ['npm ci'],
+      commands: ['npm test'],
+      limits: {},
+    },
+    ...overrides,
+  };
+}
+
+test('validates a normal mission spec', () => {
+  assert.doesNotThrow(() => validateSpecs([spec()]));
+});
+
+test('rejects traversal, duplicate mission IDs, and credentialed repository URLs', () => {
+  assert.throws(() => validateSpecs([spec({mission_id: '../../northset-oss'})]), /mission_id/);
+  assert.throws(() => validateSpecs([spec(), spec()]), /duplicate mission_id/);
+  assert.throws(
+    () => validateSpecs([spec({target_repo: 'https://token@github.com/owner/repo'})]),
+    /credentials/i,
+  );
+});
 
 test('classifyChangedFiles flags modified and deleted existing tests', () => {
   const classes = classifyChangedFiles(
@@ -86,6 +119,13 @@ test('manifestDigest is order-stable and binds every selected field', () => {
   }
 });
 
+test('manifestDigest serialization is locked to a fixed output', () => {
+  assert.equal(
+    manifestDigest([readyPack()]),
+    'sha256:6271f0e12a9e16fa597154b00826e0792127f7bea12f613e33315df2d3523888',
+  );
+});
+
 test('assertBindingChain validates subjects and remote commit equality', () => {
   const chain = {patch_sha256: digest('a'), tested_tree_oid: oid('b'), commit_oid: oid('c')};
   assert.equal(assertBindingChain(chain), true);
@@ -96,21 +136,48 @@ test('assertBindingChain validates subjects and remote commit equality', () => {
 });
 
 test('reused identity verifier is fail-closed for identity and DCO', () => {
+  assert.deepEqual(OSS_IDENTITY, {name: 'Aysajan Eziz', email: 'aeziz@northset.ai'});
   const body = `detail\n\nSigned-off-by: ${OSS_IDENTITY.name} <${OSS_IDENTITY.email}>`;
   assert.doesNotThrow(() => assertOssCommitIdentity({
     authorEmail: OSS_IDENTITY.email, committerEmail: OSS_IDENTITY.email, body,
   }));
   assert.throws(() => assertOssCommitIdentity({authorEmail: 'wrong@example.com', committerEmail: OSS_IDENTITY.email, body}));
+  assert.throws(() => assertOssCommitIdentity({authorEmail: OSS_IDENTITY.email, committerEmail: 'wrong@example.com', body}));
   assert.throws(() => assertOssCommitIdentity({authorEmail: OSS_IDENTITY.email, committerEmail: OSS_IDENTITY.email, body: 'no trailer'}));
 });
 
 test('drafted PR body contains the mandatory receipt footer', () => {
+  assert.equal(RECEIPT_FOOTER, [
+    '---',
+    'Disclosure: this change was prepared with AI assistance and reviewed by me before submitting.',
+    'I ran the check(s) above in a network-isolated container and published a signed, re-runnable',
+    'record of that run, verifiable via GitHub artifact attestation:',
+    'https://northset-oss.github.io/verification-pilot/. Contributor self-run, not a maintainer verification.',
+  ].join('\n'));
   const spec = {
     candidate: 'owner/repo#123', issue_url: 'https://github.com/owner/repo/issues/123',
     executor: {commands: ['npm test']},
   };
   const body = prBody(spec, {changedFiles: ['src/index.mjs']});
   assert.ok(body.includes(RECEIPT_FOOTER));
+});
+
+test('timeline API pagination and cross-reference parsing include closed competing PRs', () => {
+  const args = timelineApiArgs('owner', 'repo', 123);
+  assert.ok(args.includes('--paginate'));
+  assert.ok(args.includes('--slurp'));
+  assert.ok(!args.includes('--jq'));
+  assert.deepEqual(timelineCrossReferences([
+    [{event: 'commented'}, {event: 'cross-referenced', source: {issue: {
+      html_url: 'https://example/pr/1', state: 'closed', title: 'one', pull_request: {},
+    }}}],
+    [{event: 'cross-referenced', source: {issue: {
+      html_url: 'https://example/pr/2', state: 'open', title: 'two', pull_request: {},
+    }}}],
+  ]), [
+    {source: 'https://example/pr/1', state: 'closed', title: 'one', is_pr: true},
+    {source: 'https://example/pr/2', state: 'open', title: 'two', is_pr: true},
+  ]);
 });
 
 test('dry-run container plans are hardened, separated, pinned, and task-bound', async () => {

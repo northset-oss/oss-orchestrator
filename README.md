@@ -1,69 +1,99 @@
 # OSS Mission Orchestrator
 
-Private tool (never pushed public) that runs Northset's OSS contribute-first loop for many
-candidate issues in parallel, then **stops at your review gate**. It never pushes, forks, attests,
-or opens a PR — that stays the proven manual M-008/M-009 flow.
+Private tool (never pushed public) for Northset's OSS contribute-first loop. Discovery and screening
+stay as separate founder tools; `oss.mjs` is the one canonical prepare/ship CLI, `core.mjs` holds its
+shared logic, and `oss.test.mjs` is its one test suite.
 
-Everything lives in one file: **`runner.mjs`** (+ `runner.test.mjs`). That is the whole tool.
+## Find the next candidate batch
 
-## The two passes (this is the design)
-
-The expensive, fragile part of a mission is the Dockerized attested-receipt build (`npm install` +
-tests + bundle + ledger, uncached, minutes each). Building it on *every* candidate before you've
-read the diff is why a fix took 10+ minutes. So the loop is split at your review gate:
-
-```
-# PASS 1 — SCAN (fast, no Docker; run this across all your candidates)
-node runner.mjs [--only M-010] [--concurrency 4] [--specs specs] [--out runs]
-#   per mission: recheck (issue timeline) -> clone at base_commit -> Codex codes in an
-#   isolated clone -> capture diff + PR body -> STOP.  Result per mission:
-#     CODED     Codex produced a diff — review runs/<id>/fix.patch
-#     NOCHANGE  tree left unmodified (issue already fixed on main — not a failure)
-#     SKIP      recheck not clean (closed / assigned / competing PR)
-#     FAILED    a real error (see runs/<id>/run.log)
-
-# --- you read each CODED diff and decide what to ship ---
-
-# PASS 2 — RECEIPT (heavy; run ONLY on the fixes you approve)
-node runner.mjs --receipt --only M-010 [--specs specs] [--out runs]
-#   asserts the work tree still equals the exact commit you reviewed (head==tested),
-#   rechecks the issue again, builds the attested receipt locally, prints the manual ship.
-
-# recheck a mission without coding (used inside the manual ship checklist)
-node runner.mjs --recheck-only --only M-010
+```sh
+node find-candidates.mjs 10
 ```
 
-Docker cost is now paid only on winners. Scanning is Codex-bound, so raise `--concurrency` toward
-your Codex rate limit to scan more at once.
+Replace `10` with the number of accepted candidates you want. The finder searches current,
+unassigned `good first issue` and `help wanted` issues in public repositories with at least 10
+stars, skips
+the candidates in Northset's first two registers and anything it reviewed previously, and runs
+`review-issue.mjs` on the remainder. It uses four reviewers in parallel by default.
 
-## What stays manual, and why
+The completed JSON batch is printed to stdout and saved under `runs/candidate-batch-*.json`.
+Review history is kept in the ignored local file `runs/candidate-history.jsonl`, so the next run
+moves on instead of repeating work. Exit `0` means all `N` candidates were found, exit `2` means
+the search produced a smaller partial batch, and exit `1` means the finder itself failed. It only
+reads GitHub and makes temporary clones; it does not claim issues or change repositories.
 
-The runner never performs an irreversible or public act. After PASS 2 it prints the exact
-M-008/M-009 ship commands; **you** run them: push the receipt to northset-oss + attest, push the
-fork branch, open the PR. Every outbound PR is reviewed line-by-line and authorized by the founder.
+For an unusually small or large run, `OSS_FIND_CONCURRENCY` changes parallelism and
+`OSS_FIND_MAX_REVIEWS` caps how many issues may be inspected. Normally neither is needed.
+
+## Review one candidate
+
+Before writing a mission spec, run the standalone conservative reviewer:
+
+```sh
+node review-issue.mjs https://github.com/owner/repo/issues/123
+# or: node review-issue.mjs owner/repo#123
+```
+
+It gathers the live issue, comments, timeline and PR references, clones the current default branch
+to a temporary directory, and asks a read-only Codex review to inspect current source, test seams and
+repository contribution instructions. It never installs dependencies, runs repository code, or
+changes GitHub. Output is one JSON verdict; exit `0` means `ACCEPT`, exit `2` means `REJECT`, and exit
+`1` means the review itself failed. Uncertainty is always `REJECT`.
+
+`ACCEPT` is candidate triage, not permission to claim or submit work. Re-run it immediately before
+starting a mission. The default model is `gpt-5.6-sol`; override only if needed with
+`OSS_REVIEW_MODEL` and `OSS_REVIEW_EFFORT`.
+
+## Canonical flow
+
+1. Discover a batch with `find-candidates.mjs`, then screen each candidate with
+   `review-issue.mjs`. Only an `ACCEPT` becomes a mission spec.
+2. Prepare one mission:
+
+   ```sh
+   node oss.mjs prepare --only M-014
+   ```
+
+   Prepare performs the fail-closed live recheck, runs the fix in the hardened networked author
+   container, applies only its committed patch to a fresh clean base on the trusted host, and runs
+   the spec-pinned check in the network-off verifier. It prints a `READY` board with the receipt,
+   flagged file classes, manifest digest, and ready-pack paths. Use `--dry-run` to print the planned
+   board without authoring or verification.
+3. Review the ready-pack once: the exact diff and commit, receipt subject, flagged file classes, PR
+   title/body, repository, and planned actions are bound by the printed manifest digest.
+4. Ship exactly that reviewed pack:
+
+   ```sh
+   node oss.mjs ship --approve <manifest-digest> M-014
+   ```
+
+   Ship builds the attestable receipt with `northset-oss`, publishes and verifies the public ledger
+   record, pushes the exact reviewed commit to the fork, opens the PR, asserts its head OID and stored
+   footer, and records progress in a resumable journal. No outbound step runs unless `--approve`
+   exactly matches the ready-pack manifest.
 
 > Volume never buys down review. If production outruns review, throttle production — not the gate.
 
 ## Load-bearing invariants (don't delete these)
 
-- **Isolated Codex sandbox** (`codexConfigText`, `createCodexHome`, `codexEnv`) — Codex runs untrusted
-  OSS code under a throwaway `CODEX_HOME`, filtered env (no host secrets), workspace-only filesystem,
-  network off. Founder decision: re-confined on purpose.
+- **Separated containers** — the author has network access and only the workspace plus throwaway
+  Codex home mounted; the fresh verifier has `--network=none`, no credentials, and only runs the
+  declared check against the clean base plus committed patch.
 - **Recheck fail-closed + timeline scan** (`recheck`, `timelineCrossReferences`) — scans the issue
   timeline for prior **closed** competing PRs, not just open ones, and a failed timeline fetch is
   FAILED, never a silent "0 PRs = clean". The A-003 lesson: prettier#19588 had an identical PR
   #19589 closed the day before; an open-PR-only check read "clean" and we shipped a duplicate a core
   maintainer closed in 30 min. Apply the timeline check to every candidate, including clean-looking ones.
-- **head==tested** — PASS 2 refuses to build a receipt for a tree that drifted from the reviewed
-  commit (`mission.json` pins `patch_commit`/`patch_diff_hash` at scan time).
+- **Content-bound approval** — canonical manifest serialization binds everything that will ship;
+  `--approve` must match exactly, and pushed/PR-head OIDs must equal the reviewed commit.
 - **Mandatory receipt footer** (`RECEIPT_FOOTER`) — every PR body carries the Northset
   receipt-disclosure footer (the verification-pilot link is the visibility mechanism). Single
   enforcement point; never drop it. Dropping it is why M-011 needed hand rework.
-- **Commit-pinned ship** (`manualShipLines`) — pins the exact commit and rechecks twice (before push,
-  before PR open). Never rebase at push; push the exact bound commit.
+- **OSS identity + DCO** — every author commit is fail-closed checked for the canonical OSS author
+  and committer identity and exact `Signed-off-by` trailer.
 - **`--require-success`** is passed unconditionally to the receipt build.
 
-These are all covered by `runner.test.mjs` — run `node --test runner.test.mjs`.
+Run the canonical suite with `node --test oss.test.mjs`.
 
 ## Spec format
 
@@ -75,12 +105,6 @@ code_prompt, executor{image, install_commands[], commands[], limits{}}, receipt{
 
 - `/Users/aeziz-local/northset-oss/bin/run-mission.mjs` — the receipt pipeline (2-phase Docker:
   phaseA networked install, phaseB `--network=none` verify), bundle + ledger. This is the
-  verification product; the orchestrator only calls it in PASS 2.
+  verification product; the orchestrator calls it only during approved ship.
 - `codex` CLI (`gpt-5.6-sol`, xhigh, fast) — the executor. `gh` authed as AysajanE. Docker + node 22.
 - OSS commit identity is `aeziz@northset.ai`, set per-clone, never global.
-
-## Deferred (not built, on purpose)
-
-Auto push/fork/attest/PR, fork auto-delete, a dual-vendor adversarial layer per mission, a durable
-ship-transaction journal, and a scheduler/lock. Earlier design drafts specified these; none are
-built. Add them only if the manual ship becomes the bottleneck — today the human gate is the point.
