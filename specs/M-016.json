@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "mission_id": "M-016",
+  "candidate": "renovatebot/renovate#44500",
+  "target_repo": "https://github.com/renovatebot/renovate",
+  "issue_url": "https://github.com/renovatebot/renovate/issues/44500",
+  "base_branch": "main",
+  "base_commit": "77da69117e70421ae034f2723f8007dd6829f142",
+  "problem_statement": "The Quadlet manager extracts Docker image references without replacement metadata, so digest pinning and updating cannot reliably rewrite a tag and digest together.",
+  "acceptance_criteria": [
+    "Quadlet Image entries expose replaceString and autoReplaceStringTemplate metadata for Docker image references.",
+    "A Quadlet image containing a tag and sha256 digest can be rewritten to a new tag and digest in one replacement.",
+    "Existing ignored transports and local .image and .build reference handling remain unchanged.",
+    "The new focused test is named exactly: supports digest replacement metadata for Quadlet images."
+  ],
+  "constraints": [
+    "Do not add dependencies, change public APIs, edit CI, update documentation, or modify version numbers.",
+    "Add the regression only in lib/modules/manager/quadlet/digest-replacement.spec.ts; do not modify existing tests or snapshots.",
+    "Import extractPackageFile directly from ./extract.ts in the focused test so the oracle does not depend on unrelated generated index artifacts.",
+    "Keep the production change limited to the Quadlet Docker image replacement-metadata defect described by issue #44500.",
+    "Follow Renovate's existing TypeScript, Vitest, formatting, and import conventions."
+  ],
+  "implementation_hints": [],
+  "process_requirements": [
+    "Disclose AI assistance in the PR and select the appropriate PR template option.",
+    "Sign the Renovate CLA.",
+    "Follow the PR template, including context and testing sections.",
+    "Do not force-push the PR branch after opening it.",
+    "Maintain 100% test coverage and green status checks."
+  ],
+  "qualification": {
+    "reviewed_at": "2026-07-13T16:55:56Z",
+    "issue_updated_at": "2026-07-13T16:24:28Z",
+    "invitation_evidence": {
+      "type": "assignment",
+      "url": "https://api.github.com/repos/renovatebot/renovate/issues/events/27919106025",
+      "observed_at": "2026-07-13T16:24:28Z"
+    },
+    "pre_author_notice_required": true,
+    "pre_author_notice": {
+      "url": "https://github.com/renovatebot/renovate/issues/44500#issuecomment-4959417176",
+      "observed_at": "2026-07-13T15:06:18Z"
+    },
+    "acceptance_contract": {
+      "problem": "Quadlet manager image extraction does not provide replacement metadata, so Docker tag+digest updates can fail to update the digest.",
+      "expected_behavior": [
+        "Quadlet dependencies extracted from Image values with tag+digest include replacement metadata suitable for rendering both a new tag and new digest.",
+        "The reported alpine.container case should update from 3.23.0 with the old sha256 digest to 3.23.2 with the new sha256 digest instead of failing with a digest mismatch.",
+        "The fix remains scoped to Quadlet replacement metadata with focused Vitest coverage."
+      ],
+      "non_goals": [
+        "Do not change docker-compose behavior, which the issue cites as already working.",
+        "Do not redesign Docker datasource lookup or broad image parsing.",
+        "Do not turn this into docs-only or cross-manager work."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/renovatebot/renovate/issues/44500",
+          "author_association": "COLLABORATOR",
+          "summary": "Issue body provides the reproduction, expected diff, observed failure, cause, and proposed getDep specifyReplaceString direction."
+        }
+      ]
+    },
+    "related_prs": []
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "setup_commands": [
+      "node tools/generate-imports.mjs"
+    ],
+    "test_paths": [
+      "lib/modules/manager/quadlet/digest-replacement.spec.ts"
+    ],
+    "command": "node_modules/.bin/vitest lib/modules/manager/quadlet/digest-replacement.spec.ts",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "supports digest replacement metadata for Quadlet images",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix(manager/quadlet): enable digest replacement metadata",
+    "summary": "Enable Quadlet Docker image replacement metadata for tag-and-digest updates and add a focused regression test.",
+    "body_template": "## Changes\n\n{{SUMMARY}}\n\n## Context\n\n- [x] This closes an existing Issue, Closes: #{{ISSUE_NUMBER}}\n- [ ] This doesn't close an Issue, but I accept the risk that this PR may be closed if maintainers disagree with its opening or implementation\n\n## AI assistance disclosure\n\nDid you use AI tools to create any part of this pull request?\n\n- [ ] No — I did not use AI for this contribution.\n- [ ] Yes — minimal assistance (e.g., IDE autocomplete, small code completions, grammar fixes).\n- [x] Yes — substantive assistance (AI-generated non-trivial portions of code, tests, or documentation).\n- [ ] Yes — other (please describe):\n\nCodex (OpenAI) was used to generate the code and focused regression test under human review.\n\n## Documentation (please check one with an [x])\n\n- [ ] I have updated the documentation, or\n- [x] No documentation update is required\n\n## How I've tested my work (please select one)\n\nI have verified these changes via:\n\n- [ ] Code inspection only, or\n- [x] Newly added/modified unit tests, or\n- [ ] No unit tests, but ran on a real repository, or\n- [ ] Both unit tests + ran on a real repository\n\n{{CHECKS}}\n\n{{RECEIPT_FOOTER}}"
+  },
+  "executor": {
+    "profile": "node",
+    "image": "node:24.16.0-bookworm",
+    "reasoning_effort": "xhigh",
+    "install_commands": [
+      "corepack pnpm install --frozen-lockfile"
+    ],
+    "commands": [
+      "node_modules/.bin/vitest lib/modules/manager/quadlet/digest-replacement.spec.ts"
+    ],
+    "limits": {
+      "cpus": 2,
+      "memory_mb": 6144,
+      "pids": 1024,
+      "wall_clock_seconds_per_command": 1800,
+      "output_bytes_per_stream": 2000000
+    }
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "url": "https://github.com/renovatebot/renovate/blob/77da69117e70421ae034f2723f8007dd6829f142/.github/contributing.md",
+      "checked_at": "2026-07-13T16:55:56Z",
+      "ai_policy_summary": "AI-assisted contributions are permitted when disclosed in the pull request; the repository also requires green checks, coverage, CLA completion, and no force-push after pull request creation."
+    },
+    "checks_not_run": [
+      "Full pnpm test suite",
+      "Full type-check, lint, formatting, and documentation checks",
+      "End-to-end Renovate execution against an external repository"
+    ],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

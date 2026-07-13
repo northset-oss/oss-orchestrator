@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "cooldowns": {
+    "prometheus/client_js": {
+      "reason": "Maintainer reported AI-generated PR bandwidth exhaustion on 2026-07-13; keep paused until the existing interaction is resolved or a maintainer explicitly invites new work.",
+      "evidence_url": "https://github.com/prometheus/client_js/pull/773#issuecomment-4953870322"
+    }
+  }
+}
