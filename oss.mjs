@@ -307,7 +307,10 @@ async function setupVerifierWorkspace(spec, dirs, authorRepoDir, patch) {
   await writeFile(patchFile, patch, 'utf8');
   const applied = await exec('git', ['-C', clean, 'apply', patchFile]);
   if (applied.code !== 0) throw new Error(`committed patch does not apply to clean base: ${applied.stderr.trim().split('\n').slice(-2).join(' ')}`);
-  await cp(path.join(authorRepoDir, 'node_modules'), path.join(clean, 'node_modules'), {recursive: true}).catch(() => {});
+  // verbatimSymlinks: keep node_modules/.bin/* as RELATIVE symlinks — the default rewrites them to
+  // absolute host paths that dangle inside the container (jest: not found). ENOENT = repo has no deps.
+  await cp(path.join(authorRepoDir, 'node_modules'), path.join(clean, 'node_modules'),
+    {recursive: true, verbatimSymlinks: true}).catch((e) => { if (e.code !== 'ENOENT') throw e; });
   return clean;
 }
 
