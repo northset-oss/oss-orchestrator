@@ -341,8 +341,21 @@ function commandLine(argv) {
 }
 
 function parseArgs(argv) {
-  if (argv[0] === 'ship') return {command: 'ship'};
-  if (argv[0] !== 'prepare') throw new Error('usage: oss prepare [--dry-run] [--only ID] [--concurrency N]');
+  if (argv[0] === 'ship') {
+    const o = {command: 'ship', specsDir: DEFAULTS.specsDir, runsDir: DEFAULTS.runsDir, approve: null, buildOnly: false, ids: []};
+    for (let i = 1; i < argv.length; i++) {
+      const a = argv[i];
+      if (a === '--approve') o.approve = argv[++i];
+      else if (a === '--build-only') o.buildOnly = true;
+      else if (a === '--specs') o.specsDir = path.resolve(argv[++i]);
+      else if (a === '--runs') o.runsDir = path.resolve(argv[++i]);
+      else if (a.startsWith('--')) throw new Error(`unknown arg ${a}`);
+      else o.ids.push(a);
+    }
+    if (!o.ids.length) throw new Error('usage: oss ship [--build-only] [--approve <digest>] <mission-id...> [--runs <dir>] [--specs <dir>]');
+    return o;
+  }
+  if (argv[0] !== 'prepare') throw new Error('usage: oss prepare [--dry-run] [--only ID] [--concurrency N]  |  oss ship ...');
   const options = {...DEFAULTS, command: 'prepare'};
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i];
@@ -471,7 +484,16 @@ function printBoard(results) {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.command === 'ship') {
-    console.log('increment 2, not implemented');
+    const {shipOne} = await import('./ship.mjs');
+    for (const id of options.ids) {
+      const spec = JSON.parse(await readFile(path.join(options.specsDir, `${id}.json`), 'utf8'));
+      const missionDir = path.join(options.runsDir, id);
+      const log = async (m) => console.log(`  ${id}  ${m}`);
+      console.log(`\nSHIP ${id} ${spec.candidate}${options.buildOnly ? '  (build-only, reversible)' : ''}`);
+      const r = await shipOne(missionDir, spec, {approvedDigest: options.approve, buildOnly: options.buildOnly, log});
+      if (r.build_only) console.log(`  manifest_digest for approval: ${r.manifest}`);
+      else console.log(`  ✓ DONE — PR ${r.pr_url}\n           attested receipt: ${r.attestation_uri}`);
+    }
     return;
   }
   const files = (await readdir(options.specsDir)).filter((file) => file.endsWith('.json') && !file.includes('.example.'));
