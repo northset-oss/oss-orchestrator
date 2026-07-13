@@ -1,0 +1,23 @@
+{
+  "mission_id": "M-014",
+  "candidate": "prometheus/client_js#621",
+  "target_repo": "https://github.com/prometheus/client_js",
+  "issue_url": "https://github.com/prometheus/client_js/issues/621",
+  "base_commit": "7c54cc43cc5443e79d92ff4b9b732c2b091b6517",
+  "code_prompt": "prom-client counter exemplars always record the value passed to `inc` (default 1), which makes exemplars unhelpful when you just call `inc()` repeatedly (issue #621). Add an opt-in Counter configuration field `useCounterValueAsExemplar` (default false, preserving today's behavior). When it is true, the exemplar value recorded on an increment should be the counter's computed current total at that moment, not the amount passed to `inc`. Look at lib/counter.js and lib/exemplar.js. Add a jest test in test/exemplarsTest.js or test/counterTest.js asserting that with `useCounterValueAsExemplar: true`, after two `inc({ exemplarLabels: { traceId: 'x' } })` calls the recorded exemplar value equals the counter total (2), and that without the option it stays the inc amount (default 1). Keep the change minimal and backward-compatible, follow the repo's conventions, and do not change version numbers. Run `npm run test-unit` and iterate until it passes.",
+  "executor": {
+    "image": "node:22-bookworm",
+    "install_commands": [
+      "npm_config_cache=/workspace/.npmcache npm install --no-audit --no-fund --loglevel=error"
+    ],
+    "commands": [
+      "npm run test-unit"
+    ],
+    "limits": {
+      "cpus": 4,
+      "memory_mb": 4096,
+      "pids": 1024,
+      "wall_clock_seconds_per_command": 1800
+    }
+  }
+}

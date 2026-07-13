@@ -1,0 +1,23 @@
+{
+  "mission_id": "M-013",
+  "candidate": "nodejs/doc-kit#891",
+  "target_repo": "https://github.com/nodejs/doc-kit",
+  "issue_url": "https://github.com/nodejs/doc-kit/issues/891",
+  "base_commit": "68774ca17480340f9c4af084dbbefa640b0f7f40",
+  "code_prompt": "doc-kit's `web` generator renders a search bar unconditionally, but search only works when the `orama-db` generator is also enabled; otherwise the search bar does nothing. Fix it so the web output only renders the search bar (the SearchBox component / its slot) when orama-db is enabled in the configuration. Inspect src/generators/web/ (generate.mjs, index.mjs, ui/components/NavBar.jsx, ui/components/SearchBox/) to find where the search bar is included and gate it on whether orama-db is enabled. Add or update a test under src/generators/web/__tests__/ asserting the search bar is present when orama-db is enabled and absent when it is not. Keep the change minimal, follow the repo's conventions, do not change version numbers. Run `npm test` and iterate until it passes.",
+  "executor": {
+    "image": "node:22-bookworm",
+    "install_commands": [
+      "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm_config_cache=/workspace/.npmcache npm ci --no-audit --no-fund --loglevel=error"
+    ],
+    "commands": [
+      "npm test"
+    ],
+    "limits": {
+      "cpus": 4,
+      "memory_mb": 4096,
+      "pids": 1024,
+      "wall_clock_seconds_per_command": 1800
+    }
+  }
+}

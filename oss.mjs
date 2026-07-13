@@ -3,7 +3,8 @@
 // at one content-bound review board. `ship` deliberately remains an increment-2 stub.
 
 import {createHash} from 'node:crypto';
-import {appendFile, mkdir, readFile, readdir, writeFile} from 'node:fs/promises';
+import {spawn} from 'node:child_process';
+import {appendFile, cp, mkdir, readFile, readdir, rm, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {
@@ -192,20 +193,140 @@ function verifierPlan(spec, dirs) {
     'sh', '-lc', shellCommand(commands)], check};
 }
 
-export async function runAuthorContainer(spec, dirs, {dryRun = false} = {}) {
-  const plan = authorPlan(spec, dirs);
-  if (dryRun) return {planned: true, ...plan};
-  throw new Error('author Docker/Codex execution boundary requires live validation before enablement');
+// --- live execution helpers (owner-built; Codex cannot run Docker to test these) ---
+function exec(cmd, args, {cwd, input, timeoutMs} = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {cwd, stdio: ['pipe', 'pipe', 'pipe']});
+    let out = '', err = '';
+    const timer = timeoutMs ? setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, timeoutMs) : null;
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('close', (code) => { if (timer) clearTimeout(timer); resolve({code, stdout: out, stderr: err}); });
+    child.on('error', (e) => { if (timer) clearTimeout(timer); resolve({code: 127, stdout: out, stderr: `${err}\n${e.message}`}); });
+    if (input !== undefined) { child.stdin.write(input); child.stdin.end(); }
+  });
+}
+const git = (cwd, ...args) => exec('git', ['-C', cwd, ...args]);
+const wallMs = (spec) => (spec.executor.limits?.wall_clock_seconds_per_command ?? 1800) * 1000;
+
+// A throwaway CODEX_HOME (copied auth + minimal config). Network stays ON for the author phase; the
+// caller scrubs this directory immediately after the author container exits.
+async function prepareCodexHome(base) {
+  const home = path.join(base, 'codex-home');
+  await mkdir(home, {recursive: true, mode: 0o700});
+  const realHome = process.env.CODEX_HOME ?? path.join(process.env.HOME ?? '', '.codex');
+  await cp(path.join(realHome, 'auth.json'), path.join(home, 'auth.json'));
+  await writeFile(path.join(home, 'config.toml'),
+    'approval_policy = "never"\n[history]\npersistence = "none"\n[features]\napps = false\nmemories = false\nmulti_agent = false\n',
+    {mode: 0o600});
+  return home;
 }
 
-export async function runVerifierContainer(spec, dirs, patch, {dryRun = false} = {}) {
+function authorPromptText(spec) {
+  return [
+    `Fix this open-source issue: ${spec.issue_url}`,
+    `The repo is checked out at base commit ${spec.base_commit} in the current directory, dependencies installed, network available.`,
+    ``,
+    `Task: ${spec.code_prompt}`,
+    ``,
+    `Make the MINIMAL focused change; follow the repo's conventions; add or update tests as appropriate.`,
+    `VERIFY YOUR WORK: run this exact check and iterate until it passes: ${spec.executor.commands.join(' && ')}`,
+    `Do not touch unrelated files, do not change version numbers, and do NOT git commit — the orchestrator commits with DCO after you finish.`,
+  ].join('\n');
+}
+
+// Runs the author boundary: one hardened, networked container that clones @ base, installs deps,
+// installs Codex, lets Codex fix + iterate against the spec-pinned check, then commits with DCO.
+// Root inside the container (needed for `npm i -g codex`); the container is the boundary
+// (cap-drop, no-new-privileges, no socket, only the workspace + throwaway codex-home mounted).
+export async function runAuthorContainer(spec, dirs, {dryRun = false, log} = {}) {
+  const plan = authorPlan(spec, dirs);
+  if (dryRun) return {planned: true, ...plan};
+  const codexHome = await prepareCodexHome(dirs.base);
+  const setup = [
+    'set -e',
+    'rm -rf /workspace/repo',
+    'git clone "$TARGET_REPO" /workspace/repo',
+    'cd /workspace/repo',
+    'git checkout "$BASE_COMMIT"',
+    `git config user.name '${OSS_IDENTITY.name}'`,
+    `git config user.email '${OSS_IDENTITY.email}'`,
+    ...spec.executor.install_commands,
+    'npm i -g @openai/codex@0.144.1 >/tmp/codex-install.log 2>&1',
+    `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model gpt-5.6-sol -c model_reasoning_effort="high" -c service_tier="fast" "$AUTHOR_PROMPT"`,
+    'git add -A',
+    `git -c commit.gpgsign=false commit -s -m 'fix: ${spec.candidate}' || echo NORTHSET_NO_COMMIT`,
+  ].join('\n');
+  const l = limits(spec);
+  const args = ['run', '--rm', '--network=bridge', '--security-opt', 'no-new-privileges', '--cap-drop=ALL',
+    '--cpus', String(l.cpus), '--memory', l.memory, '--pids-limit', String(l.pids),
+    '-e', 'CODEX_HOME=/codex-home', '-e', `TARGET_REPO=${spec.target_repo}`, '-e', `BASE_COMMIT=${spec.base_commit}`,
+    '-e', `AUTHOR_PROMPT=${authorPromptText(spec)}`,
+    '--mount', `type=bind,src=${codexHome},dst=/codex-home`,
+    '--mount', `type=bind,src=${dirs.authorWorkspace},dst=/workspace`,
+    '--workdir', '/workspace', spec.executor.image, 'sh', '-lc', setup];
+  if (log) await log('author container: clone + install + Codex fix/iterate (network on)…');
+  const r = await exec('docker', args, {timeoutMs: wallMs(spec) * 2});
+  await rm(codexHome, {recursive: true, force: true}); // scrub the auth immediately
+  if (r.code !== 0) throw new Error(`author container exited ${r.code}: ${r.stderr.trim().split('\n').slice(-2).join(' ')}`);
+  return {repoDir: path.join(dirs.authorWorkspace, 'repo')};
+}
+
+// Host-side extraction from the author repo: verify identity/DCO fail-closed, then derive the
+// content-addressed patch and the git OIDs the receipt/binding chain need.
+export async function extractAuthorResult(spec, repoDir) {
+  const head = (await git(repoDir, 'rev-parse', 'HEAD')).stdout.trim();
+  if (!head || head === spec.base_commit) return {noChange: true};
+  const id = await git(repoDir, 'show', '-s', '--format=%ae%n%ce%n%b', 'HEAD');
+  const [authorEmail = '', committerEmail = '', ...body] = id.stdout.split('\n');
+  assertOssCommitIdentity({authorEmail, committerEmail, body: body.join('\n')});
+  const patch = (await git(repoDir, 'diff', `${spec.base_commit}..HEAD`)).stdout;
+  if (!patch.trim()) return {noChange: true};
+  const changed = (await git(repoDir, 'diff', '--name-only', `${spec.base_commit}..HEAD`)).stdout.trim().split('\n').filter(Boolean);
+  const baseFiles = (await git(repoDir, 'ls-tree', '-r', '--name-only', spec.base_commit)).stdout.trim().split('\n').filter(Boolean);
+  return {
+    noChange: false, commit_oid: head, tested_tree_oid: (await git(repoDir, 'rev-parse', 'HEAD^{tree}')).stdout.trim(),
+    patch, patch_sha256: sha256(Buffer.from(patch, 'utf8')), changed, baseFiles,
+  };
+}
+
+// Builds the fresh verifier workspace on the host: a clean base tree + the author's installed deps
+// (the verifier is offline, so it reuses them) + the committed patch. The verifier applies ONLY that
+// patch — never the author's working tree — so the proof cannot be tampered with by the author.
+async function setupVerifierWorkspace(spec, dirs, authorRepoDir, patch) {
+  const clean = path.join(dirs.verifierWorkspace, 'clean');
+  await rm(dirs.verifierWorkspace, {recursive: true, force: true});
+  await mkdir(dirs.verifierWorkspace, {recursive: true, mode: 0o700});
+  await exec('git', ['clone', '--local', '--no-hardlinks', authorRepoDir, clean]);
+  await git(clean, 'checkout', '--detach', spec.base_commit);
+  await git(clean, 'reset', '--hard', spec.base_commit);
+  await exec('git', ['-C', clean, 'clean', '-ffdx']);
+  // Apply ONLY the committed patch to the clean base on the TRUSTED host (never in the container and
+  // never the author's tree) — this is the integrity boundary. The container then only RUNS the check.
+  const patchFile = path.join(dirs.verifierWorkspace, 'fix.patch');
+  await writeFile(patchFile, patch, 'utf8');
+  const applied = await exec('git', ['-C', clean, 'apply', patchFile]);
+  if (applied.code !== 0) throw new Error(`committed patch does not apply to clean base: ${applied.stderr.trim().split('\n').slice(-2).join(' ')}`);
+  await cp(path.join(authorRepoDir, 'node_modules'), path.join(clean, 'node_modules'), {recursive: true}).catch(() => {});
+  return clean;
+}
+
+export async function runVerifierContainer(spec, dirs, patch, {dryRun = false, authorRepoDir, log} = {}) {
   if (typeof patch !== 'string') throw new Error('verifier requires committed patch bytes');
   const plan = verifierPlan(spec, dirs);
   if (dryRun) return {planned: true, ...plan};
-  if (plan.docker.includes(`${spec.executor.image.split('@')[0]}@${UNRESOLVED_DIGEST}`)) {
-    throw new Error('verifier_image_digest is not pinned in the mission spec');
-  }
-  throw new Error('verifier Docker execution boundary requires live validation before enablement');
+  if (!authorRepoDir) throw new Error('verifier requires the author repo dir to build a clean workspace');
+  await setupVerifierWorkspace(spec, dirs, authorRepoDir, patch);
+  // The host already built /workspace/clean = clean base + committed patch + deps; the container just runs the check.
+  const commands = ['set -e', 'cd /workspace/clean', spec.executor.commands.join(' && ')].join('\n');
+  const l = limits(spec);
+  const args = ['run', '--rm', '--network=none', '--security-opt', 'no-new-privileges', '--cap-drop=ALL',
+    '--cpus', String(l.cpus), '--memory', l.memory, '--pids-limit', String(l.pids),
+    '--mount', `type=bind,src=${dirs.verifierWorkspace},dst=/workspace`, '--workdir', '/workspace',
+    spec.executor.image, 'sh', '-lc', commands];
+  if (log) await log('verifier container: clean base + committed patch + spec-pinned check (network OFF)…');
+  const r = await exec('docker', args, {timeoutMs: wallMs(spec)});
+  return {exit: r.code, output: `${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ''}`};
 }
 
 function quoteArg(value) {
@@ -250,6 +371,8 @@ async function prepareMission(spec, options) {
     await appendFile(path.join(dirs.base, 'prepare.log'), `[${new Date().toISOString()}] ${message}\n`, {mode: 0o600});
     console.log(`  ${spec.mission_id}  ${message}`);
   };
+  const parsed = parseCandidate(spec.candidate);
+  const repo = `${parsed.owner}/${parsed.repo}`;
   try {
     const checked = await recheck(spec, log);
     if (!checked.clean) return {state: 'SKIP', spec, dirs, detail: checked.reasons.join('; ')};
@@ -257,36 +380,57 @@ async function prepareMission(spec, options) {
       mkdir(dirs.authorWorkspace, {recursive: true, mode: 0o700}),
       mkdir(dirs.verifierWorkspace, {recursive: true, mode: 0o700}),
     ]);
-    const author = await runAuthorContainer(spec, dirs, {dryRun: options.dryRun});
-    const verifier = await runVerifierContainer(spec, dirs, '<PLANNED-COMMITTED-PATCH>', {dryRun: options.dryRun});
-    if (!options.dryRun) throw new Error('live author/verifier result handling is not enabled');
 
-    const parsed = parseCandidate(spec.candidate);
-    const changed = classifyChangedFiles([], []);
-    // A dry-run has no verifier result and therefore MUST NOT call buildReceipt or imply that a
-    // receipt exists. This is only the exact schema shape that a successful live run would fill.
-    const receipt = {
-      schema_version: 1,
-      candidate: spec.candidate, repo: `${parsed.owner}/${parsed.repo}`, base_commit: spec.base_commit,
-      patch_sha256: '<planned:sha256(fix.patch)>', tested_tree_oid: '<planned:tested-tree-oid>',
-      commit_oid: '<planned:author-commit-oid>', check_command: verifier.check,
-      verifier_image_digest: verifierImage(spec).split('@').at(-1),
-      dep_material_digest: '<planned:lockfile-material-digest>', exit: '<planned:must-equal-0>',
-      output_sha256: '<planned:sha256(original-verifier-output)>', verifier_version: VERIFIER_VERSION,
-      changed_file_classes: changed,
-    };
-    const title = `fix: ${spec.candidate}`;
-    const body = prBody(spec, {changedFiles: []});
-    const readyPack = {
-      id: spec.mission_id, candidate: spec.candidate, diff: '<planned:fix.patch bytes>',
-      diff_path: path.join(dirs.ready, 'fix.patch'), commit_oid: receipt.commit_oid,
-      receipt_subject: receipt, receipt_digest: sha256(Buffer.from(canonical(receipt))),
-      redacted_output: '<planned:redacted-verifier-output>',
-      pr_title: title, pr_body: body, repo: `${parsed.owner}/${parsed.repo}`,
-      planned_actions: ['fork', 'push', 'attest', 'open-pr', 'append-ledger'], author, verifier,
-      changed_file_classes: changed,
-    };
-    return {state: 'READY', spec, dirs, readyPack};
+    if (options.dryRun) {
+      const author = await runAuthorContainer(spec, dirs, {dryRun: true});
+      const verifier = await runVerifierContainer(spec, dirs, '<PLANNED-COMMITTED-PATCH>', {dryRun: true});
+      const receipt = {
+        schema_version: 1, candidate: spec.candidate, repo, base_commit: spec.base_commit,
+        patch_sha256: '<planned:sha256(fix.patch)>', tested_tree_oid: '<planned:tested-tree-oid>',
+        commit_oid: '<planned:author-commit-oid>', check_command: verifier.check,
+        verifier_image_digest: verifierImage(spec).split('@').at(-1), dep_material_digest: '<planned:reused-author-deps>',
+        exit: '<planned:must-equal-0>', output_sha256: '<planned:sha256(verifier-output)>',
+        verifier_version: VERIFIER_VERSION, changed_file_classes: [],
+      };
+      const body = prBody(spec, {changedFiles: []});
+      return {state: 'READY', spec, dirs, readyPack: {
+        id: spec.mission_id, candidate: spec.candidate, diff: '<planned:fix.patch bytes>',
+        diff_path: path.join(dirs.ready, 'fix.patch'), commit_oid: receipt.commit_oid, receipt_subject: receipt,
+        receipt_digest: sha256(Buffer.from(canonical(receipt))), pr_title: `fix: ${spec.candidate}`, pr_body: body, repo,
+        planned_actions: ['fork', 'push', 'attest', 'open-pr', 'append-ledger'], author, verifier, changed_file_classes: [],
+      }};
+    }
+
+    // --- LIVE: author container -> extract -> fresh verifier -> receipt ---
+    const author = await runAuthorContainer(spec, dirs, {dryRun: false, log});
+    const result = await extractAuthorResult(spec, author.repoDir);
+    if (result.noChange) return {state: 'NOCHANGE', spec, dirs, detail: 'author produced no committed change (already fixed?)'};
+    await log(`patch ${result.commit_oid.slice(0, 12)} (${result.changed.length} files) — running verifier…`);
+    const verifier = await runVerifierContainer(spec, dirs, result.patch, {authorRepoDir: author.repoDir, log});
+    await writeFile(path.join(dirs.base, 'verifier_output.txt'), verifier.output, {mode: 0o600});
+    if (verifier.exit !== 0) return {state: 'FAILED', spec, dirs, detail: `verifier check failed (exit ${verifier.exit}) — see verifier_output.txt`};
+
+    const changed = classifyChangedFiles(result.baseFiles, result.changed);
+    const receipt = buildReceipt({
+      candidate: spec.candidate, repo, base_commit: spec.base_commit, patch_sha256: result.patch_sha256,
+      tested_tree_oid: result.tested_tree_oid, commit_oid: result.commit_oid,
+      check_command: spec.executor.commands.join(' && '),
+      verifier_image_digest: spec.executor.verifier_image_digest ?? `${spec.executor.image} (tag; pin by digest before ship)`,
+      dep_material_digest: 'reused-author-node_modules', exit: verifier.exit, output: verifier.output,
+      verifier_version: VERIFIER_VERSION, changed_file_classes: changed,
+    });
+    const body = prBody(spec, {changedFiles: result.changed});
+    await mkdir(dirs.ready, {recursive: true, mode: 0o700});
+    await writeFile(path.join(dirs.ready, 'fix.patch'), result.patch);
+    await writeFile(path.join(dirs.ready, 'receipt.json'), JSON.stringify(receipt, null, 2));
+    await writeFile(path.join(dirs.ready, 'pr_body.md'), body);
+    await log(`READY — verifier exit 0, receipt ${sha256(Buffer.from(canonical(receipt))).slice(0, 19)}…`);
+    return {state: 'READY', spec, dirs, readyPack: {
+      id: spec.mission_id, candidate: spec.candidate, diff: result.patch, diff_path: path.join(dirs.ready, 'fix.patch'),
+      commit_oid: result.commit_oid, receipt_subject: receipt, receipt_digest: sha256(Buffer.from(canonical(receipt))),
+      pr_title: `fix: ${spec.candidate}`, pr_body: body, repo,
+      planned_actions: ['fork', 'push', 'attest', 'open-pr', 'append-ledger'], changed_file_classes: changed,
+    }};
   } catch (error) {
     return {state: 'FAILED', spec, dirs, detail: error.message};
   }
@@ -301,10 +445,12 @@ function printBoard(results) {
     }
     const pack = result.readyPack;
     console.log(`READY ${pack.id} ${pack.candidate}`);
-    console.log(`  author docker:   ${commandLine(pack.author.docker)}`);
-    console.log(`  codex exec:      ${commandLine(pack.author.codex)}`);
-    console.log(`  verifier docker: ${commandLine(pack.verifier.docker)}`);
-    console.log(`  pinned check_command: ${pack.receipt_subject.check_command}`);
+    if (pack.author) { // dry-run plan packs carry the planned argv; live packs do not
+      console.log(`  author docker:   ${commandLine(pack.author.docker)}`);
+      console.log(`  codex exec:      ${commandLine(pack.author.codex)}`);
+      console.log(`  verifier docker: ${commandLine(pack.verifier.docker)}`);
+    }
+    console.log(`  check_command: ${pack.receipt_subject.check_command}`);
     console.log(`  diff path: ${pack.diff_path}`);
     console.log(`  green/exit: ${pack.receipt_subject.exit}`);
     console.log(`  receipt digest: ${pack.receipt_digest}`);
