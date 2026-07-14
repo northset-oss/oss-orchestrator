@@ -1,138 +1,149 @@
 # OSS Mission Orchestrator
 
-Private tool (never pushed public) for Northset's OSS contribute-first loop. Discovery and screening
-stay as separate founder tools; `oss.mjs` is the one canonical prepare/ship CLI, `core.mjs` holds its
-shared logic, and `oss.test.mjs` is its one test suite.
+Private Northset tool for a finite OSS contribute-first loop. The active contract is
+[`OPERATING_CONTRACT.md`](OPERATING_CONTRACT.md); historical specs and architecture notes live
+under `archive/` and are never runtime inputs.
 
-## Find the next candidate batch
+## One-time local setup
 
-```sh
-node find-candidates.mjs 10
-```
-
-Replace `10` with the number of accepted candidates you want. The finder searches current,
-unassigned `good first issue` and `help wanted` issues in public repositories with at least 10
-stars, skips
-the candidates in Northset's first two registers and anything it reviewed previously, and runs
-`review-issue.mjs` on the remainder. It uses four reviewers in parallel by default.
-
-The completed JSON batch is printed to stdout and saved under `runs/candidate-batch-*.json`.
-Review history is kept in the ignored local file `runs/candidate-history.jsonl`, so the next run
-moves on instead of repeating work. Exit `0` means all `N` candidates were found, exit `2` means
-the search produced a smaller partial batch, and exit `1` means the finder itself failed. It only
-reads GitHub and makes temporary clones; it does not claim issues or change repositories.
-
-For an unusually small or large run, `OSS_FIND_CONCURRENCY` changes parallelism and
-`OSS_FIND_MAX_REVIEWS` caps how many issues may be inspected. Normally neither is needed.
-`OSS_FIND_LABELS` accepts a comma-separated label list when an explicitly approved replacement
-search needs to expand beyond the conservative `good first issue,help wanted` defaults. Expanded
-discovery never relaxes `review-issue.mjs`; every candidate must still pass all nine gates.
-`OSS_FIND_TERMS` accepts comma-separated high-signal phrases (for example `add tests,regression
-test`) and searches those phrases instead of labels. It is intended for bounded replacement
-research after the default invitation-label universe has been exhausted.
-`OSS_FIND_STARS_MIN` raises the default 10-star repository floor for a higher-signal pass; it does
-not affect any reviewer gate.
-`OSS_FIND_REPOS` accepts a comma-separated `owner/repo` list and searches current unassigned issues
-inside those repositories instead of the global label or phrase modes. Prior-register and history
-exclusions still apply to exact issue keys.
-`OSS_FIND_SEARCH_LIMIT` caps results fetched per label, phrase, or repository (maximum 1,000); use a
-smaller value for multi-repository passes to stay within GitHub Search pagination limits.
-
-## Review one candidate
-
-Before writing a mission spec, run the standalone conservative reviewer:
+Build the pinned author image once, and rebuild it only when its Dockerfile changes:
 
 ```sh
-node review-issue.mjs https://github.com/owner/repo/issues/123
-# or: node review-issue.mjs owner/repo#123
+node bin/build-author-image.mjs
 ```
 
-It gathers the live issue, comments, timeline and PR references, clones the current default branch
-to a temporary directory, and asks a read-only Codex review to inspect current source, test seams and
-repository contribution instructions. It never installs dependencies, runs repository code, or
-changes GitHub. Output is one JSON verdict; exit `0` means `ACCEPT`, exit `2` means `REJECT`, and exit
-`1` means the review itself failed. Uncertainty is always `REJECT`.
+The author image contains Codex already. Target-repository dependencies still install with the
+repository's declared command, using a cache keyed by executor-image digest, lockfile digest and
+install-command digest.
 
-`ACCEPT` is candidate triage, not permission to claim or submit work. Re-run it immediately before
-starting a mission. The default model is `gpt-5.6-sol`; override only if needed with
-`OSS_REVIEW_MODEL` and `OSS_REVIEW_EFFORT`.
+## Find and qualify the next candidate
 
-## Canonical flow
+```sh
+node find-candidates.mjs 1
+```
 
-1. Discover a batch with `find-candidates.mjs`, then screen each candidate with
-   `review-issue.mjs`. Only an `ACCEPT` becomes a mission spec.
-2. Prepare one mission:
+The finder searches current, unassigned public issues, applies mechanical filters, and invokes
+`review-issue.mjs` once per evidence snapshot. Its accepted JSON result is the single semantic
+qualification artifact and is copied into the mission spec. Every ACCEPT is bound to a deterministic
+`task_id` derived from `owner/repo#issue`; retries use a new mission ID and the next contiguous
+`attempt_sequence`, while retaining that task ID. Do not rerun the reviewer for an unchanged snapshot.
 
-   ```sh
-   node oss.mjs prepare M-016
-   ```
+Bounds:
 
-   Prepare rechecks invitation, maintainer intent, prior attempts, overlap, the one-open-PR cap and
-   repository cooldown, plus any required pre-author notice; resolves the executor image to an immutable digest; bootstraps dependencies
-   without credentials; runs the red/green author task; creates one host-owned DCO commit; proves
-   the binary/full-index patch reproduces its tree; runs the base-fails/patch-passes oracle; and
-   builds the final public bundle with `northset-oss`. It prints one `READY` review board.
-3. Review the ready-pack once. The exact patch, commit/tree, issue and policy snapshots,
-   differential-oracle record, public bundle digest, PR title/body, expiry and outbound actions are
-   bound by the batch manifest digest.
-4. Ship exactly that reviewed pack:
+- one review: five minutes;
+- one finder invocation: twenty minutes;
+- model reviews: `min(40, max(12, requested × 4))`;
+- related PRs considered: twelve; hydrated in detail: eight;
+- partial batches are valid terminal output with exit code `2`.
 
-   ```sh
-   node oss.mjs ship --approve <batch-manifest-digest> M-016
-   ```
+The finder is read-only. It neither claims issues nor changes repositories. It records reviewed
+issue keys in `runs/candidate-history-v2.jsonl`, writes a content-bound batch plus an audit JSONL,
+and supports a no-model preflight with `node find-candidates.mjs 20 --dry-run`. The existing
+`OSS_FIND_LABELS`, `OSS_FIND_TERMS`,
+`OSS_FIND_REPOS`, `OSS_FIND_STARS_MIN`, `OSS_FIND_SEARCH_LIMIT`, `OSS_FIND_CONCURRENCY`,
+`OSS_FIND_HISTORY`, `OSS_FIND_OUTPUT`, and `OSS_FIND_EXCLUDE_FILES` controls remain available for
+bounded research; none relax the reviewer gates.
+See `CANDIDATE_FINDER.md` for the complete v2 search, preflight, audit, and exit-code contract.
 
-   Ship accepts one to three missions from distinct repositories. It checks the approval once,
-   publishes the already-reviewed bundle, downloads and verifies the exact digest-qualified release
-   asset and its GitHub attestation, pushes the reviewed commit, performs a final live recheck, opens
-   the exact reviewed PR, and writes a mutable publication envelope. Progress is saved atomically in
-   a manifest- and bundle-bound journal; corrupt or mismatched state is fatal.
-5. Refresh factual upstream outcomes without editing immutable bundles:
+The standalone reviewer is available for a deliberately selected issue:
 
-   ```sh
-   node oss.mjs status
-   ```
+```sh
+node review-issue.mjs owner/repo#123
+```
 
-> Volume never buys down review. If production outruns review, throttle production — not the gate.
+An ACCEPT binds `review_id`, prompt version, review and expiry timestamps, evidence digest and base
+commit. Qualification expires after two hours. Expiry or a material live-state change makes that
+attempt terminally stale; it does not cause an automatic second semantic review.
 
-## Load-bearing invariants (don't delete these)
+## Prepare exactly once
 
-- **Credentials enter only after dependency bootstrap** — the networked install phase has the
-  public workspace and no Codex credential. The author gets a throwaway credential mount only after
-  bootstrap. Public verification runs declared checks with `--network=none` and no credentials.
-- **Recheck fail-closed + timeline scan** (`recheck`, `timelineCrossReferences`) — scans the issue
-  timeline for prior **closed** competing PRs, not just open ones, and a failed timeline fetch is
-  FAILED, never a silent "0 PRs = clean". The A-003 lesson: prettier#19588 had an identical PR
-  #19589 closed the day before; an open-PR-only check read "clean" and we shipped a duplicate a core
-  maintainer closed in 30 min. Apply the timeline check to every candidate, including clean-looking ones.
-- **Content-bound approval** — canonical manifest serialization binds everything that will ship;
-  `--approve` must match exactly, and pushed/PR-head OIDs must equal the reviewed commit.
-- **Direct, neutral receipt footer** (`receiptFooter`) — every PR links directly to its mission
-  anchor, discloses AI assistance, and describes only a contributor self-run record.
-- **OSS identity + DCO** — every author commit is fail-closed checked for the canonical OSS author
-  and committer identity and exact `Signed-off-by` trailer.
-- **`--require-success`** is passed unconditionally to the receipt build.
+Create a current-schema JSON spec in `specs/`, using `examples/mission-spec.example.json` as the
+shape, then run:
 
-Run the canonical suite with `node --test *.test.mjs`.
+```sh
+node oss.mjs prepare M-017
+```
 
-## Spec format
+Prepare has one shared sixty-minute budget. It performs a deterministic live recheck, resolves the
+executor image, clones the approved base, installs dependencies without credentials, runs one
+red/green author attempt, squashes any author commits into one host-owned DCO commit directly on the
+approved base, runs the differential oracle on read-only workspaces, and builds the exact public
+bundle. It returns one READY board or a terminal state such as `STALE`, `NOCHANGE`,
+`FAILED_BUDGET`, `FAILED_AUTHOR`, `FAILED_ORACLE`, or `FAILED_INFRA_TERMINAL`.
 
-One JSON per mission in `specs/` (see `specs/M-010.example.json`). The author contract is
-`problem_statement`, `acceptance_criteria[]`, `constraints[]`, and optional non-binding
-`implementation_hints[]`; solution-prescriptive `code_prompt` is rejected. Every spec also binds
-structured `qualification`, a differential `oracle`, exact `pr` copy, `base_branch`, `base_commit`,
-`process_requirements[]`, and `executor{profile,image,install_commands[],commands[],limits{}}`.
-Repository-policy invitations must use a blob URL pinned to `base_commit` plus a verified content
-digest. If repository policy requires notice before work, the spec must bind the live issue-comment
-evidence before `prepare` can start. `oracle.command` must name every newly added `oracle.test_paths`
-entry as a single shell command, and both its defect-specific base failure (exact exit plus approved
-output marker) and patched success are run and recorded. An optional
-`pr.body_template` preserves upstream PR templates with only the documented placeholders. The initial production lane
-accepts only the smoke-tested `node` profile and Tier A changes (source plus focused tests; no
-dependency, lockfile, CI, build, container, generated, binary, symlink or submodule changes).
+The fast lane permits source files, new tests, and at most one prominently flagged modified existing
+test. It rejects renames, copies, type changes, snapshots, fixtures, dependencies, lockfiles, CI,
+generated output, binaries, symlinks and submodules. `oracle.setup_commands` is forbidden: the test
+must run on the committed tree after dependency installation.
 
-## Dependencies (verified real)
+## Approve and ship the reviewed bytes
 
-- `/Users/aeziz-local/northset-oss/bin/run-mission.mjs` — the only canonical verifier/bundle
-  pipeline. Prepare calls it once; ship publishes those exact bytes and never rebuilds them.
-- `codex` CLI (`gpt-5.6-sol`, xhigh, fast) — the executor. `gh` authed as AysajanE. Docker + node 22.
-- OSS commit identity is `aeziz@northset.ai`, set per-clone, never global.
+The READY board prints the exact approval command:
+
+```sh
+node oss.mjs ship --approve sha256:<batch-manifest-digest> --approved-by internal-user:aeziz M-017
+```
+
+`--approved-by` is a stable operator identifier, not a display name. For schema-v2 missions it is
+written as a factual approval record after preparation; approval therefore remains distinct from
+the signed preparation bundle while still appearing in the same canonical receipt.
+
+Ship has one shared sixty-minute budget per mission and initializes every approved journal before
+the first outbound action. Its forward-only order is:
+
+```text
+APPROVED -> PRE_PUBLIC_RECHECK -> PUSHED -> PREPARED_RECEIPT_PUBLISHED -> ATTESTED
+         -> RECEIPT_AVAILABLE -> PRE_PR_COLLISION_CHECK -> PR_OPENED
+         -> DISCLOSURE_SYNCED -> FINAL_ENVELOPE_PUBLISHED -> SHIPPED
+```
+
+The full pre-public recheck occurs before fork creation, push or ledger publication. Both the
+prepared receipt and the final publication envelope land through ledger pull requests whose required
+checks must pass before merge; ship never pushes ledger changes directly to `main`. The canonical
+receipt must return HTTP 200 before the upstream PR opens. The guarded synchronizer then updates only
+the exact PR's marked receipt block and records `pr_disclosure` before the final ledger PR. A narrow
+collision check runs immediately before PR creation. A pre-public stale result makes zero outbound
+changes; a post-public collision leaves the receipt in its prepared state and consumes the mission
+ID. One infrastructure retry is allowed inside the original deadline. A terminal journal may restart
+only after a newly approved changed manifest, with the prior attempt archived unchanged.
+
+## Reconcile upstream outcomes
+
+```sh
+node oss.mjs status
+```
+
+Status updates mutable publication envelopes from factual GitHub state, resynchronizes the exact
+state-specific marked PR-body block, and publishes the rebuilt ledger through another checked pull
+request without changing immutable bundles.
+
+## Load-bearing invariants
+
+- One model qualification per immutable evidence snapshot; prepare never requests another reviewer.
+- One author attempt and one canonical DCO commit whose only parent is the approved base.
+- Dependency and author containers receive a writable worktree but a nested read-only `.git` mount.
+- Verification runs network-off with the workspace bind read-only and `/tmp` as writable scratch.
+- Every subprocess shares its enclosing deadline, has bounded output, and is terminated as a process
+  group with SIGTERM followed by SIGKILL after two seconds.
+- Content-bound approval covers the patch, commit/tree, issue and policy snapshots, oracle, public
+  bundle, PR text and outbound actions.
+- A schema-v2 bundle signs `bundle/economic.json`: task and attempt identity, observed stage effort,
+  measured resource fields, verified work scope, and factual cost lines. The immutable top-level
+  `approval.json` records the later human approval; mutable `publication.json` records upstream state.
+- Economic fields are evidence-bound facts only. Unobserved timing, usage, rates, and money remain
+  `null` or explicitly unavailable; missing components prohibit a claimed total economic cost.
+- Receipt language remains direct and modest: contributor self-run, not maintainer verification.
+- No terminal state transitions back to review or preparation.
+
+Every mission receives the same fixed, bounded gate. When the gate's time or capacity budget is
+exhausted, return a partial batch or reject the candidate; never increase review depth to chase
+completeness.
+
+Run private tests with:
+
+```sh
+node --test *.test.mjs
+```
+
+The public verifier remains `/Users/aeziz-local/northset-oss/bin/run-mission.mjs`; prepare invokes it
+with `--require-success`, and ship publishes those exact bytes rather than rebuilding them.

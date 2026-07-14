@@ -15,6 +15,7 @@ import {
   validatedInvitation,
   validatedRepositoryPolicyEvidence,
 } from './review-issue.mjs';
+import {taskIdForCandidate} from './core.mjs';
 
 test('parses a machine key and a clean issue URL', () => {
   assert.deepEqual(parseIssue('owner/repo#123'), {
@@ -32,6 +33,18 @@ test('review prompt requires every maintainer design citation to be a live comme
 test('review prompt distinguishes the Northset operator notice from a competing claimant', async () => {
   const source = await readFile(new URL('./review-issue.mjs', import.meta.url), 'utf8');
   assert.match(source, /A current AysajanE plan-to-work comment or assignment is Northset's own operator evidence, not a competing claimant/);
+});
+
+test('review prompt rejects pure coverage tasks that cannot produce a differential base failure', async () => {
+  const source = await readFile(new URL('./review-issue.mjs', import.meta.url), 'utf8');
+  assert.match(source, /The proposed regression test must fail against the checked-out base behavior/);
+  assert.match(source, /Pure test-coverage work for behavior that already passes is ineligible/);
+});
+
+test('the strengthened reviewer prompt has a new immutable version', async () => {
+  const source = await readFile(new URL('./review-issue.mjs', import.meta.url), 'utf8');
+  assert.match(source, /export const REVIEW_PROMPT_VERSION = 2/);
+  assert.match(source, /review_prompt_version: REVIEW_PROMPT_VERSION/);
 });
 
 test('rejects pull-request URLs and credential-bearing URLs', () => {
@@ -119,6 +132,7 @@ test('keeps a complete ACCEPT but binds identity to the requested issue and comm
   assert.equal(result.verdict, 'ACCEPT');
   assert.equal(result.candidate, issue.key);
   assert.equal(result.base_commit, 'a'.repeat(40));
+  assert.equal(result.task_id, taskIdForCandidate(issue.key));
 });
 
 test('fails closed when an ACCEPT lacks an exact oracle or source evidence', () => {
@@ -159,6 +173,32 @@ test('a maintainer-authored issue can settle design without a redundant maintain
     candidateRelatedPrs: [],
   };
   assert.equal(evidenceBackstopsResult(result, evidence), true);
+});
+
+test('documented scoped and hyphenated invitation labels survive semantic validation', async () => {
+  const issue = parseIssue('owner/repo#12');
+  const result = acceptedResult();
+  for (const name of [
+    'good-first-issue',
+    'E-help-wanted',
+    'Effort: Good First Issue',
+    'Status: Help Wanted',
+  ]) {
+    const evidence = {
+      issueData: {
+        url: issue.url,
+        labels: [{name}],
+        assignees: [],
+        comments: [],
+      },
+      candidateRelatedPrs: [],
+    };
+    assert.deepEqual(
+      await validatedInvitation(result, evidence, '', 'a'.repeat(40), issue),
+      result.invitation_evidence,
+      name,
+    );
+  }
 });
 
 test('repository-policy invitation is pinned to checked-out bytes and source lines', async () => {

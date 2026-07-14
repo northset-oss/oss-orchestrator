@@ -1,16 +1,20 @@
 import assert from 'node:assert/strict';
-import {access, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {access, mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
   authorDockerArgs,
+  attemptLineageForSpec,
+  buildEconomicInput,
   assertOracleChangedPaths,
   canonicalCommitArgs,
   changedEntries,
   checkDockerArgs,
   classifyChangedFiles,
+  copyNodeDependencies,
   dependencyBootstrapDockerArgs,
+  PREPARE_BUDGET_MS,
   removeRunWorkspace,
   runAuthorContainer,
 } from './oss.mjs';
@@ -29,6 +33,8 @@ import {
   receiptFooter,
   timelineApiArgs,
   timelineCrossReferences,
+  taskIdForCandidate,
+  validateSpec,
   validateSpecs,
 } from './core.mjs';
 
@@ -50,7 +56,11 @@ function spec(overrides = {}) {
     implementation_hints: [],
     process_requirements: [],
     qualification: {
+      review_id: digest('1'),
+      review_prompt_version: 2,
       reviewed_at: '2026-07-13T12:00:00Z',
+      qualification_expires_at: '2026-07-13T14:00:00Z',
+      evidence_sha256: digest('2'),
       issue_updated_at: '2026-07-13T11:00:00Z',
       invitation_evidence: {
         type: 'label', url: 'https://github.com/owner/repo/issues/123', observed_at: '2026-07-13T12:00:00Z',
@@ -80,6 +90,10 @@ function spec(overrides = {}) {
   };
 }
 
+test('prepare has one shared sixty-minute budget', () => {
+  assert.equal(PREPARE_BUDGET_MS, 60 * 60 * 1000);
+});
+
 test('validates the lean semantic mission contract and rejects legacy prompts', () => {
   assert.doesNotThrow(() => validateSpecs([spec()]));
   assert.throws(() => validateSpecs([spec({code_prompt: 'Implement my proposed flag.'})]), /code_prompt|acceptance contract/i);
@@ -99,10 +113,144 @@ test('validates the lean semantic mission contract and rejects legacy prompts', 
   })]), /setup_commands/i);
 });
 
-test('the copyable schema-v1 example validates', async () => {
-  const example = JSON.parse(await readFile(new URL('./specs/M-010.example.json', import.meta.url), 'utf8'));
+test('the copyable schema-v2 example validates', async () => {
+  const example = JSON.parse(await readFile(new URL('./examples/mission-spec.example.json', import.meta.url), 'utf8'));
   delete example._comment;
   assert.doesNotThrow(() => validateSpecs([example]));
+});
+
+test('schema-v2 missions bind stable economic task identity and attempt sequence', () => {
+  const taskId = taskIdForCandidate('owner/repo#123');
+  assert.equal(taskId, taskIdForCandidate('OWNER/REPO#123'));
+  assert.match(taskId, /^TASK-OSS-[0-9A-F]{16}$/);
+  const value = spec({
+    schema_version: 2,
+    task_id: taskId,
+    attempt_sequence: 1,
+    work_category: 'defect_fix',
+    qualification: {
+      ...spec().qualification,
+      finder_run_id: null,
+      candidate_rank: null,
+      finder_elapsed_ms: null,
+      review_duration_ms: null,
+      requested_model: 'gpt-5.6-sol',
+      actual_model: null,
+      reasoning_effort: 'xhigh',
+      service_tier: 'fast',
+    },
+  });
+  assert.doesNotThrow(() => validateSpec(value));
+  assert.throws(() => validateSpec({...value, task_id: 'TASK-OSS-INVENTED'}), /task_id.*candidate/i);
+  assert.throws(() => validateSpec({...value, attempt_sequence: 0}), /attempt_sequence/i);
+  assert.throws(() => validateSpec({...value, work_category: 'revenue_generation'}), /work_category/i);
+});
+
+test('schema-v2 economic input reports observed scope and preserves unknown costs', () => {
+  const value = spec({
+    schema_version: 2,
+    task_id: taskIdForCandidate('owner/repo#123'),
+    attempt_sequence: 1,
+    work_category: 'defect_fix',
+    qualification: {
+      ...spec().qualification,
+      finder_run_id: 'd86d9ac8-99ce-4dc0-b18e-579f6f0b9d78',
+      candidate_rank: 2,
+      finder_elapsed_ms: 1200,
+      review_duration_ms: 3000,
+      requested_model: 'gpt-5.6-sol',
+      actual_model: null,
+      reasoning_effort: 'xhigh',
+      service_tier: 'fast',
+    },
+  });
+  const economic = buildEconomicInput(value, {
+    missionSha256: digest('3'),
+    issueSnapshotSha256: digest('4'),
+    result: {
+      changedFiles: ['src/parser.mjs', 'test/parser.test.mjs'],
+      lines: 18,
+      classes: [
+        {path: 'src/parser.mjs', class: 'source'},
+        {path: 'test/parser.test.mjs', class: 'added-test'},
+      ],
+    },
+    authorUsage: {
+      bootstrap_duration_ms: 1800, bootstrap_retry_count: 0, author_duration_ms: 5000,
+      requested_model: 'gpt-5.6-sol', actual_model: null, reasoning_effort: 'xhigh', service_tier: 'fast',
+      model_requests: null, input_tokens: null, cached_input_tokens: null, output_tokens: null, reasoning_tokens: null,
+    },
+    timings: [{stage: 'clone', duration_ms: 2200}],
+    totalDurationMs: 9000,
+    attempts: [{attempt_id: 'M-010', attempt_sequence: 1, state: 'READY', terminal_reason_class: null}],
+  });
+  assert.equal(economic.task.task_id, value.task_id);
+  assert.equal(economic.work_scope.production_files, 1);
+  assert.equal(economic.work_scope.test_files, 1);
+  assert.equal(economic.usage.authoring.duration_ms, 5000);
+  assert.equal(economic.costs.status, 'partial');
+  assert.equal(economic.costs.total_economic_cost, null);
+  assert.ok(economic.costs.missing_components.includes('model_inference'));
+  assert.equal(JSON.stringify(economic).includes('estimated'), false);
+});
+
+test('attempt lineage includes every task-bound attempt and rejects sequence gaps', async (t) => {
+  const runsDir = await mkdtemp(path.join(os.tmpdir(), 'northset-attempt-lineage-'));
+  t.after(() => rm(runsDir, {recursive: true, force: true}));
+  const taskId = taskIdForCandidate('owner/repo#123');
+  await mkdir(path.join(runsDir, 'M-010'));
+  await writeFile(path.join(runsDir, 'M-010', 'attempt.json'), `${JSON.stringify({
+    schema_version: 2,
+    mission_id: 'M-010',
+    task_id: taskId,
+    attempt_sequence: 1,
+    state: 'FAILED_ORACLE',
+    terminal_reason: 'canonical verifier rejected the receipt',
+  })}\n`);
+  const current = spec({
+    schema_version: 2,
+    mission_id: 'M-011',
+    task_id: taskId,
+    attempt_sequence: 2,
+    work_category: 'defect_fix',
+  });
+  const lineage = await attemptLineageForSpec(runsDir, current);
+  assert.deepEqual(lineage, [
+    {attempt_id: 'M-010', attempt_sequence: 1, state: 'FAILED_ORACLE', terminal_reason_class: 'verification'},
+    {attempt_id: 'M-011', attempt_sequence: 2, state: 'READY', terminal_reason_class: null},
+  ]);
+  await assert.rejects(
+    attemptLineageForSpec(runsDir, {...current, attempt_sequence: 3}),
+    /contiguous|sequence/i,
+  );
+
+  await writeFile(path.join(runsDir, 'M-010', 'attempt.json'), `${JSON.stringify({
+    schema_version: 2,
+    mission_id: 'M-010',
+    task_id: taskId,
+    attempt_sequence: 1,
+    state: 'READY',
+    terminal_reason_class: null,
+  })}\n`);
+  await writeFile(path.join(runsDir, 'M-010', 'ship.journal.json'), `${JSON.stringify({
+    schema_version: 2,
+    mission_id: 'M-010',
+    state: 'ABORTED_STALE',
+  })}\n`);
+  assert.deepEqual(await attemptLineageForSpec(runsDir, current), [
+    {attempt_id: 'M-010', attempt_sequence: 1, state: 'ABORTED_STALE', terminal_reason_class: 'precondition_drift'},
+    {attempt_id: 'M-011', attempt_sequence: 2, state: 'READY', terminal_reason_class: null},
+  ]);
+
+  await rm(path.join(runsDir, 'M-010', 'ship.journal.json'));
+  await assert.rejects(attemptLineageForSpec(runsDir, current), /prior attempt.*not terminal/i);
+
+  await writeFile(path.join(runsDir, 'M-010', 'ship.journal.json'), `${JSON.stringify({
+    schema_version: 2,
+    mission_id: 'M-010',
+    state: 'SHIPPED',
+  })}\n`);
+  await assert.rejects(attemptLineageForSpec(runsDir, current), /already shipped/i);
 });
 
 test('a repository-required pre-author notice is a live, bound gate', () => {
@@ -169,7 +317,7 @@ test('a maintainer-authored candidate issue is valid design evidence', () => {
 });
 
 test('only the smoke-tested node profile and approved reasoning values are accepted', () => {
-  assert.equal(authorEffort(spec()), 'high');
+  assert.equal(authorEffort(spec()), 'xhigh');
   assert.equal(authorEffort(spec({executor: {...spec().executor, reasoning_effort: 'xhigh'}})), 'xhigh');
   assert.throws(() => validateSpecs([spec({executor: {...spec().executor, profile: 'go'}})]), /profile/);
   assert.throws(() => validateSpecs([spec({executor: {...spec().executor, reasoning_effort: 'ultra'}})]), /reasoning_effort/);
@@ -190,58 +338,59 @@ test('dependency bootstrap has no credential mount; author mount appears only in
   const dry = await runAuthorContainer(value, {base: '/runs/M-010', authorWorkspace: '/runs/M-010/author'}, {dryRun: true});
   assert.match(dry.codex.join(' '), /Problem statement:/);
   assert.match(dry.codex.join(' '), /Red\/green requirement/);
+  assert.match(dry.codex.join(' '), /Do not edit repository pull-request templates/);
   assert.doesNotMatch(dry.codex.join(' '), /code_prompt/);
 });
 
-test('trusted Codex bootstrap recreates and retries a transient missing bind source', async (t) => {
-  const base = await mkdtemp(path.join(os.tmpdir(), 'northset-codex-bootstrap-retry-'));
+test('spec validation rejects public-receipt limitations that omit exact baseline claims', () => {
+  assert.throws(() => validateSpec(spec({
+    receipt: {limitations: ['Does not prove code quality or security.']},
+  })), /limitations.*Does not prove code quality/i);
+});
+
+test('dependency bootstrap retries one infrastructure failure within the same author attempt', async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'northset-dependency-bootstrap-retry-'));
   t.after(() => rm(base, {recursive: true, force: true}));
   let bootstrapRuns = 0;
   const runImpl = async (command, args) => {
     assert.equal(command, 'docker');
-    if (args.includes('northset-m-010-codex-bootstrap') && args[0] === 'run') {
+    if (args.includes('northset-m-010-dependency-bootstrap') && args[0] === 'run') {
       bootstrapRuns += 1;
-      if (bootstrapRuns === 1) {
-        const mount = args.find((value) => value.startsWith('type=bind,src=') && value.endsWith(',dst=/workspace'));
-        const source = mount.slice('type=bind,src='.length, -',dst=/workspace'.length);
-        await rm(source, {recursive: true, force: true});
-        return {code: 125, stdout: '', stderr: 'invalid mount config for type "bind": bind source path does not exist'};
-      }
-      const mount = args.find((value) => value.startsWith('type=bind,src=') && value.endsWith(',dst=/workspace'));
-      const source = mount.slice('type=bind,src='.length, -',dst=/workspace'.length);
-      await access(source);
+      if (bootstrapRuns === 1) return {code: 125, stdout: '', stderr: 'temporary Docker daemon failure', durationMs: 11};
+      return {code: 0, stdout: '', stderr: '', durationMs: 13};
     }
-    return {code: 0, stdout: '', stderr: ''};
+    return {code: 0, stdout: '', stderr: '', durationMs: args[0] === 'run' ? 17 : 0};
   };
 
-  await runAuthorContainer(spec(), {
+  const result = await runAuthorContainer(spec(), {
     base,
     authorWorkspace: path.join(base, 'author-workspace'),
-  }, {runImpl});
+  }, {runImpl, authorImage: 'sha256:' + '8'.repeat(64)});
 
   assert.equal(bootstrapRuns, 2);
+  assert.deepEqual(result.usage, {
+    bootstrap_duration_ms: 24,
+    bootstrap_retry_count: 1,
+    author_duration_ms: 17,
+    requested_model: 'gpt-5.6-sol',
+    actual_model: null,
+    reasoning_effort: 'xhigh',
+    service_tier: 'fast',
+    model_requests: null,
+    input_tokens: null,
+    cached_input_tokens: null,
+    output_tokens: null,
+    reasoning_tokens: null,
+  });
 });
 
-test('trusted Codex bootstrap uses a fresh bind source for every run', async (t) => {
-  const base = await mkdtemp(path.join(os.tmpdir(), 'northset-codex-bootstrap-unique-'));
-  t.after(() => rm(base, {recursive: true, force: true}));
-  const bootstrapSources = [];
-  const runImpl = async (command, args) => {
-    assert.equal(command, 'docker');
-    if (args.includes('northset-m-010-codex-bootstrap') && args[0] === 'run') {
-      const mount = args.find((value) => value.startsWith('type=bind,src=') && value.endsWith(',dst=/workspace'));
-      bootstrapSources.push(mount.slice('type=bind,src='.length, -',dst=/workspace'.length));
-    }
-    return {code: 0, stdout: '', stderr: ''};
-  };
-  const dirs = {base, authorWorkspace: path.join(base, 'author-workspace')};
-
-  await runAuthorContainer(spec(), dirs, {runImpl});
-  await runAuthorContainer(spec(), dirs, {runImpl});
-
-  assert.equal(bootstrapSources.length, 2);
-  assert.notEqual(bootstrapSources[0], bootstrapSources[1]);
-  assert.ok(bootstrapSources.every((source) => path.basename(source).startsWith('trusted-codex-')));
+test('author plan uses the prebuilt image and performs no per-mission Codex install', async () => {
+  const dry = await runAuthorContainer(spec(), {
+    base: '/runs/M-010', authorWorkspace: '/runs/M-010/author-workspace',
+  }, {dryRun: true, authorImage: 'sha256:' + '8'.repeat(64)});
+  assert.ok(dry.author.includes('sha256:' + '8'.repeat(64)));
+  assert.doesNotMatch(dry.author.join(' '), /npm install.*@openai\/codex/);
+  assert.equal(Object.hasOwn(dry, 'codexBootstrap'), false);
 });
 
 test('run workspace cleanup retries transient non-empty directory races', async () => {
@@ -253,6 +402,22 @@ test('run workspace cleanup retries transient non-empty directory races', async 
   ]]);
 });
 
+test('oracle dependency copy preserves the workspace-level offline Corepack cache', async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'northset-oracle-dependencies-'));
+  t.after(() => rm(base, {recursive: true, force: true}));
+  const sourceWorkspace = path.join(base, 'source');
+  const targetWorkspace = path.join(base, 'target');
+  const marker = path.join('.northset', 'bootstrap-home', '.cache', 'node', 'corepack', 'marker');
+  const installState = path.join('repo', '.yarn', 'install-state.gz');
+  await mkdir(path.dirname(path.join(sourceWorkspace, marker)), {recursive: true});
+  await writeFile(path.join(sourceWorkspace, marker), 'offline cache');
+  await mkdir(path.dirname(path.join(sourceWorkspace, installState)), {recursive: true});
+  await writeFile(path.join(sourceWorkspace, installState), 'install state');
+  await copyNodeDependencies(path.join(sourceWorkspace, 'repo'), path.join(targetWorkspace, 'repo'));
+  assert.equal(await readFile(path.join(targetWorkspace, marker), 'utf8'), 'offline cache');
+  assert.equal(await readFile(path.join(targetWorkspace, installState), 'utf8'), 'install state');
+});
+
 test('host normalization bypasses repository hooks before isolated verification', () => {
   const args = canonicalCommitArgs(spec());
   assert.ok(args.includes('--no-verify'));
@@ -260,15 +425,17 @@ test('host normalization bypasses repository hooks before isolated verification'
 });
 
 test('differential oracle checks use a read-only root and network-off sandbox', () => {
-  const value = spec({oracle: {...spec().oracle, setup_commands: ['node tools/generate-imports.mjs']}});
+  const value = spec();
   const args = checkDockerArgs(value, '/runs/M-010/oracle', 'node@sha256:' + '9'.repeat(64), value.oracle.command);
   assert.ok(args.includes('--network'));
   assert.ok(args.includes('none'));
   assert.ok(args.includes('--read-only'));
-  assert.deepEqual(args.slice(args.indexOf('--tmpfs'), args.indexOf('--tmpfs') + 2), ['--tmpfs', '/tmp:size=512m']);
+  assert.ok(args.some((part) => String(part).includes('dst=/workspace,readonly')));
+  assert.deepEqual(args.slice(args.indexOf('--tmpfs'), args.indexOf('--tmpfs') + 2), [
+    '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=512m',
+  ]);
   assert.ok(args.includes('COREPACK_HOME=/workspace/.northset/bootstrap-home/.cache/node/corepack'));
-  assert.ok(args.at(-1).includes(value.oracle.setup_commands[0]));
-  assert.ok(args.at(-1).indexOf(value.oracle.setup_commands[0]) < args.at(-1).indexOf(value.oracle.command));
+  assert.equal(args.at(-1).trim().endsWith(value.oracle.command), true);
 });
 
 test('changed-file risk classes reject dependency, CI, binary, and existing-test mutations', () => {
@@ -295,9 +462,12 @@ test('the differential oracle is bound to newly added test files', () => {
     {path: 'test/parser.test.mjs', class: 'added-test'},
   ];
   assert.doesNotThrow(() => assertOracleChangedPaths(value, classes));
-  assert.throws(() => assertOracleChangedPaths(value, [
+  assert.doesNotThrow(() => assertOracleChangedPaths(value, [
     {path: 'test/parser.test.mjs', class: 'modified-existing-test'},
-  ]), /newly added/i);
+  ]));
+  assert.throws(() => assertOracleChangedPaths(value, [
+    {path: 'test/parser.test.mjs', class: 'rename'},
+  ]), /newly added|modified existing/i);
 });
 
 test('manifest digest is order-stable and content-bound', () => {
@@ -364,10 +534,24 @@ test('identity, binding chain, and direct mission footer are fail closed', () =>
   const chain = {patch_sha256: digest('a'), tested_tree_oid: oid('b'), commit_oid: oid('c')};
   assert.equal(assertBindingChain({...chain, pushed_oid: oid('c'), pr_head_oid: oid('c')}), true);
   assert.throws(() => assertBindingChain({...chain, pushed_oid: oid('d')}), /binding mismatch/);
-  assert.match(receiptFooter('M-010', oid('c')), /#M-010/);
+  const footer = receiptFooter('M-010', oid('c'));
+  const canonicalReceipt = 'https://northset-oss.github.io/verification-pilot/receipts/M-010/';
+  assert.equal(footer, [
+    '---',
+    'AI assistance was used; I reviewed and own this change.',
+    '',
+    '<!-- northset-receipt:M-010:start -->',
+    '### Verification',
+    '',
+    `[Northset proof-of-pass receipt M-010](${canonicalReceipt})  `,
+    'Contributor self-run; not maintainer verification.',
+    '<!-- northset-receipt:M-010:end -->',
+  ].join('\n'));
+  assert.equal(footer.split(canonicalReceipt).length - 1, 1);
+  assert.doesNotMatch(footer, /\/#M-010/);
   const bodyText = prBody(spec(), {changedFiles: ['src/index.mjs'], commitOid: oid('c')});
   assert.match(bodyText, /AI assistance was used/);
-  assert.match(bodyText, /M-010 receipt/);
+  assert.match(bodyText, /proof-of-pass receipt M-010/);
   const templated = prBody(spec({pr: {
     ...spec().pr,
     body_template: '## Changes\n\n{{SUMMARY}}\n\nCloses: #{{ISSUE_NUMBER}}\n\n{{CHECKS}}\n\n{{RECEIPT_FOOTER}}',
@@ -375,6 +559,22 @@ test('identity, binding chain, and direct mission footer are fail closed', () =>
   assert.match(templated, /Closes: #123/);
   assert.match(templated, /npm test -- test\/parser\.test\.mjs/);
   assert.match(templated, /Contributor self-run/);
+});
+
+test('PR preparation rejects duplicate canonical or legacy receipt links before publication', () => {
+  const canonical = 'https://northset-oss.github.io/verification-pilot/receipts/M-010/';
+  assert.throws(() => prBody(spec({pr: {...spec().pr, summary: `Duplicate ${canonical}`}}), {
+    changedFiles: ['src/index.mjs'], commitOid: oid('c'),
+  }), /canonical receipt URL.*exactly once/i);
+  assert.throws(() => prBody(spec({pr: {
+    ...spec().pr, summary: 'Legacy https://northset-oss.github.io/verification-pilot/#M-010',
+  }}), {changedFiles: ['src/index.mjs'], commitOid: oid('c')}), /legacy receipt URL/i);
+  assert.throws(() => prBody(spec({pr: {
+    ...spec().pr, summary: 'Legacy https://northset-oss.github.io/verification-pilot#M-010',
+  }}), {changedFiles: ['src/index.mjs'], commitOid: oid('c')}), /legacy receipt URL/i);
+  assert.throws(() => prBody(spec({pr: {
+    ...spec().pr, summary: 'Extra ledger link https://northset-oss.github.io/verification-pilot/docs/',
+  }}), {changedFiles: ['src/index.mjs'], commitOid: oid('c')}), /one Northset ledger link/i);
 });
 
 test('timeline pagination and cross-reference parsing include closed attempts with timestamps', () => {
@@ -401,14 +601,14 @@ test('semantic PR matching is title-bounded and ignores unrelated dependency rel
 
 test('live recheck fails closed on invitation drift, issue drift, overlap, and Northset repo cap', async () => {
   const value = spec();
-  const state = {labels: ['help wanted'], updatedAt: value.qualification.issue_updated_at, prs: [], timeline: [[]], designPresent: true, noticePresent: true};
+  const state = {labels: ['help wanted'], updatedAt: value.qualification.issue_updated_at, comments: [], prs: [], timeline: [[]], designPresent: true, noticePresent: true};
   const gh = async (args) => {
     const joined = args.join(' ');
     if (joined.includes('/issues/comments/1')) return state.designPresent ? {
       html_url: value.qualification.acceptance_contract.design_evidence[0].url,
       author_association: 'MEMBER', created_at: '2026-07-13T10:00:00Z',
     } : {html_url: 'https://github.com/owner/repo/issues/123#issuecomment-2', author_association: 'NONE'};
-    if (joined.includes('/comments?')) return [[]];
+    if (joined.includes('/comments?')) return [state.comments];
     if (joined.includes('/timeline?')) return state.timeline;
     if (joined.startsWith('pr list')) return state.prs;
     if (joined.includes('/git/ref/heads/')) return {object: {sha: value.base_commit}};
@@ -433,7 +633,10 @@ test('live recheck fails closed on invitation drift, issue drift, overlap, and N
   assert.match((await recheck(value, async () => {}, options)).reasons.join(' '), /invitation/);
   state.labels = ['help wanted'];
   state.updatedAt = '2026-07-13T12:01:00Z';
-  assert.match((await recheck(value, async () => {}, options)).reasons.join(' '), /issue updated/);
+  assert.equal((await recheck(value, async () => {}, options)).clean, true);
+  state.comments = [{created_at: '2026-07-13T12:01:00Z', html_url: 'https://github.com/owner/repo/issues/123#issuecomment-2', user: {login: 'external', type: 'User'}}];
+  assert.match((await recheck(value, async () => {}, options)).reasons.join(' '), /external comment/);
+  state.comments = [];
   state.updatedAt = value.qualification.issue_updated_at;
   state.prs = [{state: 'OPEN', title: 'Parser bounded input fix', body: 'Fixes #123', url: 'https://github.com/owner/repo/pull/4', author: {login: 'someone'}}];
   assert.match((await recheck(value, async () => {}, options)).reasons.join(' '), /related PR/);

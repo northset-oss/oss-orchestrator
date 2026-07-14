@@ -1,0 +1,117 @@
+{
+  "_comment": "Format example only. Copy to specs/M-0NN.json, remove _comment, and populate every evidence field from a same-day ACCEPT returned by review-issue.mjs.",
+  "schema_version": 2,
+  "mission_id": "M-010",
+  "task_id": "TASK-OSS-F6AF8A70A15F82C2",
+  "attempt_sequence": 1,
+  "work_category": "defect_fix",
+  "candidate": "owner/repo#123",
+  "target_repo": "https://github.com/owner/repo",
+  "issue_url": "https://github.com/owner/repo/issues/123",
+  "base_branch": "main",
+  "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "problem_statement": "Current main returns the wrong value for the issue's bounded input.",
+  "acceptance_criteria": [
+    "The focused regression reproduces the documented input and observes the expected value.",
+    "Existing behavior outside that input remains unchanged."
+  ],
+  "constraints": [
+    "Do not add dependencies, change public APIs, edit CI, or change version numbers.",
+    "Follow the repository's existing test and style conventions."
+  ],
+  "implementation_hints": [],
+  "process_requirements": [],
+  "qualification": {
+    "finder_run_id": "11111111-2222-4333-8444-555555555555",
+    "candidate_rank": 1,
+    "finder_elapsed_ms": 120000,
+    "review_duration_ms": 45000,
+    "review_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "review_prompt_version": 2,
+    "reviewed_at": "2026-07-13T12:00:00Z",
+    "qualification_expires_at": "2026-07-13T14:00:00Z",
+    "evidence_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "issue_updated_at": "2026-07-13T11:00:00Z",
+    "requested_model": "gpt-5.6-sol",
+    "actual_model": null,
+    "reasoning_effort": "xhigh",
+    "service_tier": "fast",
+    "model_requests": null,
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_tokens": null,
+    "invitation_evidence": {
+      "type": "label",
+      "url": "https://github.com/owner/repo/issues/123",
+      "observed_at": "2026-07-13T12:00:00Z"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "The bounded issue behavior is still defective on current main.",
+      "expected_behavior": [
+        "The focused input returns the maintainer-documented value."
+      ],
+      "non_goals": [
+        "No new option, flag, dependency, or public API."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/owner/repo/issues/123#issuecomment-1",
+          "author_association": "MEMBER",
+          "summary": "Maintainer confirmed the expected behavior and bounded scope."
+        }
+      ]
+    },
+    "related_prs": []
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "test/focused.test.mjs"
+    ],
+    "command": "npm test -- test/focused.test.mjs",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "focused bounded-input regression",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix: handle the bounded input",
+    "summary": "Handle the issue's bounded input and add a focused regression test."
+  },
+  "executor": {
+    "profile": "node",
+    "image": "node:22-bookworm",
+    "reasoning_effort": "xhigh",
+    "install_commands": [
+      "npm ci"
+    ],
+    "commands": [
+      "npm test -- test/focused.test.mjs"
+    ],
+    "limits": {
+      "cpus": 2,
+      "memory_mb": 4096,
+      "pids": 512,
+      "wall_clock_seconds_per_command": 1800,
+      "output_bytes_per_stream": 2000000
+    }
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "url": "https://github.com/owner/repo/blob/main/CONTRIBUTING.md",
+      "checked_at": "2026-07-13T12:00:00Z",
+      "ai_policy_summary": "Summarize only the contribution rules actually verified."
+    },
+    "checks_not_run": [
+      "Full upstream CI matrix"
+    ],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

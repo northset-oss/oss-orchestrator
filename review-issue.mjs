@@ -8,17 +8,25 @@
 //
 // Output: one JSON object on stdout. Exit 0 = ACCEPT, 2 = REJECT, 1 = tool error.
 
-import {spawn} from 'node:child_process';
 import {chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {repositoryPolicyLocator, sha256} from './core.mjs';
+import {canonical, createDeadline, repositoryPolicyLocator, run, sha256, taskIdForCandidate} from './core.mjs';
+import {isInvitationLabel} from './find-candidates.mjs';
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const MODEL = process.env.OSS_REVIEW_MODEL || 'gpt-5.6-sol';
-const EFFORT = process.env.OSS_REVIEW_EFFORT || 'high';
-const TIMEOUT_MS = 10 * 60 * 1000;
+const EFFORT = process.env.OSS_REVIEW_EFFORT || 'xhigh';
+export const REVIEW_BUDGET_MS = Number(process.env.OSS_REVIEW_BUDGET_MS ?? 5 * 60 * 1000);
+export const CODEX_OUTPUT_LIMIT_BYTES = Number(process.env.OSS_REVIEW_OUTPUT_LIMIT_BYTES ?? 3_500_000);
+export const GITHUB_EVIDENCE_OUTPUT_LIMIT_BYTES = Number(
+  process.env.OSS_GITHUB_EVIDENCE_OUTPUT_LIMIT_BYTES ?? 10_000_000,
+);
+export const REVIEW_PROMPT_VERSION = 2;
+const QUALIFICATION_TTL_MS = 2 * 60 * 60 * 1000;
+const RELATED_PRS_MAX = 12;
+const RELATED_PRS_HYDRATE_MAX = 8;
 
 const CHECK_NAMES = [
   'open_unassigned',
@@ -55,35 +63,24 @@ export function parseIssue(value) {
     url: `https://github.com/${owner}/${repo}/issues/${number}`};
 }
 
-function run(command, args, {cwd, env, input, timeoutMs = TIMEOUT_MS} = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, {cwd, env: env || process.env, stdio: ['pipe', 'pipe', 'pipe']});
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
-    child.stdout.on('data', (data) => { stdout += data; });
-    child.stderr.on('data', (data) => { stderr += data; });
-    child.on('error', (error) => {
-      clearTimeout(timer);
-      resolve({code: 127, stdout, stderr: `${stderr}\n${error.message}`, timedOut: false});
-    });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      resolve({code: code ?? 1, stdout, stderr,
-        timedOut: signal === 'SIGTERM' && code === null});
-    });
-    if (input !== undefined) child.stdin.end(input);
-    else child.stdin.end();
-  });
-}
-
 async function checked(command, args, options = {}) {
-  const result = await run(command, args, options);
+  const result = await run(command, args, {
+    timeoutMs: 45_000,
+    outputLimitBytes: GITHUB_EVIDENCE_OUTPUT_LIMIT_BYTES,
+    ...options,
+  });
   if (result.code !== 0) {
     const detail = (result.stderr || result.stdout).trim().slice(-2000);
     throw new Error(`${command} ${args.join(' ')} failed${result.timedOut ? ' (timeout)' : ''}: ${detail}`);
   }
   return result.stdout;
+}
+
+export function relatedPrPlan(prs) {
+  if (prs.length > RELATED_PRS_MAX) {
+    throw new Error(`candidate has ${prs.length} plausible related PRs; fast lane allows at most ${RELATED_PRS_MAX}`);
+  }
+  return {considered: prs, hydrate: prs.slice(0, RELATED_PRS_HYDRATE_MAX)};
 }
 
 function parseJson(text, label) {
@@ -158,10 +155,11 @@ export function hardGateReasons({issueData, repoData, exactOpenPrs = []}) {
 }
 
 function rejectResult(issue, reasons) {
+  const boundedReasons = reasons.slice(0, 3);
   return {
     verdict: 'REJECT', candidate: issue.key, issue_url: issue.url,
-    summary: reasons[0] || 'A mandatory candidate gate failed.',
-    reasons,
+    summary: boundedReasons[0] || 'A mandatory candidate gate failed.',
+    reasons: boundedReasons,
     checks: Object.fromEntries(CHECK_NAMES.map((name) => [name,
       name === 'open_unassigned' || name === 'no_active_claim_or_pr' ? 'FAIL' : 'FAIL'])),
     invitation_evidence: null, acceptance_contract: null, related_prs: [],
@@ -170,8 +168,30 @@ function rejectResult(issue, reasons) {
   };
 }
 
+function boundReviewOutput(result) {
+  const bounded = {
+    ...result,
+    reasons: (result.reasons ?? []).slice(0, 3),
+    source_evidence: (result.source_evidence ?? []).slice(0, 8),
+    related_prs: (result.related_prs ?? []).slice(0, 12),
+  };
+  if (bounded.acceptance_contract) {
+    bounded.acceptance_contract = {
+      ...bounded.acceptance_contract,
+      design_evidence: (bounded.acceptance_contract.design_evidence ?? []).slice(0, 4),
+    };
+  }
+  return bounded;
+}
+
 export function enforceConservativeVerdict(result, issue, baseCommit) {
-  const normalized = {...result, candidate: issue.key, issue_url: issue.url, base_commit: baseCommit};
+  const normalized = {
+    ...result,
+    candidate: issue.key,
+    issue_url: issue.url,
+    base_commit: baseCommit,
+    task_id: taskIdForCandidate(issue.key),
+  };
   normalized.reasons = Array.isArray(normalized.reasons) ? normalized.reasons : [];
   normalized.source_evidence = Array.isArray(normalized.source_evidence) ? normalized.source_evidence : [];
   normalized.process_requirements = Array.isArray(normalized.process_requirements) ? normalized.process_requirements : [];
@@ -317,30 +337,32 @@ Return ACCEPT only if every gate below is affirmatively proven. Uncertainty is R
 2. No open direct, linked, overlapping, or semantically equivalent implementation PR exists. Read the packet's exact and possible PR matches plus timeline.
 3. The requested behavior is still absent or defective on the checked-out current default branch; cite exact path:line evidence. An old open issue is not proof.
 4. Scope and expected behavior are bounded and settled by the issue or maintainer discussion. No design question, broad umbrella, external blocker, or multi-repo program.
-5. A real existing deterministic focused test/build/lint harness can exercise the change locally without credentials, production access, special hardware, subjective visual judgment, or a new harness invented from scratch. Give the exact command.
+5. A real existing deterministic focused test/build/lint harness can exercise the change locally without credentials, production access, special hardware, subjective visual judgment, or a new harness invented from scratch. The proposed regression test must fail against the checked-out base behavior and pass after the smallest production fix. Pure test-coverage work for behavior that already passes is ineligible because it cannot satisfy the differential red/green receipt. Give the exact command.
 6. Current repository contribution instructions do not prohibit this AI-assisted workflow and do not leave a material process conflict unresolved. Ordinary human claim comments, CLA/DCO, or disclosure steps are allowed but must be listed.
 7. A current invitation is proven by a qualifying label, assignment to AysajanE, an explicit OWNER/MEMBER/COLLABORATOR invitation, or repository policy opening unassigned issues to contributions. Repository-policy evidence must use an exact GitHub blob URL pinned to the supplied base commit, including supporting line numbers. Return the exact evidence URL and observation time.
 8. Maintainer intent and acceptance criteria are settled. Return a problem statement, observable expected behavior, non-goals, and live OWNER/MEMBER/COLLABORATOR evidence. Every non-policy design_evidence URL must exactly match either the live issue URL when the evidence packet proves its author association is OWNER, MEMBER, or COLLABORATOR, or a live issue comment, PR comment, or PR review URL present in the packet. Do not cite a cross-reference or source file as maintainer evidence. A pinned repository policy may be used with author_association REPOSITORY_POLICY only when its actual text settles actionability or scope.
 9. Review every candidate related PR in the packet, including open and closed results. An open overlapping PR is blocking. A closed overlapping PR is blocking unless a later maintainer statement explicitly reopens the work and settles the acceptable direction.
 
-Classify the work. Tier A is an exact bug or missing test with maintainer-backed behavior, an existing focused seam, no dependencies or CI, no public API design, and no unresolved related history. Tier B needs human-led design or broader setup. Tier C includes proposals, new options/flags, public API expansion, type broadening, concurrency/ordering/distributed behavior, performance/security work, conflicting comments, or resisted prior PRs. The current automatic lane accepts only Tier A on the Node profile.
+Classify the work. Tier A is an exact reproducible bug with maintainer-backed behavior, an existing focused seam, a regression that will fail on the checked-out base, no dependencies or CI, no public API design, and no unresolved related history. Tier B needs human-led design or broader setup. Tier C includes pure coverage-only tasks, proposals, new options/flags, public API expansion, type broadening, concurrency/ordering/distributed behavior, performance/security work, conflicting comments, or resisted prior PRs. The current automatic lane accepts only Tier A on the Node profile.
 
 Also reject already-implemented, stale/unreproduced, docs-only manual-review, security-sensitive, dependency-only, translation-only, bounty/promotion, and hardware/cloud-only tasks. Every source-evidence item must cite a real checked-out path and line that supports the claim. ACCEPT means suitable for one Northset mission after a same-day recheck; it does not authorize claiming or submitting anything.
+
+Stop as soon as a mandatory gate fails. Report no more than three blocking reasons, eight source citations, twelve related-PR dispositions, and four design-evidence items. Do not search for additional concerns after the verdict is determined.
 
 Your final response must match the supplied JSON schema exactly.`;
 }
 
-async function collectEvidence(issue) {
+async function collectEvidence(issue, deadline) {
   const repoArg = `${issue.owner}/${issue.repo}`;
   const issueJson = await checked('gh', ['issue', 'view', String(issue.number), '-R', repoArg, '--json',
-    'number,title,body,state,assignees,labels,comments,closedByPullRequestsReferences,url,updatedAt,author']);
-  const issueMetaJson = await checked('gh', ['api', `repos/${repoArg}/issues/${issue.number}`]);
+    'number,title,body,state,assignees,labels,comments,closedByPullRequestsReferences,url,updatedAt,author'], {deadline});
+  const issueMetaJson = await checked('gh', ['api', `repos/${repoArg}/issues/${issue.number}`], {deadline});
   const repoJson = await checked('gh', ['repo', 'view', repoArg, '--json',
-    'nameWithOwner,url,isArchived,isFork,licenseInfo,defaultBranchRef,description']);
+    'nameWithOwner,url,isArchived,isFork,licenseInfo,defaultBranchRef,description'], {deadline});
   const timelineJson = await checked('gh', ['api', '--paginate', '--slurp',
-    '-H', 'Accept: application/vnd.github+json', `repos/${repoArg}/issues/${issue.number}/timeline`]);
+    '-H', 'Accept: application/vnd.github+json', `repos/${repoArg}/issues/${issue.number}/timeline`], {deadline});
   const allPrJson = await checked('gh', ['pr', 'list', '-R', repoArg, '--state', 'all', '--limit', '500',
-    '--json', 'number,title,body,url,headRefName,state,updatedAt,closedAt,mergedAt,author']);
+    '--json', 'number,title,body,url,headRefName,state,updatedAt,closedAt,mergedAt,author'], {deadline});
 
   const issueData = parseJson(issueJson, 'gh issue view');
   const issueMeta = parseJson(issueMetaJson, 'gh issue metadata');
@@ -363,13 +385,14 @@ async function collectEvidence(issue) {
     ...timelinePrs,
     ...(issueData.closedByPullRequestsReferences || []),
   ].filter((pr) => pr?.url).filter((pr, index, items) => items.findIndex((other) => other.url === pr.url) === index);
-  // Large repositories routinely make one 500-PR GraphQL query with nested reviews/files/comments
-  // fail. Keep discovery lean, then hydrate only the small set that may actually overlap.
-  const candidateRelatedPrs = await Promise.all(candidateRelatedBase.map(async (pr) => {
+  const relatedPlan = relatedPrPlan(candidateRelatedBase);
+  const hydrated = await Promise.all(relatedPlan.hydrate.map(async (pr) => {
     const detail = await checked('gh', ['pr', 'view', pr.url, '--json',
-      'number,title,body,url,headRefName,state,updatedAt,closedAt,mergedAt,author,files,latestReviews,comments']);
+      'number,title,body,url,headRefName,state,updatedAt,closedAt,mergedAt,author,files,latestReviews,comments'], {deadline});
     return {...pr, ...parseJson(detail, `gh pr view ${pr.url}`)};
   }));
+  const details = new Map(hydrated.map((pr) => [pr.url, pr]));
+  const candidateRelatedPrs = relatedPlan.considered.map((pr) => details.get(pr.url) ?? {...pr, hydrated: false});
   return {issueData, issueMeta, repoData, timeline, exactOpenPrs, candidateRelatedPrs,
     possibleSemanticPrs: candidateRelatedPrs.filter((pr) => !exactOpenPrs.some((exact) => exact.url === pr.url))};
 }
@@ -378,7 +401,7 @@ export async function validatedInvitation(result, evidence, repoDir, baseCommit,
   const invitation = result.invitation_evidence;
   if (!invitation) return null;
   if (invitation.type === 'label') {
-    return invitation.url === evidence.issueData.url && evidence.issueData.labels.some((label) => /^(good first issue|help wanted)$/i.test(label.name))
+    return invitation.url === evidence.issueData.url && evidence.issueData.labels.some((label) => isInvitationLabel(label.name))
       ? invitation : null;
   }
   if (invitation.type === 'assignment') {
@@ -446,9 +469,25 @@ async function sourceEvidenceExists(entries, repoDir) {
   return checked > 0;
 }
 
-async function review(issue) {
+export function buildEvidencePacket(issue, baseCommit, evidence, observedAt = new Date().toISOString()) {
+  return {
+    candidate: issue.key,
+    issue_url: issue.url,
+    base_commit: baseCommit,
+    observed_at: observedAt,
+    ...evidence,
+  };
+}
+
+async function review(issue, deadline = createDeadline(REVIEW_BUDGET_MS)) {
+  const reviewStartedMs = Date.now();
   console.error(`review ${issue.key}: collecting live GitHub evidence…`);
-  const evidence = await collectEvidence(issue);
+  let evidence;
+  try { evidence = await collectEvidence(issue, deadline); }
+  catch (error) {
+    if (/plausible related PRs/.test(error.message)) return rejectResult(issue, [error.message]);
+    throw error;
+  }
   const hardReasons = hardGateReasons({...evidence});
   if (hardReasons.length) return rejectResult(issue, hardReasons);
 
@@ -458,13 +497,13 @@ async function review(issue) {
   try {
     console.error(`review ${issue.key}: cloning current default branch…`);
     await checked('git', ['clone', '--depth=1', '--filter=blob:none',
-      `https://github.com/${issue.owner}/${issue.repo}.git`, repoDir], {timeoutMs: 4 * 60 * 1000});
-    const baseCommit = (await checked('git', ['-C', repoDir, 'rev-parse', 'HEAD'])).trim();
+      `https://github.com/${issue.owner}/${issue.repo}.git`, repoDir], {deadline, timeoutMs: 60_000});
+    const baseCommit = (await checked('git', ['-C', repoDir, 'rev-parse', 'HEAD'], {deadline})).trim();
 
     const evidenceFile = 'NORTHSET_REVIEW_EVIDENCE.json';
-    await writeFile(path.join(repoDir, evidenceFile), JSON.stringify({
-      candidate: issue.key, issue_url: issue.url, base_commit: baseCommit, ...evidence,
-    }, null, 2));
+    const evidencePacket = buildEvidencePacket(issue, baseCommit, evidence);
+    const evidenceSha = sha256(Buffer.from(canonical(evidencePacket)));
+    await writeFile(path.join(repoDir, evidenceFile), JSON.stringify(evidencePacket, null, 2));
 
     const schemaFile = path.join(root, 'result-schema.json');
     const resultFile = path.join(root, 'result.json');
@@ -476,9 +515,12 @@ async function review(issue) {
     console.error(`review ${issue.key}: inspecting source with ${MODEL} (${EFFORT})…`);
     const codex = await run('codex', ['exec', '--ephemeral', '--ignore-rules', '--sandbox', 'read-only',
       '--output-schema', schemaFile, '--output-last-message', resultFile, '--color', 'never',
-      '--model', MODEL, '-c', `model_reasoning_effort="${EFFORT}"`, '-C', repoDir, '-'], {
+      '--model', MODEL, '-c', `model_reasoning_effort="${EFFORT}"`, '-c', 'service_tier="fast"', '-C', repoDir, '-'], {
       env: codexEnvironment(codexHome, agentHome, agentTemp),
       input: reviewPrompt(issue, evidenceFile),
+      deadline,
+      outputLimitBytes: CODEX_OUTPUT_LIMIT_BYTES,
+      terminateOnOutputLimit: false,
     });
     if (codex.code !== 0) {
       throw new Error(`codex review failed${codex.timedOut ? ' (timeout)' : ''}: ${(codex.stderr || codex.stdout).trim().slice(-2000)}`);
@@ -515,6 +557,34 @@ async function review(issue) {
     if (enforced.verdict === 'ACCEPT' && !await sourceEvidenceExists(enforced.source_evidence, repoDir)) {
       enforced = {...enforced, verdict: 'REJECT', reasons: ['No verifiable checked-out path:line evidence supports the current-main claim.', ...enforced.reasons]};
     }
+    enforced = boundReviewOutput(enforced);
+    if (enforced.verdict === 'ACCEPT') {
+      const reviewedAt = new Date();
+      const qualificationExpiresAt = new Date(reviewedAt.getTime() + QUALIFICATION_TTL_MS);
+      const reviewId = sha256(Buffer.from(canonical({
+        candidate: issue.key, base_commit: baseCommit, evidence_sha256: evidenceSha,
+        review_prompt_version: REVIEW_PROMPT_VERSION,
+      })));
+      enforced = {
+        ...enforced,
+        review_id: reviewId,
+        review_prompt_version: REVIEW_PROMPT_VERSION,
+        reviewed_at: reviewedAt.toISOString(),
+        qualification_expires_at: qualificationExpiresAt.toISOString(),
+        evidence_sha256: evidenceSha,
+        issue_updated_at: evidence.issueData.updatedAt,
+        requested_model: MODEL,
+        actual_model: null,
+        reasoning_effort: EFFORT,
+        service_tier: 'fast',
+        review_duration_ms: Date.now() - reviewStartedMs,
+        model_requests: null,
+        input_tokens: null,
+        cached_input_tokens: null,
+        output_tokens: null,
+        reasoning_tokens: null,
+      };
+    }
     return enforced;
   } finally {
     if (codexHome) await rm(codexHome, {recursive: true, force: true});
@@ -529,7 +599,17 @@ async function main() {
     process.exit(process.argv.length === 3 ? 0 : 1);
   }
   const issue = parseIssue(process.argv[2]);
-  const result = await review(issue);
+  const deadline = createDeadline(REVIEW_BUDGET_MS);
+  let result;
+  try { result = await review(issue, deadline); }
+  catch (error) {
+    if (deadline.expired() || /timeout|deadline|output limit/i.test(error.message)) {
+      const reason = /output limit/i.test(error.message)
+        ? 'Qualification evidence exceeded the fast-lane output cap.'
+        : `Qualification exceeded the ${Math.round(REVIEW_BUDGET_MS / 60_000)}-minute fast-lane budget.`;
+      result = rejectResult(issue, [reason]);
+    } else throw error;
+  }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   process.exit(result.verdict === 'ACCEPT' ? 0 : 2);
 }
@@ -537,6 +617,6 @@ async function main() {
 if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT_FILE) {
   main().catch((error) => {
     console.error(`review error: ${error.message}`);
-    process.exit(1);
+    process.exit(error.message.includes('deadline') || error.message.includes('timeout') ? 2 : 1);
   });
 }

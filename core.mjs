@@ -4,40 +4,169 @@ import {appendFile, lstat, mkdtemp, readFile, readdir, readlink, rm, writeFile} 
 import os from 'node:os';
 import path from 'node:path';
 
-// Run a command directly (never through a shell) and resolve its captured result.
-export function run(cmd, args, {cwd, env, input, timeoutMs, logPath, label} = {}) {
+const DEFAULT_OUTPUT_LIMIT_BYTES = 2_000_000;
+const KILL_GRACE_MS = 2_000;
+const ACTIVE_CHILDREN = new Set();
+let shuttingDown = false;
+
+function installSignalForwarding() {
+  if (installSignalForwarding.installed) return;
+  installSignalForwarding.installed = true;
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      for (const child of ACTIVE_CHILDREN) signalProcessGroup(child, 'SIGTERM');
+      setTimeout(() => {
+        for (const child of ACTIVE_CHILDREN) signalProcessGroup(child, 'SIGKILL');
+        process.exit(signal === 'SIGINT' ? 130 : 143);
+      }, KILL_GRACE_MS);
+    });
+  }
+}
+
+export class Deadline {
+  constructor(totalMs, {now = () => Date.now()} = {}) {
+    if (!Number.isFinite(totalMs) || totalMs <= 0) throw new Error('deadline totalMs must be positive');
+    this.totalMs = totalMs;
+    this.startedAtMs = now();
+    this.endsAtMs = this.startedAtMs + totalMs;
+    this.now = now;
+  }
+
+  remainingMs() { return Math.max(0, this.endsAtMs - this.now()); }
+  limit(phaseMs = Infinity) { return Math.max(0, Math.min(phaseMs, this.remainingMs())); }
+  expired() { return this.remainingMs() <= 0; }
+}
+
+export function createDeadline(totalMs, options) { return new Deadline(totalMs, options); }
+
+function signalProcessGroup(child, signal) {
+  try {
+    if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try { child.kill(signal); } catch {}
+  }
+}
+
+// Run a command directly (never through a shell), with a bounded process tree and output.
+export function run(cmd, args, {
+  cwd, env, input, timeoutMs, deadline, logPath, label,
+  outputLimitBytes = DEFAULT_OUTPUT_LIMIT_BYTES,
+  terminateOnOutputLimit = true,
+} = {}) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, {cwd, env: env ?? process.env, stdio: ['pipe', 'pipe', 'pipe']});
+    const startedAtMs = Date.now();
+    installSignalForwarding();
+    const effectiveTimeout = deadline ? deadline.limit(timeoutMs ?? Infinity) : timeoutMs;
+    if (effectiveTimeout !== undefined && effectiveTimeout <= 0) {
+      resolve({code: 124, stdout: '', stderr: 'deadline exhausted before subprocess start', timedOut: true, durationMs: 0});
+      return;
+    }
+    const child = spawn(cmd, args, {
+      cwd, env: env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
+    });
+    ACTIVE_CHILDREN.add(child);
     let out = '', err = '';
-    const timer = timeoutMs ? setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, timeoutMs) : null;
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
+    let timedOut = false;
+    let outputLimitExceeded = false;
+    let outputTruncated = false;
+    let finished = false;
+    let killTimer = null;
+    const terminate = (reason) => {
+      if (reason === 'timeout') timedOut = true;
+      if (reason === 'output') outputLimitExceeded = true;
+      signalProcessGroup(child, 'SIGTERM');
+      killTimer ??= setTimeout(() => signalProcessGroup(child, 'SIGKILL'), KILL_GRACE_MS);
+    };
+    const timer = Number.isFinite(effectiveTimeout)
+      ? setTimeout(() => terminate('timeout'), effectiveTimeout)
+      : null;
+    const capture = (current, data, stream) => {
+      const bytes = Buffer.from(data);
+      const remaining = Math.max(0, outputLimitBytes - Buffer.byteLength(current));
+      let next = remaining ? current + bytes.subarray(0, remaining).toString() : current;
+      if (bytes.length > remaining) {
+        if (terminateOnOutputLimit && !outputLimitExceeded) {
+          const diagnostic = `\n[subprocess ${stream} output limit exceeded: ${outputLimitBytes} bytes]\n`;
+          if (stream === 'stderr') next = `${next.slice(0, Math.max(0, outputLimitBytes - diagnostic.length))}${diagnostic}`;
+          else err += diagnostic;
+        } else if (!terminateOnOutputLimit && !outputTruncated) {
+          outputTruncated = true;
+          const diagnostic = `\n[subprocess ${stream} output truncated at ${outputLimitBytes} bytes]\n`;
+          if (stream === 'stderr') next = `${next.slice(0, Math.max(0, outputLimitBytes - diagnostic.length))}${diagnostic}`;
+          else err += diagnostic;
+        }
+        if (terminateOnOutputLimit) terminate('output');
+      }
+      return next;
+    };
+    child.stdout.on('data', (data) => { out = capture(out, data, 'stdout'); });
+    child.stderr.on('data', (data) => { err = capture(err, data, 'stderr'); });
     child.on('close', async (code) => {
+      if (finished) return;
+      finished = true;
+      ACTIVE_CHILDREN.delete(child);
       if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      let logError = null;
       if (logPath) {
         const line = `\n$ ${label ?? `${cmd} ${args.join(' ')}`}\n${out}${err ? `\n[stderr]\n${err}` : ''}\n`;
-        await appendFile(logPath, line, {mode: 0o600});
+        try { await appendFile(logPath, line, {mode: 0o600}); }
+        catch (error) { logError = error.message; }
       }
-      resolve({code, stdout: out, stderr: err});
+      resolve({
+        code: timedOut ? 124 : outputLimitExceeded ? 125 : (code ?? 1),
+        stdout: out, stderr: err, timedOut, outputLimitExceeded, outputTruncated, logError,
+        durationMs: Date.now() - startedAtMs,
+      });
     });
     child.on('error', (error) => {
+      if (finished) return;
+      finished = true;
+      ACTIVE_CHILDREN.delete(child);
       if (timer) clearTimeout(timer);
-      resolve({code: 127, stdout: out, stderr: `${err}\n${error.message}`});
+      if (killTimer) clearTimeout(killTimer);
+      resolve({
+        code: 127, stdout: out, stderr: `${err}\n${error.message}`,
+        timedOut, outputLimitExceeded, outputTruncated,
+        durationMs: Date.now() - startedAtMs,
+      });
     });
+    child.stdin.on('error', () => {});
     if (input !== undefined) { child.stdin.write(input); child.stdin.end(); }
+    else child.stdin.end();
   });
 }
 
-export const git = (cwd, ...args) => run('git', ['-C', cwd, ...args]);
+export function sanitizedGitEnv(extra = {}) {
+  return {...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', ...extra};
+}
 
-export async function ghJson(args) {
-  const result = await run('gh', args);
+export const git = (cwd, ...args) => run('git', ['-C', cwd, ...args], {env: sanitizedGitEnv()});
+
+export async function ghJson(args, options = {}) {
+  const result = await run('gh', args, options);
   if (result.code !== 0) throw new Error(`gh ${args.join(' ')} failed: ${result.stderr.trim() || result.stdout.trim()}`);
   return JSON.parse(result.stdout);
 }
 
 export function sha256(value) {
   return `sha256:${createHash('sha256').update(value).digest('hex')}`;
+}
+
+export function taskIdForCandidate(candidate) {
+  if (typeof candidate !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9][0-9]*$/.test(candidate)) {
+    throw new Error('task identity requires an owner/repo#123 candidate key');
+  }
+  const digest = createHash('sha256')
+    .update(`northset-oss-task-v1\0${candidate.toLowerCase()}`)
+    .digest('hex')
+    .slice(0, 16)
+    .toUpperCase();
+  return `TASK-OSS-${digest}`;
 }
 
 export function canonical(value) {
@@ -112,13 +241,17 @@ export function assertOssCommitIdentity({authorEmail, committerEmail, body}) {
 export function receiptFooter(missionId, commitOid) {
   if (!/^M-[0-9]{3,}$/.test(missionId ?? '')) throw new Error('receipt footer requires a mission id');
   if (!/^[0-9a-f]{40}$/i.test(commitOid ?? '')) throw new Error('receipt footer requires a full commit OID');
+  const receiptUrl = `https://northset-oss.github.io/verification-pilot/receipts/${missionId}/`;
   return [
     '---',
     'AI assistance was used; I reviewed and own this change.',
     '',
-    `Northset self-run record for commit \`${commitOid.slice(0, 12)}\`: [${missionId} receipt](https://northset-oss.github.io/verification-pilot/#${missionId}).`,
-    'It records the declared checks and published bundle provenance.',
+    `<!-- northset-receipt:${missionId}:start -->`,
+    '### Verification',
+    '',
+    `[Northset proof-of-pass receipt ${missionId}](${receiptUrl})  `,
     'Contributor self-run; not maintainer verification.',
+    `<!-- northset-receipt:${missionId}:end -->`,
   ].join('\n');
 }
 
@@ -149,7 +282,7 @@ function oracleCommandTargets(command, testPaths) {
 }
 export function authorEffort(spec) {
   const value = spec?.executor?.reasoning_effort;
-  if (value === undefined || value === null) return 'high';
+  if (value === undefined || value === null) return 'xhigh';
   if (typeof value !== 'string' || !AUTHOR_EFFORTS.includes(value)) {
     throw new Error(`executor.reasoning_effort must be one of ${AUTHOR_EFFORTS.join(', ')}, got ${JSON.stringify(value)}`);
   }
@@ -258,7 +391,20 @@ export function validateSpec(spec) {
     throw new Error('issue_url does not match candidate issue');
   }
   if (Object.hasOwn(spec, 'code_prompt')) throw new Error('legacy code_prompt is forbidden; use the evidence-backed acceptance contract fields');
-  if (spec.schema_version !== 1) throw new Error('schema_version must equal 1');
+  if (![1, 2].includes(spec.schema_version)) throw new Error('schema_version must equal 1 or 2');
+  const economicFields = ['task_id', 'attempt_sequence', 'work_category'];
+  if (spec.schema_version === 2) {
+    const expectedTaskId = taskIdForCandidate(spec.candidate);
+    if (spec.task_id !== expectedTaskId) throw new Error(`task_id must match candidate identity ${expectedTaskId}`);
+    if (!Number.isInteger(spec.attempt_sequence) || spec.attempt_sequence < 1) {
+      throw new Error('attempt_sequence must be a positive integer');
+    }
+    if (!['defect_fix', 'compatibility_fix', 'developer_tooling_fix', 'documentation_fix', 'test_infrastructure_fix'].includes(spec.work_category)) {
+      throw new Error('work_category must be a bounded factual OSS work category');
+    }
+  } else if (economicFields.some((field) => Object.hasOwn(spec, field))) {
+    throw new Error('task_id, attempt_sequence, and work_category require schema_version 2');
+  }
   if (typeof spec.base_branch !== 'string' || !spec.base_branch.trim()) throw new Error('base_branch is required');
   if (!/^[0-9a-f]{40}$/i.test(spec.base_commit ?? '')) throw new Error('base_commit must be a full 40-character commit SHA');
   for (const field of ['problem_statement']) {
@@ -274,10 +420,44 @@ export function validateSpec(spec) {
       !spec.process_requirements.every((item) => typeof item === 'string' && item.trim())) {
     throw new Error('process_requirements must be an array of non-empty strings');
   }
+  if (spec.receipt?.limitations !== undefined) {
+    const limitations = spec.receipt.limitations;
+    const baseline = ['Does not prove code quality', 'Does not prove security'];
+    if (!Array.isArray(limitations) || !limitations.every((item) => typeof item === 'string' && item.trim()) ||
+        !baseline.every((item) => limitations.includes(item))) {
+      throw new Error('receipt.limitations must include exact baseline entries "Does not prove code quality" and "Does not prove security"');
+    }
+  }
   const q = spec.qualification;
   if (!q || typeof q !== 'object') throw new Error('qualification is required');
-  for (const field of ['reviewed_at', 'issue_updated_at']) {
+  if (!/^sha256:[0-9a-f]{64}$/i.test(q.review_id ?? '')) throw new Error('qualification.review_id must be a sha256 digest');
+  if (q.review_prompt_version !== 2) throw new Error('qualification.review_prompt_version must equal 2');
+  if (!/^sha256:[0-9a-f]{64}$/i.test(q.evidence_sha256 ?? '')) throw new Error('qualification.evidence_sha256 must be a sha256 digest');
+  for (const field of ['reviewed_at', 'qualification_expires_at', 'issue_updated_at']) {
     if (typeof q[field] !== 'string' || !Number.isFinite(Date.parse(q[field]))) throw new Error(`qualification.${field} must be an ISO timestamp`);
+  }
+  if (spec.schema_version === 2) {
+    if (q.finder_run_id !== null && q.finder_run_id !== undefined && !/^[0-9a-f-]{36}$/i.test(q.finder_run_id)) {
+      throw new Error('qualification.finder_run_id must be a UUID or null');
+    }
+    if (q.candidate_rank !== null && q.candidate_rank !== undefined && (!Number.isInteger(q.candidate_rank) || q.candidate_rank < 1)) {
+      throw new Error('qualification.candidate_rank must be a positive integer or null');
+    }
+    for (const field of ['finder_elapsed_ms', 'review_duration_ms']) {
+      if (q[field] !== null && q[field] !== undefined && (!Number.isInteger(q[field]) || q[field] < 0)) {
+        throw new Error(`qualification.${field} must be a non-negative integer or null`);
+      }
+    }
+    for (const field of ['requested_model', 'reasoning_effort', 'service_tier']) {
+      if (typeof q[field] !== 'string' || !q[field].trim()) throw new Error(`qualification.${field} is required for schema_version 2`);
+    }
+    if (q.actual_model !== null && q.actual_model !== undefined && (typeof q.actual_model !== 'string' || !q.actual_model.trim())) {
+      throw new Error('qualification.actual_model must be a non-blank string or null');
+    }
+  }
+  const qualificationLifetime = Date.parse(q.qualification_expires_at) - Date.parse(q.reviewed_at);
+  if (qualificationLifetime <= 0 || qualificationLifetime > 2 * 60 * 60 * 1000) {
+    throw new Error('qualification TTL must be positive and at most two hours');
   }
   if (!q.invitation_evidence || !['label', 'assignment', 'maintainer_comment', 'repository_policy'].includes(q.invitation_evidence.type) ||
     typeof q.invitation_evidence.url !== 'string' || !Number.isFinite(Date.parse(q.invitation_evidence.observed_at))) {
@@ -305,7 +485,8 @@ export function validateSpec(spec) {
   const contract = q.acceptance_contract;
   if (!contract || typeof contract.problem !== 'string' || !contract.problem.trim() ||
     !Array.isArray(contract.expected_behavior) || contract.expected_behavior.length === 0 ||
-    !Array.isArray(contract.non_goals) || !Array.isArray(contract.design_evidence) || contract.design_evidence.length === 0) {
+    !Array.isArray(contract.non_goals) || !Array.isArray(contract.design_evidence) || contract.design_evidence.length === 0 ||
+    contract.design_evidence.length > 4) {
     throw new Error('qualification.acceptance_contract is incomplete');
   }
   if (!contract.design_evidence.every((item) => item && typeof item.url === 'string' &&
@@ -319,7 +500,7 @@ export function validateSpec(spec) {
       repositoryPolicyLocator({...item, type: 'repository_policy'}, candidate, spec.base_commit);
     } else maintainerEvidenceEndpoint(item.url, candidate, {allowIssue: true});
   }
-  if (!Array.isArray(q.related_prs) || q.related_prs.some((item) => {
+  if (!Array.isArray(q.related_prs) || q.related_prs.length > 12 || q.related_prs.some((item) => {
     if (!item || typeof item.url !== 'string' || !['OPEN', 'CLOSED', 'MERGED'].includes(item.state) ||
       !['overlap', 'not_related'].includes(item.relationship) || typeof item.disposition !== 'string') return true;
     if (item.relationship !== 'overlap') return false;
@@ -340,10 +521,8 @@ export function validateSpec(spec) {
     spec.oracle.patched_expected !== 'zero') {
     throw new Error('oracle must define a regression-test red-to-green contract');
   }
-  if (spec.oracle.setup_commands !== undefined &&
-    (!Array.isArray(spec.oracle.setup_commands) || spec.oracle.setup_commands.length > 3 ||
-      !spec.oracle.setup_commands.every((item) => typeof item === 'string' && item.trim() && item.length <= 500 && !/[\n;&|`]/.test(item)))) {
-    throw new Error('oracle.setup_commands must contain at most three single deterministic commands');
+  if (spec.oracle.setup_commands !== undefined) {
+    throw new Error('oracle.setup_commands are forbidden in the fast lane; checks must run on the committed tree');
   }
   if (!oracleCommandTargets(spec.oracle.command, spec.oracle.test_paths)) {
     throw new Error('oracle.command must name every oracle.test_paths entry so base red is attributable to the added regression');
@@ -435,15 +614,21 @@ export function possibleOverlappingPrs(prs, spec) {
   });
 }
 
-export async function recheck(spec, log, {gh = ghJson, now = () => new Date()} = {}) {
+export async function recheck(spec, log, options = {}) {
+  const mode = options.mode ?? 'prepare';
+  if (!['prepare', 'pre-public', 'pre-pr'].includes(mode)) throw new Error(`unknown recheck mode ${mode}`);
+  const now = options.now ?? (() => new Date());
+  const gh = options.gh ?? ((args) => ghJson(args, {deadline: options.deadline, timeoutMs: 60_000}));
   const {owner, repo, issue: num} = parseCandidate(spec.candidate);
   const repoData = await gh(['api', `repos/${owner}/${repo}`,
     '--jq', '{default_branch,archived,fork,html_url}']);
   const issue = await gh(['api', `repos/${owner}/${repo}/issues/${num}`,
     '--jq', '{number,state,title,html_url,assignees:[.assignees[].login],labels:[.labels[].name],created_at,updated_at,body,author_association,user:.user.login}']);
-  const comments = (await gh(['api', `repos/${owner}/${repo}/issues/${num}/comments?per_page=100`, '--paginate', '--slurp'])).flat();
-  const defaultRef = await gh(['api', `repos/${owner}/${repo}/git/ref/heads/${repoData.default_branch}`]);
-  const defaultHead = defaultRef.object?.sha;
+  const commentPages = await gh(['api', `repos/${owner}/${repo}/issues/${num}/comments?per_page=100`, '--paginate', '--slurp']);
+  const comments = Array.isArray(commentPages) ? commentPages.flat() : [];
+  const defaultRef = mode === 'pre-pr' ? null
+    : await gh(['api', `repos/${owner}/${repo}/git/ref/heads/${repoData.default_branch}`]);
+  const defaultHead = defaultRef?.object?.sha ?? null;
   const allPrs = await gh(['pr', 'list', '--repo', `${owner}/${repo}`, '--state', 'all', '--limit', '500',
     '--json', 'number,title,body,url,state,headRefName,author,updatedAt,closedAt,mergedAt']);
   const openPrs = allPrs.filter((pr) => pr.state === 'OPEN');
@@ -462,12 +647,14 @@ export async function recheck(spec, log, {gh = ghJson, now = () => new Date()} =
   const semanticPRs = possibleOverlappingPrs(allPrs, spec).filter((pr) => pr.author?.login !== 'AysajanE');
   const related = new Map(spec.qualification.related_prs.map((item) => [item.url, item]));
   const reopeningChecks = new Map();
-  for (const reviewed of spec.qualification.related_prs) {
-    if (!reviewed.reopened_by) continue;
-    const evidence = await fetchMaintainerEvidence(reviewed.reopened_by, {owner, repo}, gh);
-    const livePr = allPrs.find((pr) => pr.url === reviewed.url);
-    reopeningChecks.set(reviewed.url, evidence.valid && Boolean(evidence.timestamp) && Boolean(livePr?.closedAt) &&
-      Date.parse(evidence.timestamp) > Date.parse(livePr.closedAt));
+  if (mode !== 'pre-pr') {
+    for (const reviewed of spec.qualification.related_prs) {
+      if (!reviewed.reopened_by) continue;
+      const evidence = await fetchMaintainerEvidence(reviewed.reopened_by, {owner, repo}, gh);
+      const livePr = allPrs.find((pr) => pr.url === reviewed.url);
+      reopeningChecks.set(reviewed.url, evidence.valid && Boolean(evidence.timestamp) && Boolean(livePr?.closedAt) &&
+        Date.parse(evidence.timestamp) > Date.parse(livePr.closedAt));
+    }
   }
   const blockingSemantic = semanticPRs.filter((pr) => {
     if (pr.state === 'OPEN' || pr.state === 'MERGED') return true;
@@ -490,17 +677,20 @@ export async function recheck(spec, log, {gh = ghJson, now = () => new Date()} =
           ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(comment.author_association))
         : invitationPolicy?.content_sha256 === invitation.content_sha256;
   const designPolicies = new Map();
-  for (const item of spec.qualification.acceptance_contract.design_evidence) {
-    if (item.author_association !== 'REPOSITORY_POLICY') continue;
-    const fetched = await fetchRepositoryPolicy({...item, type: 'repository_policy'}, {owner, repo}, spec.base_commit, gh);
-    designPolicies.set(item.url, fetched);
-  }
-  const designEvidenceStillPresent = (await Promise.all(spec.qualification.acceptance_contract.design_evidence.map(async (item) => {
-    if (item.author_association === 'REPOSITORY_POLICY') {
-      return designPolicies.get(item.url)?.content_sha256 === item.content_sha256;
+  let designEvidenceStillPresent = true;
+  if (mode !== 'pre-pr') {
+    for (const item of spec.qualification.acceptance_contract.design_evidence) {
+      if (item.author_association !== 'REPOSITORY_POLICY') continue;
+      const fetched = await fetchRepositoryPolicy({...item, type: 'repository_policy'}, {owner, repo}, spec.base_commit, gh);
+      designPolicies.set(item.url, fetched);
     }
-    return (await fetchMaintainerEvidence(item, {owner, repo, issue: num}, gh, {allowIssue: true})).valid;
-  }))).every(Boolean);
+    designEvidenceStillPresent = (await Promise.all(spec.qualification.acceptance_contract.design_evidence.map(async (item) => {
+      if (item.author_association === 'REPOSITORY_POLICY') {
+        return designPolicies.get(item.url)?.content_sha256 === item.content_sha256;
+      }
+      return (await fetchMaintainerEvidence(item, {owner, repo, issue: num}, gh, {allowIssue: true})).valid;
+    }))).every(Boolean);
+  }
   let preAuthorNoticeStillPresent = true;
   let preAuthorNotice = null;
   if (spec.qualification.pre_author_notice_required) {
@@ -524,8 +714,36 @@ export async function recheck(spec, log, {gh = ghJson, now = () => new Date()} =
   if (issue.assignees.some((login) => login !== 'AysajanE')) reasons.push(`assigned to ${issue.assignees.join(', ')}`);
   if (repoData.archived || repoData.fork) reasons.push('repository is archived or a fork');
   if (repoData.default_branch !== spec.base_branch) reasons.push(`default branch changed to ${repoData.default_branch}`);
-  if (defaultHead !== spec.base_commit) reasons.push(`default branch head changed to ${defaultHead}`);
-  if (issue.updated_at !== spec.qualification.issue_updated_at) reasons.push(`issue updated at ${issue.updated_at} after qualification`);
+  if (mode === 'prepare' && defaultHead !== spec.base_commit) reasons.push(`reviewed base is stale; default branch head is ${defaultHead}`);
+  if (mode === 'prepare' && Date.parse(spec.qualification.qualification_expires_at) <= now().getTime()) {
+    reasons.push(`qualification expired at ${spec.qualification.qualification_expires_at}`);
+  }
+  if (mode === 'pre-public' && defaultHead && defaultHead !== spec.base_commit) {
+    const ancestryCheck = options.ancestryCheck ?? (async () => {
+      const comparison = await gh(['api', `repos/${owner}/${repo}/compare/${spec.base_commit}...${defaultHead}`]);
+      return ['ahead', 'identical'].includes(comparison?.status) && comparison?.merge_base_commit?.sha === spec.base_commit;
+    });
+    const mergeabilityCheck = options.mergeabilityCheck ?? (async () => {
+      if (!options.authorRepo || !options.commitOid) throw new Error('pre-public mergeability requires the prepared author repository and commit');
+      const fetched = await run('git', ['-C', options.authorRepo, 'fetch', '--no-tags', 'origin', defaultHead], {
+        env: sanitizedGitEnv(), deadline: options.deadline, timeoutMs: 60_000,
+      });
+      if (fetched.code !== 0) return false;
+      const merged = await run('git', ['-C', options.authorRepo, 'merge-tree', '--write-tree', defaultHead, options.commitOid], {
+        env: sanitizedGitEnv(), deadline: options.deadline, timeoutMs: 60_000,
+      });
+      return merged.code === 0;
+    });
+    if (!await ancestryCheck(spec.base_commit, defaultHead)) reasons.push('approved base is no longer an ancestor of the default branch');
+    else if (!await mergeabilityCheck(defaultHead, options.commitOid)) reasons.push('reviewed commit no longer merges cleanly with the default branch');
+  }
+  const newExternalComments = comments.filter((comment) => {
+    const created = Date.parse(comment.created_at ?? comment.createdAt ?? '');
+    const login = comment.user?.login ?? comment.author?.login ?? '';
+    const type = comment.user?.type ?? comment.author?.type ?? '';
+    return Number.isFinite(created) && created > reviewedAt && login !== 'AysajanE' && type !== 'Bot' && !/\[bot\]$/i.test(login);
+  });
+  if (newExternalComments.length) reasons.push(`new non-bot external comment after qualification: ${newExternalComments[0].html_url ?? newExternalComments[0].url ?? 'unknown URL'}`);
   if (!invitationStillPresent) reasons.push('contribution invitation is no longer present');
   if (!designEvidenceStillPresent) reasons.push('maintainer design evidence is no longer present');
   if (!preAuthorNoticeStillPresent) reasons.push('required pre-author notice is no longer present');
@@ -534,8 +752,8 @@ export async function recheck(spec, log, {gh = ghJson, now = () => new Date()} =
   if (northsetOpen.length) reasons.push(`Northset already has an open PR in ${owner}/${repo}: ${northsetOpen.map((pr) => pr.url).join(', ')}`);
   const policy = await loadRepoPolicy();
   if (policy.cooldowns?.[`${owner}/${repo}`]) reasons.push(`repository cooldown: ${policy.cooldowns[`${owner}/${repo}`].reason}`);
-  await log(`recheck: state=${issue.state} invitation=${invitationStillPresent ? 'present' : 'missing'} assignees=${issue.assignees.join(',') || 'none'} crossrefs=${timeline.length} competingPRs=${competingPRs.length} relatedPRs=${blockingSemantic.length} northsetOpen=${northsetOpen.length}`);
-  return {snapshot, clean: reasons.length === 0, reasons};
+  await log(`recheck(${mode}): state=${issue.state} invitation=${invitationStillPresent ? 'present' : 'missing'} assignees=${issue.assignees.join(',') || 'none'} commentsAfterQualification=${newExternalComments.length} crossrefs=${timeline.length} competingPRs=${competingPRs.length} relatedPRs=${blockingSemantic.length} northsetOpen=${northsetOpen.length}`);
+  return {mode, snapshot, clean: reasons.length === 0, reasons};
 }
 
 export async function pool(items, limit, worker) {
@@ -551,6 +769,24 @@ export async function pool(items, limit, worker) {
   return results;
 }
 
+function checkedPrBody(body, missionId) {
+  const canonicalReceipt = `https://northset-oss.github.io/verification-pilot/receipts/${missionId}/`;
+  const ledgerRoot = 'https://northset-oss.github.io/verification-pilot';
+  if (body.split(canonicalReceipt).length - 1 !== 1) {
+    throw new Error(`${missionId} canonical receipt URL must appear exactly once in the PR body`);
+  }
+  if (body.includes(`${ledgerRoot}/#${missionId}`) || body.includes(`${ledgerRoot}#${missionId}`)) {
+    throw new Error(`${missionId} PR body contains a legacy receipt URL`);
+  }
+  for (const marker of [`<!-- northset-receipt:${missionId}:start -->`, `<!-- northset-receipt:${missionId}:end -->`]) {
+    if (body.split(marker).length - 1 !== 1) throw new Error(`${missionId} PR body must contain one marked receipt block`);
+  }
+  if (body.split(ledgerRoot).length - 1 !== 1) {
+    throw new Error(`${missionId} PR body must contain only one Northset ledger link`);
+  }
+  return `${body.trimEnd()}\n`;
+}
+
 export function prBody(spec, patchInfo) {
   const num = parseCandidate(spec.candidate).issue;
   const files = (patchInfo.changedFiles ?? []).map((file) => `- \`${file}\``).join('\n') || '- (see fix.patch)';
@@ -564,9 +800,9 @@ export function prBody(spec, patchInfo) {
     };
     const rendered = spec.pr.body_template.replace(/\{\{([A-Z_]+)\}\}/g, (_, name) => replacements[name]);
     if (/\{\{[A-Z_]+\}\}/.test(rendered)) throw new Error('PR body template has an unresolved placeholder');
-    return `${rendered.trimEnd()}\n`;
+    return checkedPrBody(rendered, spec.mission_id);
   }
-  return [
+  return checkedPrBody([
     `## Summary`,
     ``,
     spec.pr.summary,
@@ -582,20 +818,20 @@ export function prBody(spec, patchInfo) {
     ``,
     receiptFooter(spec.mission_id, patchInfo.commitOid),
     ``,
-  ].join('\n');
+  ].join('\n'), spec.mission_id);
 }
 
-export async function assertPatchCommitBinding(repoDir, baseCommit, commitOid, patchFile) {
+export async function assertPatchCommitBinding(repoDir, baseCommit, commitOid, patchFile, options = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'northset-patch-binding-'));
   const index = path.join(root, 'index');
   const env = {...process.env, GIT_INDEX_FILE: index, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null'};
   try {
-    let result = await run('git', ['-C', repoDir, 'read-tree', baseCommit], {env});
+    let result = await run('git', ['-C', repoDir, 'read-tree', baseCommit], {env, ...options, timeoutMs: options.timeoutMs ?? 60_000});
     if (result.code !== 0) throw new Error(`cannot read base tree: ${result.stderr.trim()}`);
-    result = await run('git', ['-C', repoDir, 'apply', '--cached', '--binary', patchFile], {env});
+    result = await run('git', ['-C', repoDir, 'apply', '--cached', '--binary', patchFile], {env, ...options, timeoutMs: options.timeoutMs ?? 60_000});
     if (result.code !== 0) throw new Error(`canonical patch does not apply to base: ${result.stderr.trim()}`);
-    const actual = (await run('git', ['-C', repoDir, 'write-tree'], {env})).stdout.trim();
-    const expected = (await git(repoDir, 'rev-parse', `${commitOid}^{tree}`)).stdout.trim();
+    const actual = (await run('git', ['-C', repoDir, 'write-tree'], {env, ...options, timeoutMs: options.timeoutMs ?? 60_000})).stdout.trim();
+    const expected = (await run('git', ['-C', repoDir, 'rev-parse', `${commitOid}^{tree}`], {env, ...options, timeoutMs: options.timeoutMs ?? 60_000})).stdout.trim();
     if (!actual || actual !== expected) throw new Error(`patch-to-commit tree mismatch: ${actual || '(none)'} != ${expected || '(none)'}`);
     return expected;
   } finally {
