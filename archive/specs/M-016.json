@@ -1,4 +1,5 @@
 {
+  "_archive_note": "Historical mission already shipped under v1; retained for audit only.",
   "schema_version": 1,
   "mission_id": "M-016",
   "candidate": "renovatebot/renovate#44500",

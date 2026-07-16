@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "mission_id": "M-020",
+  "candidate": "KaotoIO/kaoto#3473",
+  "target_repo": "https://github.com/KaotoIO/kaoto",
+  "issue_url": "https://github.com/KaotoIO/kaoto/issues/3473",
+  "base_branch": "main",
+  "base_commit": "caf30cc7c6123728c8c05d1f36e9cd8a67f23f0e",
+  "problem_statement": "When an XSD sequence contains multiple element particles that reference the same abstract declaration, name-based deduplication drops every reference after the first and loses that particle's occurrence constraints.",
+  "acceptance_criteria": [
+    "Each repeated reference to the same abstract element produces a separate abstract wrapper field.",
+    "The wrappers have stable unique internal names while each keeps the abstract declaration's display name for the UI.",
+    "Each wrapper preserves minOccurs and maxOccurs from its own referencing particle; the focused two-reference fixture preserves maxOccurs values 1 and unbounded.",
+    "Existing concrete-element deduplication and the rest of the focused abstract-element suite remain green."
+  ],
+  "constraints": [
+    "Do not add dependencies, change public APIs, edit CI, update documentation, lockfiles, generated output, or version numbers.",
+    "Keep the change limited to packages/ui/src/services/document/xml-schema/xml-schema-document.service.ts and a new focused test at packages/ui/src/services/document/xml-schema/xml-schema-document.service.abstract-repeated-ref.test.ts.",
+    "Do not redesign substitution-group membership, schema-path indexing, ordinary concrete-element deduplication, or unrelated DataMapper UI behavior.",
+    "Use an inline deterministic XSD fixture; do not add fixture files or require network access."
+  ],
+  "implementation_hints": [
+    "The current same-name guard in populateElement runs before abstract-element dispatch; repeated abstract references need to reach populateAbstractElement while ordinary concrete duplicates should keep their existing behavior.",
+    "Give each sibling abstract wrapper a stable collision-free internal name derived from repository-native sibling context, and continue using the resolved declaration name as displayName.",
+    "Add one focused Vitest file using the maintainer's two-reference shape and assert wrapper count, unique names, preserved display names, and per-particle cardinality."
+  ],
+  "process_requirements": [
+    "A human must review, approve, and sign all AI-generated code; the AI agent may not submit the pull request independently.",
+    "Use a contributor-created descriptive branch on a fork; never push to another contributor's branch.",
+    "Before submission run the UI lint, style lint, and test commands required by AGENTS.md.",
+    "Keep under 10 pull requests per operator per day and provide active human follow-up within two weeks.",
+    "AI-use disclosure is optional but recommended."
+  ],
+  "qualification": {
+    "review_id": "sha256:e98c85656df7b264a548268ff62cf4a77c5ed52d55b318553f101bfcdbf94e75",
+    "review_prompt_version": 2,
+    "reviewed_at": "2026-07-13T20:58:14Z",
+    "qualification_expires_at": "2026-07-13T22:58:14.000Z",
+    "evidence_sha256": "sha256:e757cc42bac2c94c4904a37b767338ca74df0595e3b1b6194da138af31c792ba",
+    "issue_updated_at": "2026-07-13T20:54:08Z",
+    "invitation_evidence": {
+      "type": "label",
+      "url": "https://github.com/KaotoIO/kaoto/issues/3473",
+      "observed_at": "2026-07-13T20:57:27Z"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "When a sequence contains multiple element particles referencing the same abstract declaration, the name-and-namespace deduplication guard returns before constructing the later abstract wrapper, losing that particle and its occurrence constraints.",
+      "expected_behavior": [
+        "Every repeated reference to the abstract declaration produces a distinct abstract wrapper field.",
+        "Each wrapper preserves its own minOccurs and maxOccurs values from its referencing particle.",
+        "The abstract declaration's display name remains visible to the UI.",
+        "The supplied two-reference shape yields two wrappers rather than one."
+      ],
+      "non_goals": [
+        "No new option, flag, or public API.",
+        "No redesign of substitution-group membership behavior.",
+        "No unrelated change to ordinary concrete-element deduplication or UI presentation."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/KaotoIO/kaoto/issues/3473",
+          "author_association": "MEMBER",
+          "summary": "The member-authored issue identifies the same-name deduplication root cause, requires one wrapper per abstract reference with particle-specific occurrence constraints, and requires preserving the UI display name."
+        }
+      ]
+    },
+    "related_prs": []
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "packages/ui/src/services/document/xml-schema/xml-schema-document.service.abstract-repeated-ref.test.ts"
+    ],
+    "command": "corepack yarn workspace @kaoto/kaoto test src/services/document/xml-schema/xml-schema-document.service.abstract-repeated-ref.test.ts packages/ui/src/services/document/xml-schema/xml-schema-document.service.abstract-repeated-ref.test.ts --configLoader runner",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "should create a unique wrapper with its own cardinality for each abstract element ref",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix(DataMapper): preserve repeated abstract element refs",
+    "summary": "Preserve every repeated abstract-element reference as a distinct wrapper with particle-specific cardinality, while retaining the declaration name for display, and add a focused XSD regression test.",
+    "body_template": "### Description\n\n{{SUMMARY}}\n\nFixes #{{ISSUE_NUMBER}}\n\n#### Type of Change\n- [x] Bug fix\n- [ ] New feature\n- [ ] Improvement\n- [ ] Documentation update\n- [ ] Other\n\n#### How Has This Been Tested?\n{{CHECKS}}\n\n#### Checklist\n- [x] I have read the Contributing Guidelines.\n- [x] I have followed the coding style and conventions of the project.\n- [x] I have tested my changes and ensured that they work as expected.\n- [ ] I have updated relevant documentation (not applicable: behavior and regression-test change only).\n- [x] I have added tests that prove the fix works.\n\n{{RECEIPT_FOOTER}}"
+  },
+  "executor": {
+    "profile": "node",
+    "image": "node:24.16.0-bookworm",
+    "reasoning_effort": "xhigh",
+    "install_commands": [
+      "corepack yarn install --immutable"
+    ],
+    "commands": [
+      "corepack yarn workspace @kaoto/kaoto test src/services/document/xml-schema/xml-schema-document.service.abstract-repeated-ref.test.ts packages/ui/src/services/document/xml-schema/xml-schema-document.service.abstract-repeated-ref.test.ts --configLoader runner",
+      "corepack yarn workspace @kaoto/kaoto lint",
+      "corepack yarn workspace @kaoto/kaoto lint:style",
+      "corepack yarn workspace @kaoto/kaoto test --configLoader runner --maxWorkers 4"
+    ],
+    "limits": {
+      "cpus": 6,
+      "memory_mb": 6144,
+      "pids": 512,
+      "wall_clock_seconds_per_command": 2700,
+      "output_bytes_per_stream": 2000000
+    }
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "url": "https://github.com/KaotoIO/kaoto/blob/caf30cc7c6123728c8c05d1f36e9cd8a67f23f0e/AGENTS.md",
+      "checked_at": "2026-07-13T20:58:14Z",
+      "ai_policy_summary": "Kaoto permits AI-assisted contributions but requires human review, approval, signing, and responsibility. Contributors must use their own fork and branch, stay under 10 PRs per operator per day, follow up within two weeks, and run UI lint, style lint, and tests before submission. AI-use disclosure is optional but recommended."
+    },
+    "checks_not_run": [
+      "Application production build",
+      "Storybook",
+      "Cypress end-to-end suite",
+      "Full monorepo checks outside @kaoto/kaoto",
+      "Manual browser validation"
+    ],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "The focused regression validates parsed document structure and does not exercise the full browser UI.",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

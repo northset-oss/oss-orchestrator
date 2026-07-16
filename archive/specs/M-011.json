@@ -1,4 +1,5 @@
 {
+  "_archive_note": "Historical pre-v2 input; not runnable by the bounded workflow.",
   "mission_id": "M-011",
   "candidate": "prometheus/client_js#539",
   "target_repo": "https://github.com/prometheus/client_js",

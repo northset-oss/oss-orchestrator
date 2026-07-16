@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "default_profile": "node",
+  "profiles": {
+    "node": {
+      "status": "existing",
+      "production_proven": true,
+      "languages": ["JavaScript", "TypeScript"],
+      "image": "node:24.16.0-bookworm",
+      "smoke_command": "node --version",
+      "install_conventions": ["npm ci", "pnpm install --frozen-lockfile", "yarn install --immutable"],
+      "test_conventions": ["node --test <test_path>", "npm test -- <test_path>"],
+      "dependency_cache": {
+        "workspace_paths": ["node_modules", ".yarn", "ui/node_modules"],
+        "workspace_globs": ["packages/*/node_modules", "apps/*/node_modules"],
+        "bootstrap_paths": [".northset/bootstrap-home/.cache/node", ".northset/bootstrap-home/.cache/node/corepack"],
+        "never_copy": []
+      }
+    },
+    "python": {
+      "status": "pilot",
+      "production_proven": false,
+      "languages": ["Python"],
+      "image": "python:3.12.11-bookworm",
+      "smoke_command": "python --version",
+      "install_conventions": ["python -m pip install -e .", "python -m pip install -r requirements.txt"],
+      "test_conventions": ["python -m pytest <test_path> -q"],
+      "dependency_cache": {
+        "workspace_paths": ["__pypackages__"],
+        "workspace_globs": [],
+        "bootstrap_paths": [".northset/bootstrap-home/.cache/pip", ".northset/bootstrap-home/python-site"],
+        "never_copy": [".venv", "venv"]
+      }
+    },
+    "go": {
+      "status": "pilot",
+      "production_proven": false,
+      "languages": ["Go"],
+      "image": "golang:1.24.5-bookworm",
+      "smoke_command": "go version",
+      "install_conventions": ["go mod download"],
+      "test_conventions": ["go test ./...", "go test <package>"],
+      "dependency_cache": {
+        "workspace_paths": [],
+        "workspace_globs": [],
+        "bootstrap_paths": [".northset/bootstrap-home/go/pkg/mod", ".northset/bootstrap-home/.cache/go-build"],
+        "never_copy": []
+      }
+    },
+    "rust": {
+      "status": "pilot",
+      "production_proven": false,
+      "languages": ["Rust"],
+      "image": "rust:1.88.0-bookworm",
+      "smoke_command": "rustc --version",
+      "install_conventions": ["cargo fetch --locked"],
+      "test_conventions": ["cargo test --offline", "cargo test <test_name> --offline"],
+      "dependency_cache": {
+        "workspace_paths": ["target"],
+        "workspace_globs": [],
+        "bootstrap_paths": [".northset/bootstrap-home/.cargo/registry", ".northset/bootstrap-home/.cargo/git"],
+        "never_copy": []
+      }
+    }
+  }
+}

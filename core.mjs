@@ -1,5 +1,6 @@
 import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
+import {readFileSync} from 'node:fs';
 import {appendFile, lstat, mkdtemp, readFile, readdir, readlink, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -183,6 +184,54 @@ export function manifestDigest(readyPacks) {
   return sha256(Buffer.from(canonical(subjects), 'utf8'));
 }
 
+export function batchBoardData(manifests) {
+  if (!Array.isArray(manifests) || manifests.length < 1 || manifests.length > 50) {
+    throw new Error('batch board requires one to fifty ordered mission manifests');
+  }
+  const missions = manifests.map((manifest, index) => ({
+    position: index + 1,
+    mission_id: manifest.mission_id,
+    repo: manifest.repo,
+    issue_url: manifest.issue_url,
+    pr_title: manifest.pr_title,
+    patch_sha256: manifest.patch_sha256,
+    pr_body_sha256: manifest.pr_body_sha256,
+    pr_claim_text: manifest.pr_claim_text ?? null,
+    patch_review_sha256: manifest.patch_review_sha256 ?? null,
+    risk_flags: manifest.risk_flags ?? [],
+    changed_file_classes: manifest.changed_file_classes ?? [],
+    oracle_sha256: manifest.oracle_sha256,
+    bundle_digest: manifest.bundle_digest,
+  }));
+  const classCounts = {};
+  const riskCounts = {};
+  for (const mission of missions) {
+    for (const item of mission.changed_file_classes) classCounts[item.class] = (classCounts[item.class] ?? 0) + 1;
+    for (const risk of mission.risk_flags) {
+      const code = typeof risk === 'string' ? risk : risk.code;
+      riskCounts[code] = (riskCounts[code] ?? 0) + 1;
+    }
+  }
+  return {
+    schema_version: 1,
+    mission_count: manifests.length,
+    changed_file_class_counts: Object.fromEntries(Object.entries(classCounts).sort()),
+    risk_counts: Object.fromEntries(Object.entries(riskCounts).sort()),
+    missions,
+  };
+}
+
+export function batchApprovalDigest(manifests) {
+  const board = batchBoardData(manifests);
+  const subject = {
+    schema_version: 1,
+    domain: 'northset-oss-approved-batch-v1',
+    ordered_mission_manifests: manifests,
+    board,
+  };
+  return sha256(Buffer.from(canonical(subject), 'utf8'));
+}
+
 export async function directoryDigest(root) {
   const entries = [];
   async function walk(directory, prefix = '') {
@@ -268,7 +317,43 @@ export function parseCandidate(value) {
 // candidate spec opts up to `xhigh`/`max` only when its complexity warrants it. Single allow-list so
 // prepare fails fast on a bad value instead of passing garbage to `codex -c model_reasoning_effort`.
 export const AUTHOR_EFFORTS = ['medium', 'high', 'xhigh', 'max'];
-export const SUPPORTED_PROFILES = ['node'];
+export const PROFILE_REGISTRY = JSON.parse(readFileSync(new URL('./profiles.json', import.meta.url), 'utf8'));
+export const SUPPORTED_PROFILES = Object.freeze(Object.keys(PROFILE_REGISTRY.profiles));
+export const QUALIFICATION_REVIEW_PROMPT_VERSIONS = Object.freeze([2, 3]);
+
+export function normalizeLabel(value) {
+  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+export function isInvitationLabel(value) {
+  const normalized = normalizeLabel(value);
+  return normalized.includes('good first issue') || normalized.endsWith('help wanted');
+}
+
+function sourceEvidencePath(entry) {
+  if (typeof entry !== 'string' || entry.trim() !== entry) return null;
+  const match = /^([^:\r\n]+):([1-9][0-9]*)(?:-([1-9][0-9]*))?(?:\s+—\s+.+)?$/.exec(entry);
+  if (!match) return null;
+  const file = match[1];
+  const segments = file.split('/');
+  if (path.posix.isAbsolute(file) || file.includes('\\') || path.posix.normalize(file) !== file ||
+      segments.some((segment) => !segment || segment === '.' || segment === '..')) return null;
+  if (match[3] !== undefined && Number(match[3]) < Number(match[2])) return null;
+  return file;
+}
+
+export function qualificationSourceEvidencePaths(spec, {required = false} = {}) {
+  const entries = spec?.qualification?.source_evidence;
+  if (entries === undefined && !required) return [];
+  if (!Array.isArray(entries) || (required && entries.length === 0)) {
+    throw new Error('qualification.source_evidence (qualification source evidence) must be a non-empty array of normalized path:line evidence');
+  }
+  const paths = entries.map(sourceEvidencePath);
+  if (paths.some((file) => file === null)) {
+    throw new Error('qualification.source_evidence (qualification source evidence) must contain normalized relative path:line evidence');
+  }
+  return [...new Set(paths)];
+}
 
 function oracleCommandTargets(command, testPaths) {
   if (/[\n;&|`]/.test(command)) throw new Error('oracle.command must be one single focused command');
@@ -278,7 +363,14 @@ function oracleCommandTargets(command, testPaths) {
     }
     return token;
   });
-  return testPaths.every((testPath) => tokens.includes(testPath) || tokens.includes(`./${testPath}`));
+  const dirIndex = tokens.indexOf('--dir');
+  const workingDirectory = dirIndex >= 0 ? tokens[dirIndex + 1]?.replace(/^\.\//, '').replace(/\/$/, '') : null;
+  return testPaths.every((testPath) => {
+    if (tokens.includes(testPath) || tokens.includes(`./${testPath}`)) return true;
+    if (!workingDirectory || workingDirectory.includes('..') || !testPath.startsWith(`${workingDirectory}/`)) return false;
+    const relative = testPath.slice(workingDirectory.length + 1);
+    return tokens.includes(relative) || tokens.includes(`./${relative}`);
+  });
 }
 export function authorEffort(spec) {
   const value = spec?.executor?.reasoning_effort;
@@ -431,12 +523,15 @@ export function validateSpec(spec) {
   const q = spec.qualification;
   if (!q || typeof q !== 'object') throw new Error('qualification is required');
   if (!/^sha256:[0-9a-f]{64}$/i.test(q.review_id ?? '')) throw new Error('qualification.review_id must be a sha256 digest');
-  if (q.review_prompt_version !== 2) throw new Error('qualification.review_prompt_version must equal 2');
+  if (!QUALIFICATION_REVIEW_PROMPT_VERSIONS.includes(q.review_prompt_version)) {
+    throw new Error(`qualification.review_prompt_version must be a compatible prompt version (${QUALIFICATION_REVIEW_PROMPT_VERSIONS.join(' or ')})`);
+  }
   if (!/^sha256:[0-9a-f]{64}$/i.test(q.evidence_sha256 ?? '')) throw new Error('qualification.evidence_sha256 must be a sha256 digest');
   for (const field of ['reviewed_at', 'qualification_expires_at', 'issue_updated_at']) {
     if (typeof q[field] !== 'string' || !Number.isFinite(Date.parse(q[field]))) throw new Error(`qualification.${field} must be an ISO timestamp`);
   }
   if (spec.schema_version === 2) {
+    qualificationSourceEvidencePaths(spec, {required: true});
     if (q.finder_run_id !== null && q.finder_run_id !== undefined && !/^[0-9a-f-]{36}$/i.test(q.finder_run_id)) {
       throw new Error('qualification.finder_run_id must be a UUID or null');
     }
@@ -480,6 +575,18 @@ export function validateSpec(spec) {
     repositoryPolicyLocator(q.invitation_evidence, candidate, spec.base_commit);
     if (!/^sha256:[0-9a-f]{64}$/i.test(q.invitation_evidence.content_sha256 ?? '')) {
       throw new Error('qualification.invitation_evidence.content_sha256 is required for repository policy evidence');
+    }
+  }
+  if (q.invitation_evidence.type === 'label' &&
+      (q.invitation_evidence.label !== undefined || q.invitation_evidence.repo_policy_sha256 !== undefined)) {
+    if (typeof q.invitation_evidence.label !== 'string' || !q.invitation_evidence.label.trim() ||
+        !/^sha256:[0-9a-f]{64}$/i.test(q.invitation_evidence.repo_policy_sha256 ?? '')) {
+      throw new Error('custom invitation label requires its exact label and repository-policy digest');
+    }
+    const snapshot = spec.receipt?.repo_policy_snapshot;
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot) ||
+        sha256(Buffer.from(canonical(snapshot))) !== q.invitation_evidence.repo_policy_sha256) {
+      throw new Error('custom invitation label repository-policy snapshot does not match its digest');
     }
   }
   const contract = q.acceptance_contract;
@@ -550,6 +657,25 @@ export function validateSpec(spec) {
   if (!SUPPORTED_PROFILES.includes(spec.executor.profile)) {
     throw new Error(`executor.profile must be one of ${SUPPORTED_PROFILES.join(', ')}`);
   }
+  const registeredProfile = PROFILE_REGISTRY.profiles[spec.executor.profile];
+  if (spec.executor.profile !== PROFILE_REGISTRY.default_profile) {
+    if (spec.executor.image !== registeredProfile.image || spec.executor.profile_status !== registeredProfile.status) {
+      throw new Error(`executor ${spec.executor.profile} profile must explicitly use registry image ${registeredProfile.image} with status ${registeredProfile.status}`);
+    }
+    if (registeredProfile.production_proven !== false) {
+      throw new Error(`executor ${spec.executor.profile} profile registry must not overstate production proof`);
+    }
+    if (spec.executor.profile_production_proven !== undefined &&
+        spec.executor.profile_production_proven !== false) {
+      throw new Error(`executor ${spec.executor.profile} pilot profile must not claim production proof`);
+    }
+  }
+  if (spec.authoring_mode !== undefined && !['test_only_then_fix', 'direct_fix'].includes(spec.authoring_mode)) {
+    throw new Error('authoring_mode must be test_only_then_fix or direct_fix');
+  }
+  if (spec.allow_modified_existing_tests !== undefined && typeof spec.allow_modified_existing_tests !== 'boolean') {
+    throw new Error('allow_modified_existing_tests must be boolean when present');
+  }
   if (!spec.executor.commands.includes(spec.oracle.command)) throw new Error('oracle.command must be included in executor.commands');
   authorEffort(spec); // validates the optional executor.reasoning_effort override
   return spec;
@@ -596,6 +722,20 @@ async function loadRepoPolicy() {
   }
 }
 
+function repositoryPolicyEntry(policy, repository) {
+  return Object.entries(policy?.repositories ?? {})
+    .find(([key]) => key.toLowerCase() === repository.toLowerCase())?.[1] ?? {};
+}
+
+function approvedCustomInvitationLabels(entry) {
+  return new Set([
+    ...(entry.invitation_labels ?? []),
+    ...Object.entries(entry.invitation_label_map ?? {})
+      .filter(([, enabled]) => enabled === true)
+      .map(([label]) => label),
+  ].map(normalizeLabel));
+}
+
 function semanticWords(value) {
   const stop = new Set(['about', 'after', 'before', 'could', 'from', 'have', 'into', 'issue', 'should', 'that', 'their', 'there', 'these', 'this', 'using', 'when', 'where', 'with']);
   return [...new Set(String(value ?? '').toLowerCase().match(/[a-z0-9_]{4,}/g) ?? [])].filter((word) => !stop.has(word));
@@ -620,6 +760,9 @@ export async function recheck(spec, log, options = {}) {
   const now = options.now ?? (() => new Date());
   const gh = options.gh ?? ((args) => ghJson(args, {deadline: options.deadline, timeoutMs: 60_000}));
   const {owner, repo, issue: num} = parseCandidate(spec.candidate);
+  const repositoryKey = `${owner}/${repo}`;
+  const policy = options.repoPolicy ?? await loadRepoPolicy();
+  const policyEntry = repositoryPolicyEntry(policy, repositoryKey);
   const repoData = await gh(['api', `repos/${owner}/${repo}`,
     '--jq', '{default_branch,archived,fork,html_url}']);
   const issue = await gh(['api', `repos/${owner}/${repo}/issues/${num}`,
@@ -630,7 +773,7 @@ export async function recheck(spec, log, options = {}) {
     : await gh(['api', `repos/${owner}/${repo}/git/ref/heads/${repoData.default_branch}`]);
   const defaultHead = defaultRef?.object?.sha ?? null;
   const allPrs = await gh(['pr', 'list', '--repo', `${owner}/${repo}`, '--state', 'all', '--limit', '500',
-    '--json', 'number,title,body,url,state,headRefName,author,updatedAt,closedAt,mergedAt']);
+    '--json', 'number,title,body,url,state,headRefName,author,createdAt,updatedAt,closedAt,mergedAt']);
   const openPrs = allPrs.filter((pr) => pr.state === 'OPEN');
   const northsetOpen = openPrs.filter((pr) => pr.author?.login === 'AysajanE');
   let timeline;
@@ -668,8 +811,15 @@ export async function recheck(spec, log, options = {}) {
   if (invitation.type === 'repository_policy') {
     invitationPolicy = await fetchRepositoryPolicy(invitation, {owner, repo}, spec.base_commit, gh);
   }
+  const customLabelBound = invitation.type === 'label' &&
+    typeof invitation.label === 'string' && /^sha256:[0-9a-f]{64}$/i.test(invitation.repo_policy_sha256 ?? '');
+  const customLabelStillPresent = customLabelBound &&
+    sha256(Buffer.from(canonical(spec.receipt?.repo_policy_snapshot ?? null))) === invitation.repo_policy_sha256 &&
+    sha256(Buffer.from(canonical(policy))) === invitation.repo_policy_sha256 &&
+    approvedCustomInvitationLabels(policyEntry).has(normalizeLabel(invitation.label)) &&
+    issue.labels.includes(invitation.label);
   const invitationStillPresent = invitation.type === 'label'
-    ? issue.labels.some((label) => /^(good first issue|help wanted)$/i.test(label))
+    ? (customLabelBound ? customLabelStillPresent : issue.labels.some(isInvitationLabel))
     : invitation.type === 'assignment'
       ? issue.assignees.includes('AysajanE')
       : invitation.type === 'maintainer_comment'
@@ -749,10 +899,15 @@ export async function recheck(spec, log, options = {}) {
   if (!preAuthorNoticeStillPresent) reasons.push('required pre-author notice is no longer present');
   if (competingPRs.length) reasons.push(`competing PR(s): ${competingPRs.map((pr) => `${pr.title} [${pr.state}]`).join('; ')}`);
   if (blockingSemantic.length) reasons.push(`blocking related PR(s): ${blockingSemantic.map((pr) => `${pr.url} [${pr.state}]`).join(', ')}`);
-  if (northsetOpen.length) reasons.push(`Northset already has an open PR in ${owner}/${repo}: ${northsetOpen.map((pr) => pr.url).join(', ')}`);
-  const policy = await loadRepoPolicy();
-  if (policy.cooldowns?.[`${owner}/${repo}`]) reasons.push(`repository cooldown: ${policy.cooldowns[`${owner}/${repo}`].reason}`);
-  await log(`recheck(${mode}): state=${issue.state} invitation=${invitationStillPresent ? 'present' : 'missing'} assignees=${issue.assignees.join(',') || 'none'} commentsAfterQualification=${newExternalComments.length} crossrefs=${timeline.length} competingPRs=${competingPRs.length} relatedPRs=${blockingSemantic.length} northsetOpen=${northsetOpen.length}`);
+  const maxOpenPrs = policyEntry.max_open_prs ?? policy.defaults?.max_open_prs ?? 1;
+  const dailyPrCap = policyEntry.daily_pr_cap ?? policy.defaults?.daily_pr_cap ?? 1;
+  const today = now().toISOString().slice(0, 10);
+  const northsetToday = allPrs.filter((pr) => pr.author?.login === 'AysajanE' && String(pr.createdAt ?? '').slice(0, 10) === today);
+  if (northsetOpen.length >= maxOpenPrs) reasons.push(`Northset already has an open PR or reached the open PR cap for ${owner}/${repo} (${northsetOpen.length}/${maxOpenPrs})`);
+  if (northsetToday.length >= dailyPrCap) reasons.push(`Northset daily PR cap reached for ${owner}/${repo} (${northsetToday.length}/${dailyPrCap})`);
+  const cooldown = Object.entries(policy.cooldowns ?? {}).find(([key]) => key.toLowerCase() === repositoryKey.toLowerCase())?.[1];
+  if (cooldown) reasons.push(`repository cooldown: ${cooldown.reason}`);
+  await log(`recheck(${mode}): state=${issue.state} invitation=${invitationStillPresent ? 'present' : 'missing'} assignees=${issue.assignees.join(',') || 'none'} commentsAfterQualification=${newExternalComments.length} crossrefs=${timeline.length} competingPRs=${competingPRs.length} relatedPRs=${blockingSemantic.length} northsetOpen=${northsetOpen.length}/${maxOpenPrs} northsetToday=${northsetToday.length}/${dailyPrCap}`);
   return {mode, snapshot, clean: reasons.length === 0, reasons};
 }
 

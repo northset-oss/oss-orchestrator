@@ -160,7 +160,7 @@ test('review and finder expose their finite wall-clock and complexity caps', () 
   assert.equal(reviewer.REVIEW_BUDGET_MS, 5 * 60 * 1000);
   assert.equal(reviewer.CODEX_OUTPUT_LIMIT_BYTES, 3_500_000);
   assert.equal(reviewer.GITHUB_EVIDENCE_OUTPUT_LIMIT_BYTES, 10_000_000);
-  assert.equal(finder.FINDER_VERSION, '2.0.4');
+  assert.equal(finder.FINDER_VERSION, '3.0.0');
   assert.equal(finder.parseArgs(['1'], {}).totalBudgetMs, 20 * 60 * 1000);
   assert.equal(finder.parseArgs(['1'], {}).maxReviews, 12);
   assert.equal(finder.parseArgs(['20'], {}).maxReviews, 40);

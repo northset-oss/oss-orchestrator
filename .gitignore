@@ -1,2 +1,6 @@
 runs/
+cache/
+candidate_lake.sqlite
+candidate_lake.sqlite-shm
+candidate_lake.sqlite-wal
 .DS_Store

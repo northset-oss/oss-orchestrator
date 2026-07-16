@@ -5,15 +5,18 @@
 //   ship    -> publish exactly those bytes after founder approval
 //   status  -> reconcile factual PR outcomes into mutable publication envelopes
 
-import {appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile} from 'node:fs/promises';
+import {appendFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, stat, statfs, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {
   OSS_IDENTITY,
+  PROFILE_REGISTRY,
   assertOssCommitIdentity,
   assertPatchCommitBinding,
   authorEffort,
+  batchApprovalDigest,
+  batchBoardData,
   canonical,
   createDeadline,
   directoryDigest,
@@ -22,12 +25,14 @@ import {
   parseCandidate,
   pool,
   prBody,
+  qualificationSourceEvidencePaths,
   recheck,
   run,
   sanitizedGitEnv,
   sha256,
   validateSpecs,
 } from './core.mjs';
+import {normalizedPrClaimText, reviewPatch} from './review-patch.mjs';
 
 const OSS_FILE = fileURLToPath(import.meta.url);
 const HERE = path.dirname(OSS_FILE);
@@ -38,10 +43,11 @@ const READY_TTL_HOURS = 8;
 export const PREPARE_BUDGET_MS = 60 * 60 * 1000;
 const AUTHOR_IMAGE = process.env.OSS_AUTHOR_IMAGE ?? 'northset-oss-author:0.144.1';
 const DEPENDENCY_CACHE_ROOT = process.env.OSS_DEPENDENCY_CACHE_DIR ?? path.join(HERE, 'cache', 'dependencies');
+const REPOSITORY_MIRROR_ROOT = process.env.OSS_REPOSITORY_MIRROR_DIR ?? path.join(HERE, 'cache', 'repos');
 const DEFAULTS = {
   specsDir: path.join(HERE, 'specs'),
   runsDir: path.join(HERE, 'runs'),
-  concurrency: 2,
+  concurrency: 3,
 };
 
 function missionGit(deadline, cwd, ...args) {
@@ -52,8 +58,11 @@ function missionGit(deadline, cwd, ...args) {
 
 function changedPath(entry) { return typeof entry === 'string' ? entry : entry.path; }
 function isTestPath(file) {
+  const name = path.basename(file);
   return /(^|\/)(__tests__|test|tests|spec|specs)(\/|$)/i.test(file)
-    || /(?:^|\.)(?:test|spec)\.[^/]+$/i.test(path.basename(file));
+    || /(?:^|\.)(?:test|spec)\.[^/]+$/i.test(name)
+    || /^(?:test_.+|.+_test)\.py$/i.test(name)
+    || /_test\.go$/i.test(name);
 }
 
 function classifyRisk(entry, base) {
@@ -65,23 +74,35 @@ function classifyRisk(entry, base) {
   if (entry.mode === '160000') return 'submodule';
   if (entry.mode === '120000') return 'symlink';
   if (entry.binary) return 'binary';
-  if (/^(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|cargo\.lock|poetry\.lock|uv\.lock|go\.sum|gemfile\.lock|gradle\.lockfile)$/i.test(name)) return 'lockfile';
-  if (/^(package\.json|pyproject\.toml|requirements[^/]*\.txt|cargo\.toml|go\.mod|gemfile|pom\.xml|build\.gradle(?:\.kts)?)$/i.test(name)) return 'dependency-manifest';
-  if (/^(dockerfile|compose\.ya?ml)$/i.test(name) || /(^|\/)docker\//i.test(file)) return 'container-config';
-  if (/^(?:\.github\/workflows\/|\.circleci\/|\.gitlab-ci\.yml$|azure-pipelines\.yml$)/i.test(file)) return 'check-or-CI-config';
+  if (/^(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|cargo\.lock|poetry\.lock|pipfile\.lock|uv\.lock|go\.(?:sum|work\.sum)|gemfile\.lock|gradle\.lockfile)$/i.test(name)) return 'lockfile';
+  if (/^(package\.json|pyproject\.toml|requirements[^/]*\.(?:txt|in)|pipfile|setup\.(?:py|cfg)|cargo\.toml|go\.(?:mod|work)|gemfile|pom\.xml|build\.gradle(?:\.kts)?)$/i.test(name)) return 'dependency-manifest';
+  if (/^(dockerfile|compose\.ya?ml)$/i.test(name) || /(^|\/)(?:docker|\.devcontainer)\//i.test(file)) return 'container-config';
+  if (/^(?:\.github\/|\.circleci\/|\.gitlab-ci\.yml$|azure-pipelines\.yml$)/i.test(file)) return 'check-or-CI-config';
   if (/(^|\/)(?:vite|webpack|rollup|babel|tsconfig|eslint|prettier|jest|vitest|playwright)(?:\.|\/)/i.test(file)) return 'build-config';
-  if (/(^|\/)(?:dist|build|generated|vendor)\//i.test(file)) return 'generated-output';
+  if (/^(?:makefile|gnumakefile|justfile|cmakelists\.txt|meson\.build|taskfile(?:\.ya?ml)?|turbo\.json|nx\.json|build\.rs|conftest\.py|noxfile\.py|tox\.ini|pytest\.ini|gulpfile\.[^/]+|gruntfile\.[^/]+)$/i.test(name) ||
+      /^(?:\.npmrc|\.yarnrc(?:\.ya?ml)?|\.nvmrc|\.node-version|\.python-version|rust-toolchain(?:\.toml)?|ruff\.toml|biome\.json|deno\.jsonc?|\.babelrc(?:\.[^/]*)?|\.eslintrc(?:\.[^/]*)?|\.prettierrc(?:\.[^/]*)?)$/i.test(name) ||
+      /\.config\.(?:[cm]?[jt]sx?|json|ya?ml)$/i.test(name)) return 'build-config';
+  if (/(^|\/)(?:dist|build|generated|vendor)\//i.test(file) ||
+      /(?:^|[._-])generated(?:[._-]|$)|\.g\.[^/]+$|\.pb\.go$/i.test(name)) return 'generated-output';
   if (/(^|\/)(?:fixtures?|snapshots?|__snapshots__)\//i.test(file) || /\.snap$/i.test(file)) return 'snapshot-or-fixture';
-  if (file === 'package.json' || /(^|\/)(?:ci|scripts?)\/(?:check|test|verify|lint)(?:\.|$)/i.test(file)) return 'check-or-CI-config';
+  if (file === 'package.json' || /(^|\/)(?:ci|scripts?|tools?)\/(?:build|release|setup|bootstrap|generate|publish|check|test|verify|lint)(?:\.|$)/i.test(file)) return 'check-or-CI-config';
   if (isTestPath(file)) return base.has(file) ? 'modified-existing-test' : 'added-test';
-  return 'source';
+  if (/(^|\/)(?:docs?|documentation)(?:\/|$)/i.test(file) ||
+      /(^|\/)(?:examples?|samples?|benchmarks?|config|configs)(?:\/|$)/i.test(file) ||
+      /\.(?:md|mdx|rst|adoc|txt)$/i.test(name) ||
+      /^(?:readme|contributing|changelog|changes|license|notice|authors|code_of_conduct|security)(?:\.[^/]*)?$/i.test(name)) return 'nonproduction';
+  if (/(^|\/)(?:\.changeset|\.vscode|\.idea)(?:\/|$)/i.test(file) ||
+      /^(?:\.gitignore|\.gitattributes|\.editorconfig|\.mailmap|\.pre-commit-config\.ya?ml|codeowners|release-please-config\.json|\.releaserc(?:\.[^/]*)?)$/i.test(name)) return 'nonproduction';
+  if (/\.d\.(?:ts|mts|cts)$/i.test(name) || /\.pyi$/i.test(name)) return 'nonproduction';
+  if (/\.(?:[cm]?[jt]sx?|py|go|rs|vue|svelte|css|scss|sass|less|html?)$/i.test(name)) return 'source';
+  return 'nonproduction';
 }
 
 export function classifyChangedFiles(baseFileList, changedFiles) {
   const base = new Set(baseFileList.map(changedPath));
   const hard = new Set([
     'dependency-manifest', 'lockfile', 'build-config', 'container-config', 'generated-output',
-    'submodule', 'binary', 'symlink', 'check-or-CI-config', 'rename', 'copy', 'type-change',
+    'submodule', 'binary', 'symlink', 'check-or-CI-config', 'rename', 'copy', 'type-change', 'nonproduction',
   ]);
   return changedFiles.map((entry) => {
     const file = changedPath(entry);
@@ -136,23 +157,46 @@ function commonDockerArgs(spec, workspace, image, {
 }
 
 export function dependencyBootstrapDockerArgs(spec, workspace, image, cacheDir = null) {
+  const cacheExports = cacheDir ? {
+    node: [],
+    python: [
+      'mkdir -p /workspace/.northset/bootstrap-home/.cache/pip /workspace/.northset/bootstrap-home/python-site',
+      'if [ -d /northset-cache/pip ]; then cp -a /northset-cache/pip/. /workspace/.northset/bootstrap-home/.cache/pip/; fi',
+    ],
+    go: [
+      'mkdir -p /workspace/.northset/bootstrap-home/go/pkg/mod /workspace/.northset/bootstrap-home/.cache/go-build',
+      'if [ -d /northset-cache/go-mod ]; then cp -a /northset-cache/go-mod/. /workspace/.northset/bootstrap-home/go/pkg/mod/; fi',
+      'if [ -d /northset-cache/go-build ]; then cp -a /northset-cache/go-build/. /workspace/.northset/bootstrap-home/.cache/go-build/; fi',
+    ],
+    rust: [
+      'mkdir -p /workspace/.northset/bootstrap-home/.cargo/registry /workspace/.northset/bootstrap-home/.cargo/git',
+      'if [ -d /northset-cache/cargo/registry ]; then cp -a /northset-cache/cargo/registry/. /workspace/.northset/bootstrap-home/.cargo/registry/; fi',
+      'if [ -d /northset-cache/cargo/git ]; then cp -a /northset-cache/cargo/git/. /workspace/.northset/bootstrap-home/.cargo/git/; fi',
+    ],
+  }[spec.executor.profile] ?? [] : [];
   const commands = [
     'mkdir -p /workspace/.northset/bootstrap-home',
     ...spec.executor.install_commands,
+    ...cacheExports,
   ];
   const args = commonDockerArgs(spec, workspace, image, {
     home: '/workspace/.northset/bootstrap-home', phase: 'dependency-bootstrap', protectGit: true,
   });
-  if (cacheDir) args.splice(args.length - 1, 0,
-    '--mount', `type=bind,src=${cacheDir},dst=/northset-cache`,
-    '--env', 'npm_config_cache=/northset-cache/npm',
-    '--env', 'PNPM_STORE_DIR=/northset-cache/pnpm',
-    '--env', 'YARN_CACHE_FOLDER=/northset-cache/yarn');
+  if (cacheDir) {
+    const cacheEnvironment = {
+      node: ['npm_config_cache=/northset-cache/npm', 'PNPM_STORE_DIR=/northset-cache/pnpm', 'YARN_CACHE_FOLDER=/northset-cache/yarn'],
+      python: ['PIP_CACHE_DIR=/northset-cache/pip', 'PIP_TARGET=/workspace/.northset/bootstrap-home/python-site'],
+      go: ['GOMODCACHE=/northset-cache/go-mod', 'GOCACHE=/northset-cache/go-build'],
+      rust: ['CARGO_HOME=/northset-cache/cargo', 'CARGO_TARGET_DIR=/northset-cache/target'],
+    }[spec.executor.profile] ?? [];
+    args.splice(args.length - 1, 0, '--mount', `type=bind,src=${cacheDir},dst=/northset-cache`,
+      ...cacheEnvironment.flatMap((value) => ['--env', value]));
+  }
   return [...args, 'sh', '-c', shell(commands)];
 }
 
-function authorPrompt(spec) {
-  return [
+function authorPrompt(spec, phase = 'direct_fix') {
+  const shared = [
     `Issue: ${spec.issue_url}`,
     `Problem statement: ${spec.problem_statement}`,
     `Acceptance criteria:\n${spec.acceptance_criteria.map((item) => `- ${item}`).join('\n')}`,
@@ -163,16 +207,26 @@ function authorPrompt(spec) {
     spec.process_requirements.length
       ? `Repository process requirements:\n${spec.process_requirements.map((item) => `- ${item}`).join('\n')}`
       : 'No additional repository process requirements were identified.',
-    `Red/green requirement: first add the regression test at ${spec.oracle.test_paths.join(', ')} and confirm \`${spec.oracle.command}\` fails for the defect; then implement the smallest fix and make it pass.`,
-    `Run every declared check before finishing: ${spec.executor.commands.join(' && ')}`,
     'Do not edit repository pull-request templates or process documentation; the host renders the final PR body after human review.',
     'Do not modify dependencies, lockfiles, CI, release files, generated dependency output, or version numbers. Do not commit; the host creates one canonical DCO commit.',
+  ];
+  if (phase === 'test_only') return [...shared,
+    `This is the test-only phase. Add only the regression test at ${spec.oracle.test_paths.join(', ')}. Do not modify production source. The host will run \`${spec.oracle.command}\` against the base behavior and stop the attempt unless it exits ${spec.oracle.base_exit_code} with marker ${JSON.stringify(spec.oracle.base_failure_contains)}.`,
+    'Stop immediately after writing the regression. Do not implement the fix and do not commit.',
+  ].join('\n\n');
+  if (phase === 'fix_only') return [...shared,
+    `The host has independently confirmed that the test-only change fails on the base with marker ${JSON.stringify(spec.oracle.base_failure_contains)}. Keep that regression intact and implement the smallest production fix.`,
+    `Run every declared check before finishing: ${spec.executor.commands.join(' && ')}`,
+  ].join('\n\n');
+  return [...shared,
+    `Red/green requirement: first add the regression test at ${spec.oracle.test_paths.join(', ')} and confirm \`${spec.oracle.command}\` fails for the defect; then implement the smallest fix and make it pass.`,
+    `Run every declared check before finishing: ${spec.executor.commands.join(' && ')}`,
   ].join('\n\n');
 }
 
-export function authorDockerArgs(spec, workspace, image, codexHome) {
+export function authorDockerArgs(spec, workspace, image, codexHome, phase = 'direct_fix') {
   const command = [
-    `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model gpt-5.6-sol -c model_reasoning_effort=${quote(authorEffort(spec))} -c service_tier=fast ${quote(authorPrompt(spec))}`,
+    `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model gpt-5.6-sol -c model_reasoning_effort=${quote(authorEffort(spec))} -c service_tier=fast ${quote(authorPrompt(spec, phase))}`,
   ];
   const args = commonDockerArgs(spec, workspace, image, {home: '/tmp', phase: 'author', protectGit: true});
   args.splice(args.length - 1, 0,
@@ -186,9 +240,21 @@ export function checkDockerArgs(spec, workspace, image, command) {
   const args = commonDockerArgs(spec, workspace, image, {
     network: 'none', phase: 'oracle', workspaceReadonly: true,
   });
-  args.splice(args.length - 1, 0,
-    '--env', 'COREPACK_HOME=/workspace/.northset/bootstrap-home/.cache/node/corepack',
-    '--read-only', '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=512m');
+  const profileEnvironment = {
+    node: ['COREPACK_HOME=/workspace/.northset/bootstrap-home/.cache/node/corepack'],
+    python: ['PIP_CACHE_DIR=/workspace/.northset/bootstrap-home/.cache/pip',
+      'PYTHONPATH=/workspace/.northset/bootstrap-home/python-site', 'PYTHONDONTWRITEBYTECODE=1'],
+    go: ['GOMODCACHE=/workspace/.northset/bootstrap-home/go/pkg/mod', 'GOCACHE=/tmp/go-build'],
+    rust: ['CARGO_HOME=/workspace/.northset/bootstrap-home/.cargo', 'CARGO_TARGET_DIR=/tmp/cargo-target', 'CARGO_NET_OFFLINE=true'],
+  }[spec.executor.profile] ?? [];
+  const sandboxArgs = [
+    ...profileEnvironment.flatMap((value) => ['--env', value]),
+    '--read-only', '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=512m',
+  ];
+  if (spec.oracle.test_paths.some((testPath) => testPath.startsWith('ui/'))) {
+    sandboxArgs.push('--tmpfs', '/workspace/repo/ui/node_modules/.vite-temp:rw,exec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=700');
+  }
+  args.splice(args.length - 1, 0, ...sandboxArgs);
   return [...args, 'sh', '-c', shell([command])];
 }
 
@@ -215,13 +281,28 @@ async function resolveAuthorImage(runImpl = run, deadline = null) {
 }
 
 export async function dependencyCacheKey(spec, repo, image) {
-  const names = ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock'];
+  const names = {
+    node: ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock'],
+    python: ['pyproject.toml', 'requirements.txt', 'requirements-dev.txt', 'poetry.lock', 'uv.lock'],
+    go: ['go.mod', 'go.sum'],
+    rust: ['Cargo.toml', 'Cargo.lock'],
+  }[spec.executor.profile] ?? [];
   const lockfiles = [];
   for (const name of names) {
     try { lockfiles.push({name, sha256: sha256(await readFile(path.join(repo, name)))}); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
-  return sha256(Buffer.from(canonical({image, install_commands: spec.executor.install_commands, lockfiles})))
+  const candidate = parseCandidate(spec.candidate);
+  return sha256(Buffer.from(canonical({
+    repository: `${candidate.owner}/${candidate.repo}`.toLowerCase(),
+    candidate: spec.candidate.toLowerCase(),
+    mission_id: spec.mission_id,
+    base_commit: spec.base_commit.toLowerCase(),
+    profile: spec.executor.profile,
+    image,
+    install_commands: spec.executor.install_commands,
+    lockfiles,
+  })))
     .slice('sha256:'.length);
 }
 
@@ -254,21 +335,244 @@ async function resolveImage(spec, log, deadline) {
   return digest;
 }
 
+async function resolveBatchImage(spec, options, log, deadline) {
+  options.imagePromises ??= new Map();
+  if (!options.imagePromises.has(spec.executor.image)) {
+    options.imagePromises.set(spec.executor.image, (async () => {
+      const warmed = options.warmCache?.images?.find((item) => item.image === spec.executor.image);
+      if (!warmed) return resolveImage(spec, log, deadline);
+      if (!/@sha256:[0-9a-f]{64}$/i.test(warmed.digest ?? '')) throw new Error(`warm manifest has invalid digest for ${spec.executor.image}`);
+      const inspected = await must('verify warmed executor image', await run('docker', [
+        'image', 'inspect', warmed.digest, '--format', '{{json .RepoDigests}}',
+      ], {deadline, timeoutMs: 30_000}));
+      const values = JSON.parse(inspected.stdout.trim());
+      if (!values.includes(warmed.digest)) throw new Error(`warmed image digest is no longer present locally: ${warmed.digest}`);
+      await log(`using warmed immutable executor image ${warmed.digest}`);
+      return warmed.digest;
+    })());
+  }
+  return options.imagePromises.get(spec.executor.image);
+}
+
+export function buildWarmPlan(specs) {
+  const images = [];
+  const repositories = [];
+  const seenImages = new Set();
+  const seenRepositories = new Set();
+  for (const spec of specs) {
+    const imageKey = spec.executor.image;
+    if (!seenImages.has(imageKey)) {
+      seenImages.add(imageKey);
+      images.push({profile: spec.executor.profile, image: spec.executor.image,
+        smoke_command: PROFILE_REGISTRY.profiles[spec.executor.profile]?.smoke_command});
+    }
+    const repository = `${parseCandidate(spec.candidate).owner}/${parseCandidate(spec.candidate).repo}`;
+    if (!seenRepositories.has(repository.toLowerCase())) {
+      seenRepositories.add(repository.toLowerCase());
+      repositories.push({repository, target_repo: spec.target_repo, base_commit: spec.base_commit, spec});
+    }
+  }
+  return {images, repositories};
+}
+
+export async function warmBatch(specs, {
+  runImpl = run,
+  mirrorInitializer = (spec, options) => ensureRepositoryMirror(spec, options),
+  statfsImpl = statfs,
+  mirrorRoot = REPOSITORY_MIRROR_ROOT,
+  deadline = null,
+  minimumFreeBytes = 5 * 1024 * 1024 * 1024,
+} = {}) {
+  validateSpecs(specs);
+  const plan = buildWarmPlan(specs);
+  const images = [];
+  for (const item of plan.images) {
+    await must(`warm executor image ${item.image}`, await runImpl('docker', ['pull', item.image], {deadline, timeoutMs: 30 * 60 * 1000}));
+    const inspected = await must(`inspect executor image ${item.image}`, await runImpl('docker', ['image', 'inspect', item.image, '--format', '{{json .RepoDigests}}'], {deadline, timeoutMs: 30_000}));
+    let values;
+    try { values = JSON.parse(inspected.stdout.trim()); } catch { throw new Error(`docker returned invalid RepoDigests for ${item.image}`); }
+    const digest = values.find((value) => /@sha256:[0-9a-f]{64}$/i.test(value));
+    if (!digest) throw new Error(`image ${item.image} has no immutable repository digest`);
+    if (!item.smoke_command) throw new Error(`profile ${item.profile} has no smoke command`);
+    await must(`smoke executor image ${item.image}`, await runImpl('docker', [
+      'run', '--rm', '--network', 'none', '--read-only', '--security-opt', 'no-new-privileges',
+      '--cap-drop=ALL', digest, 'sh', '-c', item.smoke_command,
+    ], {deadline, timeoutMs: 60_000}));
+    images.push({...item, digest, warmed: true});
+  }
+  const repositories = [];
+  for (const item of plan.repositories) {
+    const mirror = await mirrorInitializer(item.spec, {root: mirrorRoot, deadline, runImpl});
+    repositories.push({repository: item.repository, base_commit: item.base_commit, mirror});
+  }
+  await mkdir(mirrorRoot, {recursive: true, mode: 0o700});
+  const disk = await statfsImpl(mirrorRoot);
+  const freeBytes = Number(disk.bavail) * Number(disk.bsize);
+  if (!Number.isFinite(freeBytes) || freeBytes < minimumFreeBytes) {
+    throw new Error(`warm disk readiness failed: ${freeBytes} free bytes is below ${minimumFreeBytes}; no data was deleted`);
+  }
+  return {
+    schema_version: 1,
+    warmed_at: new Date().toISOString(),
+    images,
+    repositories,
+    disk: {path: mirrorRoot, free_bytes: freeBytes, minimum_free_bytes: minimumFreeBytes, ready: true, data_deleted: false},
+  };
+}
+
 export async function removeRunWorkspace(workspace, removeImpl = rm) {
   await removeImpl(workspace, {recursive: true, force: true, maxRetries: 5, retryDelay: 100});
 }
 
-async function cloneBase(spec, workspace, deadline) {
+export function repositoryMirrorPath(spec, root = REPOSITORY_MIRROR_ROOT) {
+  const candidate = parseCandidate(spec.candidate);
+  const readable = `${candidate.owner}__${candidate.repo}`.toLowerCase().replace(/[^a-z0-9_.-]+/g, '_');
+  return path.join(root, `${readable}.git`);
+}
+
+async function pathExists(value) {
+  try { await stat(value); return true; }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+
+async function withMirrorLock(lock, deadline, operation) {
+  const waitStarted = Date.now();
+  while (true) {
+    try {
+      await mkdir(lock);
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (deadline?.expired() || (!deadline && Date.now() - waitStarted >= 2 * 60 * 1000)) {
+        throw new Error(`deadline exhausted waiting for repository mirror lock ${lock}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  try { return await operation(); }
+  finally { await rm(lock, {recursive: true, force: true}); }
+}
+
+export async function ensureRepositoryMirror(spec, {
+  root = REPOSITORY_MIRROR_ROOT, deadline = null, runImpl = run,
+} = {}) {
+  await mkdir(root, {recursive: true, mode: 0o700});
+  const mirror = repositoryMirrorPath(spec, root);
+  await withMirrorLock(`${mirror}.lock`, deadline, async () => {
+    if (!await pathExists(mirror)) {
+      const temporary = `${mirror}.${process.pid}.tmp`;
+      await rm(temporary, {recursive: true, force: true});
+      await must('initialize repository mirror', await runImpl('git', ['clone', '--mirror', spec.target_repo, temporary], {
+        env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000,
+      }));
+      await rename(temporary, mirror);
+    } else {
+      await must('refresh repository mirror', await runImpl('git', ['-C', mirror, 'fetch', '--prune', 'origin'], {
+        env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000,
+      }));
+    }
+    await must('verify base commit in repository mirror', await runImpl('git', ['-C', mirror, 'cat-file', '-e', `${spec.base_commit}^{commit}`], {
+      env: sanitizedGitEnv(), deadline, timeoutMs: 30_000,
+    }));
+  });
+  return mirror;
+}
+
+export async function cloneBase(spec, workspace, deadline, {mirrorRoot = REPOSITORY_MIRROR_ROOT, runImpl = run} = {}) {
   await removeRunWorkspace(workspace);
   await mkdir(workspace, {recursive: true, mode: 0o700});
   const repo = path.join(workspace, 'repo');
-  await must('clone target', await run('git', ['clone', '--no-checkout', spec.target_repo, repo], {
+  const mirror = await ensureRepositoryMirror(spec, {root: mirrorRoot, deadline, runImpl});
+  await must('clone target from repository mirror', await runImpl('git', ['clone', '--shared', '--no-checkout', mirror, repo], {
     env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000,
   }));
-  await must('checkout base', await missionGit(deadline, repo, 'checkout', '--detach', spec.base_commit));
-  await missionGit(deadline, repo, 'config', 'user.name', OSS_IDENTITY.name);
-  await missionGit(deadline, repo, 'config', 'user.email', OSS_IDENTITY.email);
+  await must('bind workspace origin', await runImpl('git', ['-C', repo, 'remote', 'set-url', 'origin', spec.target_repo], {
+    env: sanitizedGitEnv(), deadline, timeoutMs: 30_000,
+  }));
+  const localGit = (...args) => runImpl('git', ['-C', repo, ...args], {
+    env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000,
+  });
+  await must('checkout base', await localGit('checkout', '--detach', spec.base_commit));
+  await must('set mission git user name', await localGit('config', 'user.name', OSS_IDENTITY.name));
+  await must('set mission git user email', await localGit('config', 'user.email', OSS_IDENTITY.email));
   return repo;
+}
+
+export async function cloneStandaloneRepository(source, destination, commit, deadline = null, {runImpl = run} = {}) {
+  await rm(destination, {recursive: true, force: true});
+  await must('standalone verifier clone', await runImpl('git', [
+    'clone', '--no-local', '--no-checkout', source, destination,
+  ], {env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000}));
+  const localGit = (...args) => runImpl('git', ['-C', destination, ...args], {
+    env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000,
+  });
+  await must('standalone verifier checkout', await localGit('checkout', '--detach', commit));
+  await must('standalone verifier reset', await localGit('reset', '--hard', commit));
+  await must('standalone verifier clean', await localGit('clean', '-ffdx'));
+  // --no-local transfers reachable objects instead of propagating the author's shared
+  // alternates chain. Remove any unexpected alternates before proving the clone stands alone.
+  await rm(path.join(destination, '.git', 'objects', 'info', 'alternates'), {force: true});
+  await must('standalone verifier object check', await localGit('cat-file', '-e', `${commit}^{commit}`));
+  const head = (await must('standalone verifier HEAD', await localGit('rev-parse', 'HEAD^{commit}'))).stdout.trim();
+  if (head !== commit) throw new Error(`standalone verifier source commit changed: ${head} != ${commit}`);
+  const status = await must('standalone verifier repository check', await localGit('status', '--porcelain'));
+  if (status.stdout.trim()) throw new Error(`standalone verifier clone is dirty: ${status.stdout.trim()}`);
+  return destination;
+}
+
+export async function verifyTestOnlyAuthorResult(spec, workspace, image, {
+  deadline = null, runImpl = run, log = async () => {}, dependencySnapshot = null,
+} = {}) {
+  const repo = path.join(workspace, 'repo');
+  const head = await must('read test-only author HEAD', await runImpl('git', ['-C', repo, 'rev-parse', 'HEAD'], {
+    env: sanitizedGitEnv(), deadline, timeoutMs: 30_000,
+  }));
+  if (head.stdout.trim() !== spec.base_commit) throw new Error('FAILED_ORACLE_DESIGN: test-only phase must not commit or change history');
+  const status = await must('read test-only author changes', await runImpl('git', ['-C', repo, 'status', '--porcelain', '--untracked-files=all'], {
+    env: sanitizedGitEnv(), deadline, timeoutMs: 30_000,
+  }));
+  const changed = status.stdout.split('\n').filter(Boolean).map((line) => line.slice(3).trim().replace(/^.* -> /, ''));
+  if (!changed.length) throw new Error('FAILED_ORACLE_DESIGN: test-only phase produced no regression');
+  const allowed = new Set(spec.oracle.test_paths);
+  const unexpected = changed.filter((file) => !allowed.has(file));
+  if (unexpected.length || !spec.oracle.test_paths.some((file) => changed.includes(file))) {
+    throw new Error(`FAILED_ORACLE_DESIGN: test-only phase may change only oracle.test_paths (${unexpected.join(', ') || 'oracle path missing'})`);
+  }
+  if (!dependencySnapshot) throw new Error('FAILED_ORACLE_DESIGN: immutable pre-author dependency snapshot is required');
+  const redRoot = await mkdtemp(path.join(os.tmpdir(), `${spec.mission_id}-test-only-red-`));
+  try {
+    const redRepo = path.join(redRoot, 'repo');
+    await must('test-only base clone', await runImpl('git', ['clone', '--local', '--no-hardlinks', '--no-checkout', repo, redRepo], {
+      env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000,
+    }));
+    const redGit = (...args) => runImpl('git', ['-C', redRepo, ...args], {
+      env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000,
+    });
+    await must('test-only base checkout', await redGit('checkout', '--detach', spec.base_commit));
+    await must('test-only base reset', await redGit('reset', '--hard', spec.base_commit));
+    await must('test-only base clean', await redGit('clean', '-ffdx'));
+    for (const testPath of spec.oracle.test_paths) {
+      const source = path.join(repo, testPath);
+      const target = path.join(redRepo, testPath);
+      const info = await lstat(source).catch(() => null);
+      if (!info?.isFile()) throw new Error(`FAILED_ORACLE_DESIGN: oracle test path is not a regular file: ${testPath}`);
+      await mkdir(path.dirname(target), {recursive: true});
+      await cp(source, target, {verbatimSymlinks: true});
+    }
+    await copyDependencySnapshot(spec.executor.profile, dependencySnapshot, redRepo);
+    await log('test-only author phase: checking base-red marker against pre-author dependencies before spending the fix phase…');
+    const observed = await runDocker(runImpl, checkDockerArgs(spec, redRoot, image, spec.oracle.command), {
+      timeoutMs: limits(spec).wallMs, deadline, outputLimitBytes: limits(spec).output,
+    });
+    const output = `${observed.stdout}\n${observed.stderr}`;
+    if (observed.code !== spec.oracle.base_exit_code || !output.includes(spec.oracle.base_failure_contains)) {
+      throw new Error(`FAILED_ORACLE_DESIGN: test-only regression did not exit ${spec.oracle.base_exit_code} with marker ${JSON.stringify(spec.oracle.base_failure_contains)}`);
+    }
+    return {changed_files: changed, base_exit: observed.code, base_failure_observed: true,
+      output_sha256: sha256(Buffer.from(output)), dependency_snapshot_sha256: dependencySnapshot.digest};
+  } finally {
+    await rm(redRoot, {recursive: true, force: true});
+  }
 }
 
 export async function runAuthorContainer(spec, dirs, {
@@ -277,9 +581,13 @@ export async function runAuthorContainer(spec, dirs, {
 } = {}) {
   const codexHome = dryRun ? '/tmp/northset-codex-home' : await prepareCodexHome(dirs.base);
   const resolvedAuthorImage = authorImage ?? (dryRun ? AUTHOR_IMAGE : await resolveAuthorImage(runImpl, deadline));
+  const authoringMode = spec.authoring_mode ?? 'direct_fix';
   const plan = {
     bootstrap: dependencyBootstrapDockerArgs(spec, dirs.authorWorkspace, image, cacheDir),
-    author: authorDockerArgs(spec, dirs.authorWorkspace, resolvedAuthorImage, codexHome),
+    author: authorDockerArgs(spec, dirs.authorWorkspace, resolvedAuthorImage, codexHome,
+      authoringMode === 'test_only_then_fix' ? 'test_only' : 'direct_fix'),
+    authorFix: authoringMode === 'test_only_then_fix'
+      ? authorDockerArgs(spec, dirs.authorWorkspace, resolvedAuthorImage, codexHome, 'fix_only') : null,
   };
   if (dryRun) return {planned: true, docker: plan.author, codex: ['codex', authorPrompt(spec)], ...plan};
   const names = ['dependency-bootstrap', 'author'].map((phase) => containerName(spec, phase));
@@ -297,16 +605,27 @@ export async function runAuthorContainer(spec, dirs, {
       bootstrapDurationMs += bootstrap.durationMs ?? 0;
     }
     await must('dependency bootstrap', bootstrap);
-    const author = await runDocker(runImpl, plan.author, {timeoutMs: limits(spec).wallMs * 2, deadline});
-    await must('author container', author);
+    const dependencySnapshot = await snapshotProfileDependencies(spec.executor.profile,
+      path.join(dirs.authorWorkspace, 'repo'), path.join(dirs.base, 'dependency-snapshot'));
+    await log(`dependency bootstrap snapshot fixed before credentialed authoring: ${dependencySnapshot.digest}`);
+    let author = await runDocker(runImpl, plan.author, {timeoutMs: limits(spec).wallMs * 2, deadline});
+    await must(authoringMode === 'test_only_then_fix' ? 'test-only author container' : 'author container', author);
+    let authorDurationMs = author.durationMs ?? 0;
+    if (authoringMode === 'test_only_then_fix') {
+      await verifyTestOnlyAuthorResult(spec, dirs.authorWorkspace, image, {deadline, runImpl, log, dependencySnapshot});
+      author = await runDocker(runImpl, plan.authorFix, {timeoutMs: limits(spec).wallMs * 2, deadline});
+      await must('fix-only author container', author);
+      authorDurationMs += author.durationMs ?? 0;
+    }
     return {
       repoDir: path.join(dirs.authorWorkspace, 'repo'),
       image,
       authorImage: resolvedAuthorImage,
+      dependencySnapshot,
       usage: {
         bootstrap_duration_ms: bootstrapDurationMs,
         bootstrap_retry_count: bootstrapRetryCount,
-        author_duration_ms: author.durationMs ?? null,
+        author_duration_ms: authorDurationMs,
         requested_model: 'gpt-5.6-sol',
         actual_model: null,
         reasoning_effort: authorEffort(spec),
@@ -413,11 +732,28 @@ export async function normalizeAuthorResult(spec, repo, ready, deadline = null) 
   if (changed.entries.length > 5) throw new Error(`initial lane allows at most 5 changed files, got ${changed.entries.length}`);
   if (changed.lines > 300) throw new Error(`initial lane allows at most 300 changed lines, got ${changed.lines}`);
   const classes = classifyChangedFiles(changed.baseFiles, changed.entries);
-  const forbidden = classes.filter((item) => !['source', 'added-test', 'modified-existing-test'].includes(item.class));
+  const permitted = spec.allow_modified_existing_tests === true
+    ? ['source', 'added-test', 'modified-existing-test'] : ['source', 'added-test'];
+  const forbidden = classes.filter((item) => !permitted.includes(item.class));
   if (forbidden.length) throw new Error(`initial lane forbids changed class(es): ${forbidden.map((item) => `${item.class}:${item.path}`).join(', ')}`);
   const modifiedTests = classes.filter((item) => item.class === 'modified-existing-test');
-  if (modifiedTests.length > 1) throw new Error(`initial lane allows at most one modified existing test, got ${modifiedTests.length}`);
+  if (modifiedTests.length && spec.allow_modified_existing_tests !== true) {
+    throw new Error(`fast lane forbids modified existing tests: ${modifiedTests.map((item) => item.path).join(', ')}`);
+  }
+  if (modifiedTests.length > 1) throw new Error(`elevated lane allows at most one modified existing test, got ${modifiedTests.length}`);
   assertOracleChangedPaths(spec, classes);
+  if (spec.work_category === 'defect_fix' && !classes.some((item) => item.class === 'source')) {
+    throw new Error('defect_fix must modify at least one production-source file');
+  }
+  if (spec.work_category === 'defect_fix') {
+    const evidencePaths = qualificationSourceEvidencePaths(spec, {required: true});
+    if (!classes.some((item) => item.class === 'source' && evidencePaths.includes(item.path))) {
+      throw new Error('defect_fix production change must touch a qualification source-evidence path');
+    }
+  }
+  if (spec.work_category === 'defect_fix' && !classes.some((item) => item.class === 'added-test') && spec.allow_modified_existing_tests !== true) {
+    throw new Error('defect_fix fast lane must add an oracle-bound regression test');
+  }
   return {
     noChange: false, commit, tree, patch: patch.stdout, patchFile,
     patchSha: sha256(Buffer.from(patch.stdout)), classes, changedFiles: changed.entries.map((item) => item.path), lines: changed.lines,
@@ -425,7 +761,7 @@ export async function normalizeAuthorResult(spec, repo, ready, deadline = null) 
 }
 
 export async function copyNodeDependencies(fromRepo, toRepo) {
-  for (const directory of ['node_modules', '.yarn']) {
+  for (const directory of ['node_modules', '.yarn', path.join('ui', 'node_modules'), path.join('client', 'node_modules')]) {
     await cp(path.join(fromRepo, directory), path.join(toRepo, directory), {recursive: true, verbatimSymlinks: true})
       .catch((error) => { if (error.code !== 'ENOENT') throw error; });
   }
@@ -448,6 +784,87 @@ export async function copyNodeDependencies(fromRepo, toRepo) {
   }
 }
 
+async function copyIfPresent(source, target) {
+  await mkdir(path.dirname(target), {recursive: true});
+  await cp(source, target, {recursive: true, verbatimSymlinks: true})
+    .catch((error) => { if (error.code !== 'ENOENT') throw error; });
+}
+
+function safeRelative(value) {
+  if (!value || path.isAbsolute(value) || value.split(/[\\/]/).includes('..')) {
+    throw new Error(`unsafe dependency-cache path ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+export async function copyProfileDependencies(profile, fromRepo, toRepo) {
+  if (!PROFILE_REGISTRY.profiles[profile]) throw new Error(`unknown dependency profile ${profile}`);
+  if (profile === 'node') return copyNodeDependencies(fromRepo, toRepo);
+  const policy = PROFILE_REGISTRY.profiles[profile].dependency_cache;
+  for (const forbidden of policy.never_copy ?? []) {
+    if ((policy.workspace_paths ?? []).includes(forbidden)) throw new Error(`${profile} cache policy attempts to copy forbidden ${forbidden}`);
+  }
+  for (const relative of policy.workspace_paths ?? []) {
+    const clean = safeRelative(relative);
+    await copyIfPresent(path.join(fromRepo, clean), path.join(toRepo, clean));
+  }
+  for (const relative of policy.bootstrap_paths ?? []) {
+    const clean = safeRelative(relative);
+    await copyIfPresent(path.join(path.dirname(fromRepo), clean), path.join(path.dirname(toRepo), clean));
+  }
+}
+
+async function assertContainedDependencySymlinks(root) {
+  async function walk(directory) {
+    for (const entry of await readdir(directory, {withFileTypes: true})) {
+      const file = path.join(directory, entry.name);
+      const info = await lstat(file);
+      if (info.isDirectory()) await walk(file);
+      else if (info.isSymbolicLink()) {
+        const target = await readlink(file);
+        const resolved = path.resolve(path.dirname(file), target);
+        if (path.isAbsolute(target) || (resolved !== root && !resolved.startsWith(`${root}${path.sep}`))) {
+          throw new Error(`pre-author dependency snapshot contains an external symlink: ${path.relative(root, file)}`);
+        }
+      }
+    }
+  }
+  await walk(root);
+}
+
+export async function snapshotProfileDependencies(profile, fromRepo, snapshotRoot) {
+  if (!PROFILE_REGISTRY.profiles[profile]) throw new Error(`unknown dependency profile ${profile}`);
+  const root = path.resolve(snapshotRoot);
+  const repo = path.join(root, 'repo');
+  await rm(root, {recursive: true, force: true});
+  try {
+    await mkdir(repo, {recursive: true, mode: 0o700});
+    await copyProfileDependencies(profile, fromRepo, repo);
+    await assertContainedDependencySymlinks(root);
+    return {schema_version: 1, profile, root, repo, digest: await directoryDigest(root)};
+  } catch (error) {
+    await rm(root, {recursive: true, force: true});
+    throw error;
+  }
+}
+
+export async function copyDependencySnapshot(profile, snapshot, toRepo) {
+  if (!snapshot || snapshot.profile !== profile || !snapshot.root || !snapshot.repo ||
+      !/^sha256:[0-9a-f]{64}$/i.test(snapshot.digest ?? '')) {
+    throw new Error(`invalid pre-author dependency snapshot for ${profile}`);
+  }
+  const before = await directoryDigest(snapshot.root);
+  if (before !== snapshot.digest) {
+    throw new Error(`pre-author dependency snapshot changed: ${before} != ${snapshot.digest}`);
+  }
+  await copyProfileDependencies(profile, snapshot.repo, toRepo);
+  const after = await directoryDigest(snapshot.root);
+  if (after !== snapshot.digest) {
+    throw new Error(`pre-author dependency snapshot changed during copy: ${after} != ${snapshot.digest}`);
+  }
+  return snapshot.digest;
+}
+
 export async function assertExpectedTree(repo, commit, deadline = null) {
   const head = (await must('read verifier HEAD', await missionGit(deadline, repo, 'rev-parse', 'HEAD'))).stdout.trim();
   if (head !== commit) throw new Error(`verifier HEAD changed: ${head} != ${commit}`);
@@ -465,7 +882,8 @@ async function worktreeFingerprint(repo, deadline) {
   return sha256(Buffer.from(canonical({unstaged: unstaged.stdout, staged: staged.stdout, status: status.stdout})));
 }
 
-export async function runDifferentialOracle(spec, dirs, authorRepo, result, image, log, deadline) {
+export async function runDifferentialOracle(spec, dirs, authorRepo, result, image, log, deadline, dependencySnapshot) {
+  if (!dependencySnapshot) throw new Error('differential oracle requires an immutable pre-author dependency snapshot');
   const root = await mkdtemp(path.join(os.tmpdir(), `${spec.mission_id}-oracle-`));
   try {
     const repo = path.join(root, 'repo');
@@ -481,7 +899,7 @@ export async function runDifferentialOracle(spec, dirs, authorRepo, result, imag
     const testPatchFile = path.join(root, 'test-only.patch');
     await writeFile(testPatchFile, testPatch.stdout);
     await must('apply test-only patch', await missionGit(deadline, repo, 'apply', '--binary', testPatchFile));
-    await copyNodeDependencies(authorRepo, repo);
+    await copyDependencySnapshot(spec.executor.profile, dependencySnapshot, repo);
     const baseFingerprint = await worktreeFingerprint(repo, deadline);
     await log('differential oracle: running the test-only patch on the base tree (expected failure)…');
     const observed = await runDocker(run, checkDockerArgs(spec, root, image, spec.oracle.command), {
@@ -500,16 +918,8 @@ export async function runDifferentialOracle(spec, dirs, authorRepo, result, imag
         `failure marker observed=${baseOutput.includes(spec.oracle.base_failure_contains)}; output tail: ${tail}`,
       );
     }
-    await log('differential oracle: running the same focused test on the patched tree (expected success)…');
-    await assertExpectedTree(authorRepo, result.commit, deadline);
-    const patched = await runDocker(run, checkDockerArgs(spec, dirs.authorWorkspace, image, spec.oracle.command),
-      {timeoutMs: limits(spec).wallMs, deadline, outputLimitBytes: limits(spec).output});
-    await assertExpectedTree(authorRepo, result.commit, deadline);
-    if (patched.code !== 0) {
-      throw new Error(`differential oracle failed: the focused test exited ${patched.code ?? 'without an exit code'} on the patched tree`);
-    }
     const record = {
-      schema_version: 1,
+      schema_version: 2,
       kind: spec.oracle.kind,
       command: spec.oracle.command,
       base_expected: spec.oracle.base_expected,
@@ -519,10 +929,11 @@ export async function runDifferentialOracle(spec, dirs, authorRepo, result, imag
       base_failure_contains: spec.oracle.base_failure_contains,
       base_failure_observed: true,
       patched_expected: spec.oracle.patched_expected,
-      patched_exit: patched.code,
-      patched_observed: patched.code === 0,
+      patched_execution: 'canonical_verifier_pending',
+      patched_observed: false,
       base_output_sha256: sha256(Buffer.from(baseOutput)),
-      patched_output_sha256: sha256(Buffer.from(`${patched.stdout}\n${patched.stderr}`)),
+      dependency_snapshot_sha256: dependencySnapshot.digest,
+      declared_commands: spec.executor.commands,
     };
     const file = path.join(dirs.ready, 'oracle.json');
     await writeFile(file, `${JSON.stringify(record, null, 2)}\n`);
@@ -530,6 +941,18 @@ export async function runDifferentialOracle(spec, dirs, authorRepo, result, imag
   } finally {
     await rm(root, {recursive: true, force: true});
   }
+}
+
+export async function completeOracleWithCanonicalVerification(oracle, bundle) {
+  const record = {
+    ...oracle.record,
+    patched_execution: 'fresh_canonical_verifier',
+    patched_observed: true,
+    declared_commands_executed_once: true,
+    canonical_bundle_digest: bundle.bundleDigest,
+  };
+  await writeFile(oracle.file, `${JSON.stringify(record, null, 2)}\n`);
+  return {record, file: oracle.file, sha: sha256(Buffer.from(canonical(record)))};
 }
 
 export function buildEconomicInput(spec, {
@@ -735,13 +1158,7 @@ function publicMissionInput(spec, repoDir, patchFile, issueSnapshotFile, image, 
 
 export async function runCanonicalVerifier(spec, dirs, authorRepo, result, image, snapshotFile, log, deadline, economicContext = null) {
   const baseRepo = path.join(dirs.base, 'public-base');
-  await rm(baseRepo, {recursive: true, force: true});
-  await must('public base clone', await run('git', ['clone', '--local', '--no-hardlinks', authorRepo, baseRepo], {
-    env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000,
-  }));
-  await must('public base checkout', await missionGit(deadline, baseRepo, 'checkout', '--detach', spec.base_commit));
-  await missionGit(deadline, baseRepo, 'reset', '--hard', spec.base_commit);
-  await missionGit(deadline, baseRepo, 'clean', '-ffdx');
+  await cloneStandaloneRepository(authorRepo, baseRepo, spec.base_commit, deadline);
   const staging = path.join(dirs.base, 'prepared-missions');
   await rm(staging, {recursive: true, force: true});
   await mkdir(staging, {recursive: true});
@@ -912,7 +1329,7 @@ async function prepareMission(spec, options) {
       await writeAttempt(dirs, spec, 'STALE', detail, timings, startedAt);
       return {state: 'STALE', spec, detail, timings};
     }
-    const image = await stage('executor_image', () => resolveImage(spec, log, deadline));
+    const image = await stage('executor_image', () => resolveBatchImage(spec, options, log, deadline));
     const repo = await stage('clone', () => cloneBase(spec, dirs.authorWorkspace, deadline));
     const cacheKey = await dependencyCacheKey(spec, repo, image);
     const cacheDir = path.join(DEPENDENCY_CACHE_ROOT, cacheKey);
@@ -924,7 +1341,9 @@ async function prepareMission(spec, options) {
       return {state: 'NOCHANGE', spec, detail: 'author produced no change', timings};
     }
     await log(`canonical commit ${result.commit.slice(0, 12)}; ${result.changedFiles.length} files / ${result.lines} changed lines`);
-    const oracle = await stage('differential_oracle', () => runDifferentialOracle(spec, dirs, repo, result, image, log, deadline));
+    let oracle = await stage('differential_oracle', () => runDifferentialOracle(
+      spec, dirs, repo, result, image, log, deadline, authorRun.dependencySnapshot,
+    ));
 
     const snapshotFile = path.join(dirs.ready, 'issue_snapshot.json');
     const policyFile = path.join(dirs.ready, 'policy_snapshot.json');
@@ -946,10 +1365,25 @@ async function prepareMission(spec, options) {
         attempts,
       } : null,
     ));
+    oracle = await stage('oracle_binding', () => completeOracleWithCanonicalVerification(oracle, bundle));
     const body = prBody(spec, {changedFiles: result.changedFiles, commitOid: result.commit});
     const titleFile = path.join(dirs.ready, 'pr_title.txt');
     const bodyFile = path.join(dirs.ready, 'pr_body.md');
     await Promise.all([writeFile(titleFile, `${spec.pr.title}\n`), writeFile(bodyFile, body)]);
+    const patchReviewInput = {
+      spec,
+      classes: result.classes,
+      patch_file: 'fix.patch',
+      pr_body_file: 'pr_body.md',
+    };
+    const patchReviewInputFile = path.join(dirs.ready, 'patch-review-input.json');
+    await writeFile(patchReviewInputFile, `${JSON.stringify(patchReviewInput, null, 2)}\n`);
+    const patchReview = await stage('patch_review', async () => {
+      const reviewed = reviewPatch({spec, classes: result.classes, patch: result.patch, prBody: body});
+      await writeFile(path.join(dirs.ready, 'patch-review.json'), `${JSON.stringify(reviewed, null, 2)}\n`);
+      if (!reviewed.ready) throw new Error(`deterministic patch review blocked READY: ${reviewed.blocking_reasons.join('; ')}`);
+      return reviewed;
+    });
     const preparedAt = new Date();
     const manifest = {
       schema_version: spec.schema_version === 2 ? 2 : 1,
@@ -976,20 +1410,25 @@ async function prepareMission(spec, options) {
       issue_snapshot_sha256: sha256(await readFile(snapshotFile)),
       policy_snapshot_sha256: sha256(await readFile(policyFile)),
       oracle_sha256: oracle.sha,
+      patch_review_sha256: sha256(Buffer.from(canonical(patchReview))),
+      risk_flags: patchReview.risks,
+      changed_file_classes: result.classes.map((item) => ({path: item.path, class: item.class})),
       pr_title: spec.pr.title,
       pr_body_sha256: sha256(Buffer.from(body)),
+      pr_claim_text: normalizedPrClaimText(body),
       executor_image_digest: image,
       author_image_digest: authorRun.authorImage,
       dependency_cache_key: cacheKey,
+      dependency_snapshot_sha256: authorRun.dependencySnapshot.digest,
       timings,
       total_duration_ms: Date.now() - startedAt.getTime(),
       planned_actions: [
         'push-reviewed-commit',
-        'publish-prepared-receipt-pr', 'wait-prepared-receipt-checks', 'merge-prepared-receipt-pr',
-        'verify-attestation', 'confirm-canonical-receipt-http-200', 'recheck-collision',
+        'publish-prepared-ledger-batch', 'wait-prepared-ledger-checks', 'merge-prepared-ledger-batch',
+        'verify-batch-attestations', 'wait-pages-readiness-once', 'confirm-individual-receipt-http-200', 'recheck-collision',
         'open-approved-upstream-pr', 'sync-guarded-pr-disclosure', 'record-pr-disclosure',
-        'rebuild-full-ledger', 'publish-final-envelope-pr', 'wait-final-envelope-checks',
-        'merge-final-envelope-pr',
+        'rebuild-full-ledger', 'publish-final-envelope-batch', 'wait-final-envelope-batch-checks',
+        'merge-final-envelope-batch',
       ],
     };
     await writeFile(path.join(dirs.ready, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
@@ -1001,59 +1440,103 @@ async function prepareMission(spec, options) {
     const budget = deadline.expired() || /timed out|deadline exhausted/i.test(error.message);
     const state = budget ? 'FAILED_BUDGET'
       : activeStage === 'author' ? 'FAILED_AUTHOR'
-        : ['differential_oracle', 'canonical_verifier'].includes(activeStage) ? 'FAILED_ORACLE'
+        : ['differential_oracle', 'canonical_verifier', 'oracle_binding', 'patch_review'].includes(activeStage) ? 'FAILED_ORACLE'
           : 'FAILED_INFRA_TERMINAL';
     await writeAttempt(dirs, spec, state, error.message, timings, startedAt);
     return {state, spec, detail: error.message, timings};
   }
 }
 
-function printBoard(results) {
-  console.log('\nOSS PREPARE — REVIEW BOARD');
-  const ready = [];
-  for (const result of results) {
-    if (result.state !== 'READY') {
-      console.log(`${result.state} ${result.spec.mission_id} ${result.spec.candidate}: ${result.detail}`);
-      continue;
-    }
-    ready.push(result.manifest);
+function markdownCell(value) { return String(value ?? '').replaceAll('|', '\\|').replaceAll('\n', ' '); }
+
+export function buildBatchBoard(results) {
+  const readyResults = results.filter((result) => result.state === 'READY');
+  if (!readyResults.length) return null;
+  if (readyResults.length > 50) throw new Error('one batch board may contain at most 50 READY missions');
+  const manifests = readyResults.map((result) => result.manifest);
+  const boardData = batchBoardData(manifests);
+  const batchDigest = batchApprovalDigest(manifests);
+  const failures = results.filter((result) => result.state !== 'READY').map((result) => ({
+    mission_id: result.spec.mission_id, candidate: result.spec.candidate, state: result.state, detail: result.detail ?? null,
+  }));
+  const machine = {
+    schema_version: 1,
+    batch_digest: batchDigest,
+    ordered_mission_ids: manifests.map((manifest) => manifest.mission_id),
+    ...boardData,
+    non_ready: failures,
+  };
+  const lines = [
+    '# OSS preparation batch review board', '',
+    `Batch digest: \`${batchDigest}\``, '',
+    `Missions ready: ${manifests.length}`, '',
+    `Changed-file classes: ${Object.entries(boardData.changed_file_class_counts).map(([name, count]) => `${name}=${count}`).join(', ') || 'none'}`, '',
+    `Risk flags: ${Object.entries(boardData.risk_counts).map(([name, count]) => `${name}=${count}`).join(', ') || 'none'}`, '',
+    '| # | Mission | Repository | Issue | Changed files | Base red | Declared checks | PR title | Normalized PR claim text | Risk |',
+    '|---:|---|---|---|---|---|---|---|---|---|',
+  ];
+  for (const [index, result] of readyResults.entries()) {
     const spec = result.spec;
-    console.log(`READY ${spec.mission_id} ${spec.candidate}`);
-    console.log(`  invitation: ${spec.qualification.invitation_evidence.type} ${spec.qualification.invitation_evidence.url}`);
-    console.log(`  latest maintainer intent: ${spec.qualification.acceptance_contract.design_evidence.map((item) => item.url).join(', ')}`);
-    console.log(`  repository process: ${spec.process_requirements.join(' | ') || 'no additional requirements'}`);
-    console.log(`  pre-author notice: ${spec.qualification.pre_author_notice?.url ?? 'not required'}`);
-    console.log(`  related PR/history: ${spec.qualification.related_prs.length ? spec.qualification.related_prs.map((item) => `${item.state} ${item.url}: ${item.disposition}`).join('; ') : 'clear'}`);
-    console.log(`  acceptance criteria: ${spec.acceptance_criteria.join(' | ')}`);
-    console.log('  BASE: expected failure observed');
-    console.log(`  PATCH: focused test passed (${spec.oracle.command})`);
-    console.log(`  PATCH: declared checks passed (${spec.executor.commands.join(' && ')})`);
-    console.log(`  changed files: ${result.classes.map((item) => `${item.flagged ? 'RISK ' : ''}${item.class}:${item.path}`).join(', ')}`);
-    console.log(`  checks not run: ${(spec.receipt?.checks_not_run ?? []).join(', ') || '(see limitations)'}`);
-    console.log(`  resolved image: ${result.manifest.executor_image_digest}`);
-    console.log(`  public bundle: ${result.manifest.bundle_digest}`);
-    console.log(`  prepare time: ${(result.manifest.total_duration_ms / 1000).toFixed(1)}s`);
-    console.log(`  diff: ${path.join(result.dirs.ready, 'fix.patch')}`);
-    console.log(`  PR title: ${result.manifest.pr_title}`);
-    console.log(`  PR body: ${path.join(result.dirs.ready, 'pr_body.md')}`);
+    lines.push(`| ${index + 1} | ${markdownCell(spec.mission_id)} | ${markdownCell(result.manifest.repo)} | ${markdownCell(spec.issue_url)} | ${markdownCell(result.classes.map((item) => `${item.class}:${item.path}`).join(', '))} | ${markdownCell(spec.oracle.base_failure_contains)} | ${markdownCell(spec.executor.commands.join(' ; '))} | ${markdownCell(spec.pr.title)} | ${markdownCell(result.manifest.pr_claim_text)} | ${markdownCell((result.manifest.risk_flags ?? []).map((risk) => risk.code ?? risk).join(', ') || 'none')} |`);
   }
-  if (!ready.length) return;
-  const digest = manifestDigest(ready);
-  const ids = ready.map((item) => item.mission_id).join(' ');
-  console.log(`batch_manifest_digest: ${digest}`);
-  console.log(`node oss.mjs ship --approve ${digest} --approved-by internal-user:aeziz ${ids}`);
+  if (failures.length) {
+    lines.push('', '## Non-ready missions', '');
+    for (const failure of failures) lines.push(`- ${failure.mission_id} ${failure.state}: ${failure.detail ?? 'no detail'}`);
+  }
+  lines.push('', 'Approval binds the ordered manifest bytes, patch hashes, PR-body hashes, risk data, and this board data.', '');
+  return {machine, markdown: `${lines.join('\n')}\n`, manifests};
 }
 
-function parseArgs(argv) {
-  const command = argv.shift();
-  if (!['prepare', 'decline', 'ship', 'status'].includes(command)) throw new Error('usage: oss <prepare|decline|ship|status> ...');
-  const options = {...DEFAULTS, command, ids: [], approve: null, approvedBy: null, push: true, retryInfraTerminal: false};
+export async function writeBatchBoards(results, runsDir, explicitBase = null) {
+  const board = buildBatchBoard(results);
+  if (!board) return null;
+  const short = board.machine.batch_digest.slice('sha256:'.length, 'sha256:'.length + 16);
+  const base = explicitBase ? path.resolve(explicitBase) : path.join(runsDir, 'boards', `batch-${short}`);
+  const jsonFile = base.endsWith('.json') ? base : `${base}.json`;
+  const markdownFile = base.endsWith('.json') ? base.replace(/\.json$/i, '.md') : `${base}.md`;
+  await mkdir(path.dirname(jsonFile), {recursive: true, mode: 0o700});
+  await Promise.all([
+    writeFile(jsonFile, `${JSON.stringify(board.machine, null, 2)}\n`, {mode: 0o600}),
+    writeFile(markdownFile, board.markdown, {mode: 0o600}),
+  ]);
+  return {...board, jsonFile, markdownFile};
+}
+
+async function printBoard(results, options) {
+  console.log('\nOSS PREPARE — REVIEW BOARD');
+  for (const result of results.filter((item) => item.state !== 'READY')) {
+    console.log(`${result.state} ${result.spec.mission_id} ${result.spec.candidate}: ${result.detail}`);
+  }
+  const board = await writeBatchBoards(results, options.runsDir, options.board);
+  if (!board) return;
+  process.stdout.write(board.markdown);
+  console.log(`machine_board: ${board.jsonFile}`);
+  console.log(`human_board: ${board.markdownFile}`);
+  console.log(`batch_manifest_digest: ${board.machine.batch_digest}`);
+  console.log(`node oss.mjs ship-batch --batch ${board.jsonFile} --approve ${board.machine.batch_digest} --approved-by internal-user:aeziz`);
+}
+
+export function parseOssArgs(argv) {
+  const requestedCommand = argv.shift();
+  const aliases = {'prepare-batch': 'prepare', 'ship-batch': 'ship'};
+  const command = aliases[requestedCommand] ?? requestedCommand;
+  if (!['warm', 'prepare', 'decline', 'ship', 'status'].includes(command)) {
+    throw new Error('usage: oss <warm|prepare|prepare-batch|decline|ship|ship-batch|status> ...');
+  }
+  const options = {...DEFAULTS, command, requestedCommand, ids: [], approve: null, approvedBy: null,
+    push: true, retryInfraTerminal: false, batch: null, board: null, warmOutput: null,
+    warmManifest: null, minimumFreeBytes: 5 * 1024 * 1024 * 1024};
   while (argv.length) {
     const value = argv.shift();
     if (value === '--approve') options.approve = argv.shift();
     else if (value === '--approved-by') options.approvedBy = argv.shift();
     else if (value === '--retry-infra-terminal') options.retryInfraTerminal = true;
     else if (value === '--concurrency') options.concurrency = Number(argv.shift());
+    else if (value === '--batch' || value === '--batch-manifest') options.batch = path.resolve(argv.shift());
+    else if (value === '--board') options.board = path.resolve(argv.shift());
+    else if (value === '--warm-output') options.warmOutput = path.resolve(argv.shift());
+    else if (value === '--warm-manifest') options.warmManifest = path.resolve(argv.shift());
+    else if (value === '--minimum-free-gb') options.minimumFreeBytes = Number(argv.shift()) * 1024 * 1024 * 1024;
     else if (value === '--specs') options.specsDir = path.resolve(argv.shift());
     else if (value === '--runs') options.runsDir = path.resolve(argv.shift());
     else if (value === '--only') options.ids.push(argv.shift());
@@ -1061,20 +1544,43 @@ function parseArgs(argv) {
     else if (value.startsWith('--')) throw new Error(`unknown argument ${value}`);
     else options.ids.push(value);
   }
-  if (!Number.isInteger(options.concurrency) || options.concurrency < 1) throw new Error('--concurrency must be positive');
-  if (command !== 'status' && !options.ids.length) throw new Error(`${command} requires one or more mission ids`);
+  if (!Number.isInteger(options.concurrency) || options.concurrency < 1 || options.concurrency > 12) throw new Error('--concurrency must be an integer from 1 to 12');
+  if (!Number.isFinite(options.minimumFreeBytes) || options.minimumFreeBytes < 0) throw new Error('--minimum-free-gb must be non-negative');
+  if (command !== 'status' && !options.ids.length && !options.batch) throw new Error(`${requestedCommand} requires mission ids or --batch <manifest>`);
   if (command === 'ship' && !options.approve) throw new Error('ship requires --approve <batch-digest>');
   return options;
 }
 
 async function loadSpecs(options) {
+  const embedded = [];
+  const ids = [...options.ids];
+  if (options.batch) {
+    const batch = JSON.parse(await readFile(options.batch, 'utf8'));
+    if (Array.isArray(batch.specs)) embedded.push(...batch.specs);
+    const batchIds = batch.ordered_mission_ids ?? (Array.isArray(batch.missions)
+      ? batch.missions.map((mission) => typeof mission === 'string' ? mission : mission.mission_id) : []);
+    ids.push(...batchIds);
+  }
   const specs = [];
-  for (const id of options.ids) specs.push(JSON.parse(await readFile(path.join(options.specsDir, `${id}.json`), 'utf8')));
+  const seen = new Set();
+  for (const spec of embedded) {
+    if (!spec?.mission_id || seen.has(spec.mission_id)) continue;
+    seen.add(spec.mission_id);
+    specs.push(spec);
+  }
+  const uniqueIds = [...new Set(ids.filter(Boolean))];
+  for (const id of uniqueIds) {
+    if (seen.has(id)) continue;
+    const spec = JSON.parse(await readFile(path.join(options.specsDir, `${id}.json`), 'utf8'));
+    seen.add(id);
+    specs.push(spec);
+  }
+  if (specs.length < 1 || specs.length > 50) throw new Error('a local batch must contain one to fifty missions');
   return validateSpecs(specs);
 }
 
 async function main() {
-  const options = parseArgs(process.argv.slice(2));
+  const options = parseOssArgs(process.argv.slice(2));
   if (options.command === 'status') {
     const {syncStatus} = await import('./ship.mjs');
     const result = await syncStatus({push: options.push});
@@ -1083,6 +1589,16 @@ async function main() {
     return;
   }
   const specs = await loadSpecs(options);
+  if (options.warmManifest) options.warmCache = JSON.parse(await readFile(options.warmManifest, 'utf8'));
+  if (options.command === 'warm') {
+    const warmed = await warmBatch(specs, {minimumFreeBytes: options.minimumFreeBytes});
+    const output = options.warmOutput ?? path.join(options.runsDir, 'batch-warm-cache.json');
+    await mkdir(path.dirname(output), {recursive: true, mode: 0o700});
+    await writeFile(output, `${JSON.stringify(warmed, null, 2)}\n`, {mode: 0o600});
+    console.log(`WARM READY: ${warmed.images.length} images, ${warmed.repositories.length} mirrors, ${warmed.disk.free_bytes} free bytes`);
+    console.log(`warm_manifest: ${output}`);
+    return;
+  }
   if (options.command === 'ship' && specs.some((spec) => spec.schema_version === 2) && !options.approvedBy) {
     throw new Error('schema-v2 ship requires --approved-by <stable-operator-id>');
   }
@@ -1102,7 +1618,7 @@ async function main() {
   }
   if (options.command === 'prepare') {
     const results = await pool(specs, options.concurrency, (spec) => prepareMission(spec, options));
-    printBoard(results);
+    await printBoard(results, options);
     if (results.some((result) => result.state.startsWith('FAILED'))) process.exitCode = 1;
     return;
   }
@@ -1111,6 +1627,7 @@ async function main() {
     approvedDigest: options.approve,
     approvedBy: options.approvedBy,
     retryInfraTerminal: options.retryInfraTerminal,
+    concurrency: options.concurrency,
     log: async (id, message) => console.log(`  ${id}  ${message}`),
   });
   for (const item of result) {

@@ -11,11 +11,15 @@ import {
   hardGateReasons,
   parseIssue,
   possibleSemanticPrs,
+  reviewerCandidateEvidenceKey,
   sameRepositoryOpenPrs,
   validatedInvitation,
   validatedRepositoryPolicyEvidence,
 } from './review-issue.mjs';
-import {taskIdForCandidate} from './core.mjs';
+import {canonical, sha256, taskIdForCandidate} from './core.mjs';
+import {candidateEvidenceKey} from './candidate-lake.mjs';
+
+const digest = (character) => `sha256:${character.repeat(64)}`;
 
 test('parses a machine key and a clean issue URL', () => {
   assert.deepEqual(parseIssue('owner/repo#123'), {
@@ -43,8 +47,41 @@ test('review prompt rejects pure coverage tasks that cannot produce a differenti
 
 test('the strengthened reviewer prompt has a new immutable version', async () => {
   const source = await readFile(new URL('./review-issue.mjs', import.meta.url), 'utf8');
-  assert.match(source, /export const REVIEW_PROMPT_VERSION = 2/);
+  assert.match(source, /export const REVIEW_PROMPT_VERSION = 3/);
   assert.match(source, /review_prompt_version: REVIEW_PROMPT_VERSION/);
+});
+
+test('reviewer live facts recompute the same canonical queued evidence identity', () => {
+  const issue = parseIssue('Owner/Repo#12');
+  const baseCommit = 'a'.repeat(40);
+  const policySha = digest('3');
+  const evidence = {
+    issueData: {
+      updatedAt: '2026-07-15T12:00:00Z',
+      labels: [{name: 'Help Wanted'}, {name: 'bug'}],
+      assignees: [{login: 'AysajanE'}],
+      comments: [{author: {login: 'maintainer'}, authorAssociation: 'MEMBER',
+        body: 'Exact bounded behavior.', createdAt: '2026-07-15T11:00:00Z'}],
+    },
+    timeline: [{event: 'cross-referenced', source: {issue: {
+      number: 7, title: 'Prior fix', html_url: 'https://github.com/Owner/Repo/pull/7',
+      state: 'open', draft: false, repository_url: 'https://api.github.com/repos/Owner/Repo', pull_request: {},
+    }}}],
+  };
+  const comments = [{author: 'maintainer', author_association: 'MEMBER', body: 'Exact bounded behavior.',
+    created_at: '2026-07-15T11:00:00Z'}];
+  const prs = [{number: 7, title: 'Prior fix', url: 'https://github.com/Owner/Repo/pull/7', state: 'OPEN',
+    draft: false, repository: 'Owner/Repo'}];
+  const expected = candidateEvidenceKey({
+    candidate: issue.key, profile: 'node', base_commit: baseCommit,
+    issue_updated_at: evidence.issueData.updatedAt, labels: ['Help Wanted', 'bug'], assignees: ['AysajanE'],
+    comments_tail_sha256: sha256(Buffer.from(canonical(comments))),
+    timeline_prs_sha256: sha256(Buffer.from(canonical(prs))), repo_policy_sha256: policySha,
+  });
+  const actual = reviewerCandidateEvidenceKey(issue, baseCommit, evidence, 'node', policySha);
+  assert.equal(actual.evidence_key, expected);
+  assert.deepEqual(actual.comments, comments);
+  assert.deepEqual(actual.cross_referenced_prs, prs);
 });
 
 test('rejects pull-request URLs and credential-bearing URLs', () => {
@@ -199,6 +236,27 @@ test('documented scoped and hyphenated invitation labels survive semantic valida
       name,
     );
   }
+});
+
+test('custom invitation label requires the exact content-bound crawl policy', async () => {
+  const issue = parseIssue('owner/repo#12');
+  const result = acceptedResult();
+  const policy = {defaults: {}, repositories: {'Owner/Repo': {
+    invitation_label_map: {'starter-ready': true},
+  }}};
+  const policySha256 = sha256(Buffer.from(canonical(policy)));
+  const evidence = {
+    issueData: {url: issue.url, labels: [{name: 'starter-ready'}], assignees: [], comments: []},
+    candidateRelatedPrs: [],
+  };
+  const checked = await validatedInvitation(result, evidence, '', 'a'.repeat(40), issue, {
+    repoPolicySnapshot: policy, repoPolicySha256: policySha256,
+  });
+  assert.equal(checked.label, 'starter-ready');
+  assert.equal(checked.repo_policy_sha256, policySha256);
+  assert.equal(await validatedInvitation(result, evidence, '', 'a'.repeat(40), issue, {
+    repoPolicySnapshot: {...policy, repositories: {}}, repoPolicySha256: policySha256,
+  }), null);
 });
 
 test('repository-policy invitation is pinned to checked-out bytes and source lines', async () => {

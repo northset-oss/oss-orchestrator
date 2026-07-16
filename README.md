@@ -13,8 +13,9 @@ node bin/build-author-image.mjs
 ```
 
 The author image contains Codex already. Target-repository dependencies still install with the
-repository's declared command, using a cache keyed by executor-image digest, lockfile digest and
-install-command digest.
+repository's declared command. Writable caches are keyed by canonical repository, base commit,
+candidate or mission identity, executor-image digest, lockfile digest, and install-command digest,
+so retries of one mission can reuse them without sharing mutable state across unrelated work.
 
 ## Find and qualify the next candidate
 
@@ -43,12 +44,52 @@ and supports a no-model preflight with `node find-candidates.mjs 20 --dry-run`. 
 `OSS_FIND_REPOS`, `OSS_FIND_STARS_MIN`, `OSS_FIND_SEARCH_LIMIT`, `OSS_FIND_CONCURRENCY`,
 `OSS_FIND_HISTORY`, `OSS_FIND_OUTPUT`, and `OSS_FIND_EXCLUDE_FILES` controls remain available for
 bounded research; none relax the reviewer gates.
-See `CANDIDATE_FINDER.md` for the complete v2 search, preflight, audit, and exit-code contract.
+See `CANDIDATE_FINDER.md` for the complete v3 search, preflight, audit, and exit-code contract.
+
+For a scaled pilot, import existing rich qualifications once and keep model-free crawl/rank
+separate from the bounded qualify queue:
+
+```sh
+node find-candidates.mjs import --out candidate_lake.sqlite batch-3.jsonl
+node find-candidates.mjs crawl --profile node --out candidate_lake.sqlite
+node find-candidates.mjs rank --lake candidate_lake.sqlite --count 100 --out runs/review-queue.json
+node find-candidates.mjs qualify --lake candidate_lake.sqlite \
+  --queue runs/review-queue.json --count 25 --out runs/qualifications.json
+```
+
+The local candidate lake preserves complete qualification JSON and provenance. Live mechanical
+facts refresh independently; a cached ACCEPT or REJECT is usable only for the same unexpired
+evidence key. Node remains the default existing profile. Python, Go, and Rust require explicit
+selection and remain pilot profiles rather than production-proven profiles.
+
+A combined `--profile node,python,go,rust` crawl assigns each repository exactly one profile before
+lake persistence: a repository-policy override wins, then its primary language, then registry
+order. Later profile passes cannot overwrite that assignment. A missing preseeded test command is
+left for the bounded source-inspecting reviewer to derive; an ACCEPT still requires one exact,
+deterministic harness command.
+
+Lake qualification passes the queued evidence identity into the reviewer. The reviewer recomputes
+that identity from its own live issue, comment, timeline, policy, and cloned-base observations;
+drift is retryable and is never written under the queued key.
+Repository-approved custom invitation labels travel with the complete policy snapshot and digest
+through crawl, rank, qualify, and review, and are accepted only when the same live label and
+content-bound policy are observed.
 
 The standalone reviewer is available for a deliberately selected issue:
 
 ```sh
 node review-issue.mjs owner/repo#123
+```
+
+An ACCEPT can also emit a schema-v2 draft, which is finalized only after the mission ID, attempt
+sequence, repository-policy snapshot, exact oracle marker, and registry image are known:
+
+```sh
+node review-issue.mjs owner/repo#123 --profile node --emit-spec-draft \
+  --test-path test/regression.test.mjs \
+  --base-failure-contains 'exact failing test marker' > draft.json
+node spec-finalize.mjs draft.json --mission-id M-100 --attempt-sequence 1 \
+  --repo-policy-snapshot policy-snapshot.json --output specs/M-100.json
 ```
 
 An ACCEPT binds `review_id`, prompt version, review and expiry timestamps, evidence digest and base
@@ -64,32 +105,64 @@ shape, then run:
 node oss.mjs prepare M-017
 ```
 
-Prepare has one shared sixty-minute budget. It performs a deterministic live recheck, resolves the
+Prepare uses three local lanes by default; `--concurrency 1..12` is an explicit bounded override.
+For a batch, warm each distinct executor image and repository mirror once before preparation:
+
+```sh
+node oss.mjs warm --batch-manifest batch.json --warm-output runs/batch-warm-cache.json
+node oss.mjs prepare-batch --batch-manifest batch.json \
+  --warm-manifest runs/batch-warm-cache.json
+```
+
+Warm resolves immutable image digests, smoke-tests each profile, initializes per-repository mirrors,
+and reports disk readiness without deleting data. Prepare has one shared sixty-minute budget per
+mission. It performs a deterministic live recheck, resolves the
 executor image, clones the approved base, installs dependencies without credentials, runs one
 red/green author attempt, squashes any author commits into one host-owned DCO commit directly on the
 approved base, runs the differential oracle on read-only workspaces, and builds the exact public
-bundle. It returns one READY board or a terminal state such as `STALE`, `NOCHANGE`,
-`FAILED_BUDGET`, `FAILED_AUTHOR`, `FAILED_ORACLE`, or `FAILED_INFRA_TERMINAL`.
+bundle. The checkout passed to the canonical verifier is a standalone clone: it remains usable after
+the author workspace and its shared mirror disappear. Prepare returns one READY board or a terminal
+state such as `STALE`, `NOCHANGE`, `FAILED_BUDGET`, `FAILED_AUTHOR`, `FAILED_ORACLE`, or
+`FAILED_INFRA_TERMINAL`.
 
-The fast lane permits source files, new tests, and at most one prominently flagged modified existing
-test. It rejects renames, copies, type changes, snapshots, fixtures, dependencies, lockfiles, CI,
-generated output, binaries, symlinks and submodules. `oracle.setup_commands` is forbidden: the test
-must run on the committed tree after dependency installation.
+The default fast lane permits production source and new oracle-bound regression tests. A modified
+existing test requires explicit spec elevation and remains a recorded risk. A deterministic patch
+review runs before READY and rejects renames, copies, type changes, snapshots, fixtures,
+dependencies, lockfiles, CI, generated output, binaries, symlinks and submodules. It also rejects PR
+body overclaims about maintainer approval, production readiness, security, vulnerability absence,
+quality, correctness, predicted merge, or unscoped checks. The normalized PR claim text appears on
+the human review board. Shipping independently recomputes the same policy from the exact bound base,
+patch, spec, and PR-body bytes; the stored review digest is evidence rather than authority.
+`oracle.setup_commands` is forbidden: the test must run on the committed tree after dependency
+installation.
+
+`test_only_then_fix` is the default authoring mode and stops before a fix attempt if no exact
+base-red regression can be produced. `direct_fix` is available explicitly and must satisfy the same
+test-only base failure plus one fresh canonical pass of the declared commands.
 
 ## Approve and ship the reviewed bytes
 
-The READY board prints the exact approval command:
+Prepare writes one machine-readable JSON board and one Markdown board for the ordered READY set.
+The approval digest binds the ordered manifests, patch and PR-body hashes, patch-review risks, and
+board data. The READY board prints the exact approval command:
 
 ```sh
-node oss.mjs ship --approve sha256:<batch-manifest-digest> --approved-by internal-user:aeziz M-017
+node oss.mjs ship-batch --batch runs/boards/batch-<digest>.json \
+  --approve sha256:<batch-manifest-digest> --approved-by internal-user:aeziz
 ```
 
 `--approved-by` is a stable operator identifier, not a display name. For schema-v2 missions it is
 written as a factual approval record after preparation; approval therefore remains distinct from
 the signed preparation bundle while still appearing in the same canonical receipt.
 
-Ship has one shared sixty-minute budget per mission and initializes every approved journal before
-the first outbound action. Its forward-only order is:
+Shipping accepts 1–50 missions (with a configurable lower maximum), preserves repository policy
+caps, and initializes every approved journal plus one exact batch-approval record before the first
+outbound action. It publishes one prepared-ledger batch, waits for Pages readiness once, processes
+upstream PRs independently with bounded concurrency, and publishes one final-envelope batch. A
+post-freeze failure is recorded for that mission without silently skipping or duplicating an
+unrelated mission. Prepared-ledger destinations and approvals are all prevalidated before local
+mutation; valid missions are staged as one rollback-capable subset, while a conflicting mission is
+recorded independently. The per-mission forward-only order is:
 
 ```text
 APPROVED -> PRE_PUBLIC_RECHECK -> PUSHED -> PREPARED_RECEIPT_PUBLISHED -> ATTESTED
@@ -106,6 +179,9 @@ collision check runs immediately before PR creation. A pre-public stale result m
 changes; a post-public collision leaves the receipt in its prepared state and consumes the mission
 ID. One infrastructure retry is allowed inside the original deadline. A terminal journal may restart
 only after a newly approved changed manifest, with the prior attempt archived unchanged.
+The contributor metric is counted only when the journaled upstream PR URL belongs to the manifest's
+repository (case-insensitively), its number matches any recorded PR number, and all exact patch,
+receipt-publication, and receipt-link bindings hold; merge is not required.
 
 ## Reconcile upstream outcomes
 
@@ -126,23 +202,27 @@ request without changing immutable bundles.
 - Every subprocess shares its enclosing deadline, has bounded output, and is terminated as a process
   group with SIGTERM followed by SIGKILL after two seconds.
 - Content-bound approval covers the patch, commit/tree, issue and policy snapshots, oracle, public
-  bundle, PR text and outbound actions.
+  bundle, PR text, patch review, ordered batch board and outbound actions.
 - A schema-v2 bundle signs `bundle/economic.json`: task and attempt identity, observed stage effort,
   measured resource fields, verified work scope, and factual cost lines. The immutable top-level
   `approval.json` records the later human approval; mutable `publication.json` records upstream state.
 - Economic fields are evidence-bound facts only. Unobserved timing, usage, rates, and money remain
   `null` or explicitly unavailable; missing components prohibit a claimed total economic cost.
 - Receipt language remains direct and modest: contributor self-run, not maintainer verification.
+- A contributor receipt counts only after exact local patch/PR-body verification, public receipt
+  availability, and creation of the upstream PR with that receipt link; merge is not required.
 - No terminal state transitions back to review or preparation.
 
 Every mission receives the same fixed, bounded gate. When the gate's time or capacity budget is
 exhausted, return a partial batch or reject the candidate; never increase review depth to chase
 completeness.
 
-Run private tests with:
+Run the focused orchestrator and scaling checks with:
 
 ```sh
-node --test *.test.mjs
+node --test find-candidates.test.mjs review-issue.test.mjs oss.test.mjs ship.test.mjs \
+  candidate-lake.test.mjs spec-finalize.test.mjs review-patch.test.mjs
+node bin/verify-scaling-redesign.mjs
 ```
 
 The public verifier remains `/Users/aeziz-local/northset-oss/bin/run-mission.mjs`; prepare invokes it

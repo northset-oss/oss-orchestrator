@@ -1,4 +1,6 @@
-# OSS Mission Orchestrator — Target Architecture (lean rebuild)
+# Archived OSS Mission Orchestrator target architecture (lean rebuild)
+
+This design record is historical. `OPERATING_CONTRACT.md` is the active bounded workflow contract.
 
 Status: FROZEN design for cross-vendor review, then Codex (gpt-5.6-sol, high) implementation.
 Author: Claude (owner). Supersedes the scan/receipt-split `runner.mjs` and the manual M-008/M-009 ship.

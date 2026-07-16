@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import {chmod, mkdir, mkdtemp, readFile, writeFile} from 'node:fs/promises';
+import {chmod, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import {reviewPatch} from './review-patch.mjs';
+import {OSS_IDENTITY, canonical, directoryDigest, git, sha256} from './core.mjs';
 
 const digest = (char) => `sha256:${char.repeat(64)}`;
 const oid = (char) => char.repeat(40);
@@ -28,11 +30,11 @@ function subject(id, repo) {
     pr_body_sha256: digest('3'),
     planned_actions: [
       'push-reviewed-commit',
-      'publish-prepared-receipt-pr', 'wait-prepared-receipt-checks', 'merge-prepared-receipt-pr',
-      'verify-attestation', 'confirm-canonical-receipt-http-200', 'recheck-collision',
+      'publish-prepared-ledger-batch', 'wait-prepared-ledger-checks', 'merge-prepared-ledger-batch',
+      'verify-batch-attestations', 'wait-pages-readiness-once', 'confirm-individual-receipt-http-200', 'recheck-collision',
       'open-approved-upstream-pr', 'sync-guarded-pr-disclosure', 'record-pr-disclosure',
-      'rebuild-full-ledger', 'publish-final-envelope-pr', 'wait-final-envelope-checks',
-      'merge-final-envelope-pr',
+      'rebuild-full-ledger', 'publish-final-envelope-batch', 'wait-final-envelope-batch-checks',
+      'merge-final-envelope-batch',
     ],
   };
 }
@@ -283,7 +285,7 @@ test('ledger publication stages the whole generated site and never targets main 
   ]);
 });
 
-test('batch approval is checked once and enforces the three-distinct-repository cap', async () => {
+test('batch approval is ordered, configurable to fifty, and preserves repository policy caps', async () => {
   const ship = await import('./ship.mjs');
   assert.equal(typeof ship.validateApprovedBatch, 'function');
   const subjects = [subject('M-016', 'one/repo'), subject('M-017', 'two/repo')];
@@ -292,7 +294,197 @@ test('batch approval is checked once and enforces the three-distinct-repository 
   assert.throws(() => ship.validateApprovedBatch(subjects, digest('9')), /approval/i);
   assert.throws(() => ship.validateApprovedBatch([...subjects, subject('M-018', 'one/repo')], ship.batchManifestDigest([...subjects, subject('M-018', 'one/repo')])), /repository/i);
   const four = [...subjects, subject('M-018', 'three/repo'), subject('M-019', 'four/repo')];
-  assert.throws(() => ship.validateApprovedBatch(four, ship.batchManifestDigest(four)), /three/i);
+  assert.deepEqual(ship.validateApprovedBatch(four, ship.batchManifestDigest(four)), four);
+  assert.notEqual(ship.batchManifestDigest(four), ship.batchManifestDigest([...four].reverse()));
+  const fifty = Array.from({length: 50}, (_, index) => subject(`M-${String(index + 100).padStart(3, '0')}`, `owner${index}/repo`));
+  assert.equal(ship.validateApprovedBatch(fifty, ship.batchManifestDigest(fifty)).length, 50);
+  const fiftyOne = [...fifty, subject('M-999', 'overflow/repo')];
+  assert.throws(() => ship.validateApprovedBatch(fiftyOne, ship.batchManifestDigest(fiftyOne)), /one to 50|fifty/i);
+  assert.equal(ship.configuredShipBatchMaximum({OSS_SHIP_BATCH_MAX: '25'}), 25);
+  assert.throws(() => ship.configuredShipBatchMaximum({OSS_SHIP_BATCH_MAX: '51'}), /1 to 50/);
+});
+
+test('shipping revalidates patch-review self-digest, file classes, and risk binding', async () => {
+  const ship = await import('./ship.mjs');
+  const exactPatch = `diff --git a/src/parser.mjs b/src/parser.mjs
+index 1111111..2222222 100644
+--- a/src/parser.mjs
++++ b/src/parser.mjs
+@@ -1 +1 @@
+-return tokens.slice(0, -1);
++return tokens;
+diff --git a/test/parser.test.mjs b/test/parser.test.mjs
+new file mode 100644
+--- /dev/null
++++ b/test/parser.test.mjs
+@@ -0,0 +1 @@
++test('retains final token', () => {});
+`;
+  const classes = [{path: 'src/parser.mjs', class: 'source'}, {path: 'test/parser.test.mjs', class: 'added-test'}];
+  const body = 'Contributor self-run; not maintainer verification.';
+  const review = reviewPatch({
+    spec: {
+      mission_id: 'M-100', work_category: 'defect_fix', allow_modified_existing_tests: false,
+      oracle: {test_paths: ['test/parser.test.mjs'], base_failure_contains: 'retains final token'},
+      qualification: {source_evidence: ['src/parser.mjs:1 — return tokens.slice(0, -1);']},
+    },
+    classes, patch: exactPatch, prBody: body,
+  });
+  const manifest = {
+    patch_sha256: review.patch_sha256,
+    pr_body_sha256: review.pr_body_sha256,
+    changed_file_classes: review.changed_files,
+    risk_flags: review.risks,
+  };
+  assert.equal(ship.assertPatchReviewBinding(manifest, review), true);
+  assert.throws(() => ship.assertPatchReviewBinding({...manifest, risk_flags: [{code: 'hidden'}]}, review), /risks/i);
+  assert.throws(() => ship.assertPatchReviewBinding(manifest, {...review, review_digest: digest('9')}), /self-digest/i);
+});
+
+test('ship-time policy recomputes exact patch classes instead of trusting a forged stored review', async (t) => {
+  const ship = await import('./ship.mjs');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-fresh-ship-review-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const repo = path.join(root, 'repo');
+  await mkdir(path.join(repo, 'src'), {recursive: true});
+  await git(repo, 'init');
+  await git(repo, 'config', 'user.name', OSS_IDENTITY.name);
+  await git(repo, 'config', 'user.email', OSS_IDENTITY.email);
+  await writeFile(path.join(repo, 'src', 'parser.mjs'), 'export const parse = () => ["truncated"];\n');
+  await git(repo, 'add', '.');
+  await git(repo, 'commit', '-m', 'base');
+  const base = (await git(repo, 'rev-parse', 'HEAD')).stdout.trim();
+  await writeFile(path.join(repo, 'src', 'parser.mjs'), 'export const parse = () => ["retains final token"];\n');
+  await mkdir(path.join(repo, 'test'));
+  await writeFile(path.join(repo, 'test', 'parser.test.mjs'), "test('retains final token', () => {});\n");
+  await git(repo, 'add', '.');
+  await git(repo, 'commit', '-m', 'fix parser');
+  const commit = (await git(repo, 'rev-parse', 'HEAD')).stdout.trim();
+  const patch = (await git(repo, 'diff', '--binary', '--full-index', `${base}..${commit}`)).stdout;
+  const body = 'Contributor self-run; not maintainer verification.';
+  const valueSpec = {
+    mission_id: 'M-100', work_category: 'defect_fix', allow_modified_existing_tests: false,
+    base_commit: base,
+    oracle: {test_paths: ['test/parser.test.mjs'], base_failure_contains: 'retains final token'},
+    qualification: {source_evidence: ['src/parser.mjs:1 — truncated']},
+  };
+  const valid = reviewPatch({
+    spec: valueSpec, patch, prBody: body,
+    classes: [{path: 'src/parser.mjs', class: 'source'}, {path: 'test/parser.test.mjs', class: 'added-test'}],
+  });
+  const forgedSubject = {...valid,
+    changed_files: [{path: 'package-lock.json', class: 'lockfile'}],
+    production_files: ['src/parser.mjs'], blocking_reasons: [], ready: true,
+  };
+  const {review_digest: _ignored, ...forgedBytes} = forgedSubject;
+  const forged = {...forgedBytes, review_digest: sha256(Buffer.from(canonical(forgedBytes), 'utf8'))};
+  const manifest = {
+    base_commit: base, commit_oid: commit, patch_sha256: valid.patch_sha256,
+    pr_body_sha256: valid.pr_body_sha256, pr_claim_text: body,
+    changed_file_classes: forged.changed_files, risk_flags: forged.risks,
+  };
+  assert.equal(ship.assertPatchReviewBinding(manifest, forged), true);
+  await assert.rejects(() => ship.revalidateReadyPatchPolicy({
+    spec: valueSpec, manifest: {...manifest, pr_claim_text: 'Different human-board text.'},
+    storedReview: valid, patch, prBody: body, authorRepo: repo,
+  }), /batch board claim text/i);
+  await assert.rejects(() => ship.revalidateReadyPatchPolicy({
+    spec: valueSpec, manifest, storedReview: forged, patch, prBody: body, authorRepo: repo,
+  }), /fresh deterministic patch review|changed-file classes/i);
+});
+
+test('prepared-ledger staging isolates an invalid approval and rolls back a partial commit', async (t) => {
+  const ship = await import('./ship.mjs');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-transactional-stage-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  await mkdir(path.join(root, 'missions'), {recursive: true});
+
+  const makeSubject = async (id) => {
+    const publicMission = path.join(root, 'prepared', id);
+    await mkdir(path.join(publicMission, 'bundle'), {recursive: true});
+    await chmod(publicMission, 0o700);
+    await chmod(path.join(publicMission, 'bundle'), 0o700);
+    await writeFile(path.join(publicMission, 'bundle', 'mission.json'), `${id}\n`);
+    const manifest = {...economicSubject(id, `${id.toLowerCase()}/repo`),
+      public_mission_sha256: await directoryDigest(publicMission),
+    };
+    const spec = {schema_version: 2, mission_id: id, task_id: manifest.task_id, attempt_sequence: 1};
+    const journal = ship.newJournal(manifest, digest('a'), digest('b'), new Date('2026-07-15T12:00:00Z'),
+      {approvedBy: 'internal-user:aeziz'});
+    return {spec, manifest, journal, files: {publicMission}};
+  };
+
+  const valid = await makeSubject('M-120');
+  const invalid = await makeSubject('M-121');
+  const invalidDestination = path.join(root, 'missions', 'M-121');
+  await cp(invalid.files.publicMission, invalidDestination, {recursive: true});
+  await writeFile(path.join(invalidDestination, 'publication.json'), `${JSON.stringify(ship.preparedPublication(invalid.manifest), null, 2)}\n`);
+  await writeFile(path.join(invalidDestination, 'approval.json'), '{"approved_by":"forged"}\n');
+
+  const staged = await ship.stagePreparedLedgerBatch([valid, invalid], {root});
+  assert.deepEqual(staged.accepted.map((item) => item.manifest.mission_id), ['M-120']);
+  assert.deepEqual(staged.rejected.map((item) => item.subject.manifest.mission_id), ['M-121']);
+  await readFile(path.join(root, 'missions', 'M-120', 'approval.json'));
+  assert.equal((await readFile(path.join(invalidDestination, 'approval.json'), 'utf8')).trim(), '{"approved_by":"forged"}');
+  assert.equal((await readdir(path.join(root, 'missions'))).some((name) => name.startsWith('.northset-stage-')), false);
+
+  const first = await makeSubject('M-122');
+  const second = await makeSubject('M-123');
+  let renames = 0;
+  await assert.rejects(() => ship.stagePreparedLedgerBatch([first, second], {
+    root,
+    renameImpl: async (source, destination) => {
+      renames += 1;
+      if (renames === 2) throw new Error('representative staging commit failure');
+      await rename(source, destination);
+    },
+  }), /representative staging commit failure/);
+  await assert.rejects(() => readFile(path.join(root, 'missions', 'M-122', 'publication.json')), /ENOENT/);
+  await assert.rejects(() => readFile(path.join(root, 'missions', 'M-123', 'publication.json')), /ENOENT/);
+  assert.equal((await readdir(path.join(root, 'missions'))).some((name) => name.startsWith('.northset-stage-')), false);
+});
+
+test('frozen batch pipeline publishes shared gates once and isolates one mission failure', async () => {
+  const ship = await import('./ship.mjs');
+  const items = ['M-100', 'M-101', 'M-102'].map((id) => ({id, manifest: {mission_id: id}}));
+  const calls = [];
+  const result = await ship.runFrozenBatchPipeline(items, {
+    publishPreparedBatch: async (values) => { calls.push(`prepared:${values.length}`); return {id: 'prepared'}; },
+    waitForPagesOnce: async () => { calls.push('pages'); },
+    processMission: async (item) => {
+      calls.push(`mission:${item.id}`);
+      if (item.id === 'M-101') throw new Error('representative upstream failure');
+      return {mission_id: item.id, state: 'PR_OPENED'};
+    },
+    publishFinalBatch: async (_values, missionResults) => {
+      calls.push(`final:${missionResults.length}`);
+      return {id: 'final'};
+    },
+  }, {concurrency: 3});
+  assert.deepEqual(calls.filter((value) => value.startsWith('prepared')), ['prepared:3']);
+  assert.deepEqual(calls.filter((value) => value === 'pages'), ['pages']);
+  assert.deepEqual(calls.filter((value) => value.startsWith('final')), ['final:3']);
+  assert.equal(result.mission_results[1].state, 'FAILED_INFRA_TERMINAL');
+  assert.equal(result.mission_results[0].state, 'PR_OPENED');
+  assert.equal(result.mission_results[2].state, 'PR_OPENED');
+  assert.deepEqual(calls.filter((value) => value.startsWith('mission:')).sort(), ['mission:M-100', 'mission:M-101', 'mission:M-102']);
+});
+
+test('receipt metric requires exact local patch/body proof, public receipt, and upstream PR but not merge', async () => {
+  const ship = await import('./ship.mjs');
+  const manifest = subject('M-100', 'one/repo');
+  const journal = ship.newJournal(manifest, ship.batchManifestDigest([manifest]), digest('a'));
+  journal.ledger = {receipt_url: ship.canonicalReceiptUrl('M-100'), receipt_verified_at: '2026-07-15T12:00:00Z'};
+  journal.pr = {number: 7, url: 'https://github.com/one/repo/pull/7', head_oid: manifest.commit_oid, body_sha256: manifest.pr_body_sha256};
+  assert.equal(ship.contributorReceiptCounted(manifest, journal), true);
+  assert.equal(ship.contributorReceiptCounted({...manifest, repo: 'ONE/REPO'}, journal), true);
+  assert.equal(ship.contributorReceiptCounted(manifest, {...journal,
+    pr: {...journal.pr, url: 'https://github.com/unrelated/repository/pull/7'}}), false);
+  assert.equal(ship.contributorReceiptCounted(manifest, {...journal,
+    pr: {...journal.pr, url: 'https://github.com/one/repo/pull/8'}}), false);
+  assert.equal(ship.contributorReceiptCounted(manifest, {...journal,
+    pr: {...journal.pr, url: 'https://github.com/one/repo/issues/7'}}), false);
+  assert.equal(ship.contributorReceiptCounted(manifest, {...journal, pr: {...journal.pr, head_oid: oid('9')}}), false);
 });
 
 test('journal loading treats only ENOENT as empty and rejects corruption', async () => {

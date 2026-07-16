@@ -1,0 +1,157 @@
+{
+  "schema_version": 2,
+  "mission_id": "M-029",
+  "task_id": "TASK-OSS-974F612F87373753",
+  "attempt_sequence": 8,
+  "work_category": "defect_fix",
+  "candidate": "goptics/vizb#204",
+  "target_repo": "https://github.com/goptics/vizb",
+  "issue_url": "https://github.com/goptics/vizb/issues/204",
+  "base_branch": "main",
+  "base_commit": "487ab430e17b0aa2868b33b9667c1676e6efd3be",
+  "problem_statement": "Multi-series tooltip value legends include zero-valued series, but renderDonutSvg builds its side legend from positive slices only, so those zero-valued series disappear from the donut legend; the fix must preserve the existing omission of null or undefined series.",
+  "acceptance_criteria": [
+    "Continue drawing donut arcs and calculating percentage totals only from slices whose value is greater than zero.",
+    "Include every passed zero-valued series in the donut side legend and display its share as n/a rather than 0.0%.",
+    "For slices A=10, B=0, and C=5, list A, B, and C in the side legend while drawing arcs only for A and C.",
+    "In createTooltipConfig, keep null or undefined series absent from both the value legend and donut legend while still showing a genuine numeric zero as n/a.",
+    "Preserve the existing empty result when fewer than two positive slices are present."
+  ],
+  "constraints": [
+    "Do not add dependencies, change public APIs, edit CI, update documentation, lockfiles, generated output, snapshots, or version numbers.",
+    "Keep the committed change limited to ui/src/composables/charts/shared/chartConfig.ts and ui/src/composables/charts/shared/chartConfig.test.ts.",
+    "Do not draw zero-valued or negative arcs, do not display zero shares as 0.0%, and do not change chart modules outside shared chartConfig.ts.",
+    "Do not convert null, undefined, or other missing values into zero-valued n/a legend rows.",
+    "Negative-series side-legend behavior is outside this issue's required zero-value regression."
+  ],
+  "implementation_hints": [
+    "Keep the positive-slice list as the source for the early-return condition, total, and SVG paths, while deriving side-legend rows from the caller-provided slices and formatting zero-valued shares as n/a.",
+    "In createTooltipConfig, derive donut slices from the already-filtered present parameters rather than the raw parameter list.",
+    "Name the helper regression exactly `includes zero-valued slices in the legend without drawing their arcs` so the differential oracle can bind the expected base failure.",
+    "Add a formatter-level regression with positive, zero, and null values that proves the numeric zero appears as n/a while the null series stays absent."
+  ],
+  "process_requirements": [
+    "Use Node 22.x and pnpm.",
+    "Add the focused zero-slice and formatter missing-value regressions to the existing chartConfig test file and follow red/green TDD.",
+    "Run the focused regression, UI typecheck, formatting check, full UI tests, UI build, Go tests, and Go lint before submission.",
+    "After the UI change, build the embedded UI before Go commands and do not commit pkg/template/vizb-ui.gen.go.",
+    "Use a Conventional Commit message and keep the pull request focused, describing what changed and why and linking issue #204."
+  ],
+  "qualification": {
+    "finder_run_id": "60cf6309-291a-4982-9f7a-35086087d83d",
+    "candidate_rank": 1,
+    "finder_elapsed_ms": 1087062,
+    "review_duration_ms": 103672,
+    "review_id": "sha256:e33c58db075f283d0cbc7bcfa79be3e52df3ab82d5546087143ff5743e30e891",
+    "review_prompt_version": 2,
+    "reviewed_at": "2026-07-14T22:52:38.651Z",
+    "qualification_expires_at": "2026-07-15T00:52:38.651Z",
+    "evidence_sha256": "sha256:2b632d3813ad982337ea00fc3676b2b66ad6cf525a7520e8833744a4cd3198f9",
+    "issue_updated_at": "2026-07-12T18:21:04Z",
+    "requested_model": "gpt-5.6-sol",
+    "actual_model": null,
+    "reasoning_effort": "xhigh",
+    "service_tier": "fast",
+    "model_requests": null,
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_tokens": null,
+    "invitation_evidence": {
+      "type": "label",
+      "url": "https://github.com/goptics/vizb/issues/204",
+      "observed_at": "2026-07-14T22:51:00.452Z"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "renderDonutSvg derives both arcs and side-legend rows from a positive-only slice list, so zero-valued series shown elsewhere in the tooltip disappear from the donut legend.",
+      "expected_behavior": [
+        "Continue drawing arcs and calculating percentages using only positive slices.",
+        "Include passed zero-valued series in the donut side legend with n/a, not 0.0%.",
+        "For A=10, B=0, C=5, show all three legend rows while producing arcs only for A and C.",
+        "Keep null or undefined series absent from both createTooltipConfig legend surfaces."
+      ],
+      "non_goals": [
+        "Do not allocate ring angle to zero or negative slices.",
+        "Do not alter positive-slice percentage calculations or ring geometry.",
+        "Do not expand the public API or change unrelated tooltip behavior.",
+        "Do not reinterpret missing values as numeric zeroes."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/goptics/vizb/issues/204",
+          "author_association": "MEMBER",
+          "summary": "The maintainer-authored issue specifies the defect, observable result, fix boundary, and exact regression fixture."
+        }
+      ]
+    },
+    "related_prs": []
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "ui/src/composables/charts/shared/chartConfig.test.ts"
+    ],
+    "command": "PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH pnpm --dir ui exec vitest run src/composables/charts/shared/chartConfig.test.ts",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "includes zero-valued slices in the legend without drawing their arcs",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix(ui): include zero values in donut legends",
+    "summary": "Keep donut arcs and percentage totals restricted to positive values while including genuine zero-valued series in the side legend as n/a and keeping missing series omitted, with focused regression tests."
+  },
+  "executor": {
+    "profile": "node",
+    "image": "node:22-bookworm",
+    "reasoning_effort": "xhigh",
+    "install_commands": [
+      "mkdir -p /workspace/.northset/bootstrap-home/bin /workspace/.northset/bootstrap-home/go",
+      "cp /usr/local/bin/node /workspace/.northset/bootstrap-home/bin/node",
+      "curl -fsSL https://go.dev/dl/go1.26.5.linux-arm64.tar.gz | tar -xz --strip-components=1 -C /workspace/.northset/bootstrap-home/go",
+      "npm install --global --prefix /workspace/.northset/bootstrap-home --no-audit --no-fund pnpm@10.33.2",
+      "mkdir -p /workspace/.northset/bootstrap-home/linter-go-tmp",
+      "PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH GOBIN=/workspace/.northset/bootstrap-home/bin GOMODCACHE=/workspace/.northset/bootstrap-home/linter-go-mod GOCACHE=/workspace/.northset/bootstrap-home/linter-go-build GOTMPDIR=/workspace/.northset/bootstrap-home/linter-go-tmp /workspace/.northset/bootstrap-home/go/bin/go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.7.2",
+      "test -x /workspace/.northset/bootstrap-home/bin/golangci-lint",
+      "rm -r /workspace/.northset/bootstrap-home/linter-go-mod /workspace/.northset/bootstrap-home/linter-go-build /workspace/.northset/bootstrap-home/linter-go-tmp",
+      "PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH GOMODCACHE=/workspace/.northset/bootstrap-home/project-go-mod go mod download",
+      "PATH=/workspace/.northset/bootstrap-home/bin:$PATH pnpm --dir ui install --frozen-lockfile"
+    ],
+    "commands": [
+      "PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH pnpm --dir ui exec vitest run src/composables/charts/shared/chartConfig.test.ts",
+      "PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH pnpm --dir ui typecheck",
+      "PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH pnpm --dir ui format:check",
+      "PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH pnpm --dir ui test",
+      "EMBED_UI=True PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH pnpm --dir ui build",
+      "PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH GOMODCACHE=/workspace/.northset/bootstrap-home/project-go-mod go test -count=1 ./...",
+      "PATH=/workspace/.northset/bootstrap-home/bin:/workspace/.northset/bootstrap-home/go/bin:$PATH GOMODCACHE=/workspace/.northset/bootstrap-home/project-go-mod golangci-lint run"
+    ],
+    "limits": {
+      "cpus": 6,
+      "memory_mb": 6144,
+      "pids": 512,
+      "wall_clock_seconds_per_command": 2700,
+      "output_bytes_per_stream": 2000000
+    }
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "url": "https://github.com/goptics/vizb/blob/487ab430e17b0aa2868b33b9667c1676e6efd3be/CONTRIBUTING.md",
+      "checked_at": "2026-07-14T20:49:06Z",
+      "ai_policy_summary": "Vizb explicitly accommodates Codex and other agents. Contributors must use a fork and focused branch, add tests where appropriate, run task test and task lint, build the embedded UI before Go commands after UI changes without committing the generated embed, use Conventional Commits, and open a focused pull request describing what changed and why with the related issue linked."
+    },
+    "checks_not_run": [
+      "Docs production build",
+      "Manual browser reproduction across every chart caller",
+      "Local GitHub Actions emulation with act"
+    ],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "The focused regression verifies the shared renderDonutSvg output but does not manually exercise every chart caller in a browser.",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

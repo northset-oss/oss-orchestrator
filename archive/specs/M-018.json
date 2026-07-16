@@ -1,0 +1,120 @@
+{
+  "_archive_note": "M-018 proved the differential oracle but stopped in FAILED_ORACLE when the public receipt used combined baseline limitation wording. The spec guard and author PR-template boundary were repaired under test; the forward-only retry uses M-019.",
+  "schema_version": 1,
+  "mission_id": "M-018",
+  "candidate": "glideapps/quicktype#2423",
+  "target_repo": "https://github.com/glideapps/quicktype",
+  "issue_url": "https://github.com/glideapps/quicktype/issues/2423",
+  "base_branch": "master",
+  "base_commit": "b11081470089ca0345117951033936405d874193",
+  "problem_statement": "Default Swift generation emits JSONNull.hashValue but omits hash(into:) unless swift5Support is enabled, causing a Swift 5.9 Hashable deprecation warning.",
+  "acceptance_criteria": [
+    "Default Swift output for the maintainer-provided nullable-any schema includes hash(into:) without requiring --swift-5-support.",
+    "Generated JSONNull code no longer produces the reported Swift 5.9 Hashable protocol-conformance deprecation warning.",
+    "A focused Node/Vitest generated-output regression fails on the pinned base and passes after the renderer fix."
+  ],
+  "constraints": [
+    "Do not add dependencies, change public APIs or options, edit CI, update generated fixtures, documentation, lockfiles, or version numbers.",
+    "Keep the production change limited to packages/quicktype-core/src/language/Swift/SwiftRenderer.ts and add only test/unit/swift-json-null-hashable.test.ts.",
+    "Do not change the Objective-C-support JSONNull branch or unrelated Swift rendering behavior.",
+    "Use the checked-in TypeScript source in the focused test so the oracle does not depend on generated build output or a Swift toolchain."
+  ],
+  "implementation_hints": [
+    "Mirror the direct InputData, JSONSchemaInput, and quicktype generated-output style in test/unit/java-acronym-names.test.ts, but import from ../../packages/quicktype-core/src/index.js.",
+    "Use the maintainer's minimal nullable-any schema and name the regression exactly: emits hash(into:) for JSONNull by default.",
+    "The accepted contract permits retaining hashValue or removing it; make the smallest change that emits hash(into:) by default and preserves the Objective-C branch."
+  ],
+  "process_requirements": [
+    "Link issue #2423 and describe the previous behavior, new behavior, and exact focused test in the repository pull-request template.",
+    "Keep the contribution focused and avoid unrelated fixture regeneration."
+  ],
+  "qualification": {
+    "review_id": "sha256:00989a1e13084feb34be4f541d1c55be87d30372cf56c191419589c8fa95d07c",
+    "review_prompt_version": 2,
+    "reviewed_at": "2026-07-13T19:57:14.983Z",
+    "qualification_expires_at": "2026-07-13T21:57:14.983Z",
+    "evidence_sha256": "sha256:78acc4ab690b7b0c7650f466d7d7fc33082c5cc81d3ea5f5257f8c195699074e",
+    "issue_updated_at": "2026-07-06T20:09:11Z",
+    "invitation_evidence": {
+      "type": "label",
+      "url": "https://github.com/glideapps/quicktype/issues/2423",
+      "observed_at": "2026-07-13T19:56:01Z"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "Default Swift generation emits JSONNull.hashValue but omits hash(into:) unless swift5Support is enabled, causing a Swift 5.9 Hashable deprecation warning.",
+      "expected_behavior": [
+        "Default Swift output for the maintainer-provided nullable-any schema includes hash(into:) without requiring --swift-5-support.",
+        "Generated code no longer produces the reported Swift 5.9 Hashable deprecation warning.",
+        "A focused generated-output regression is red on the checked-out production behavior and green after the smallest renderer fix."
+      ],
+      "non_goals": [
+        "No new option, flag, dependency, or public API.",
+        "Removal of hashValue is not mandatory if emitting both methods eliminates the warning.",
+        "No changes to unrelated Swift rendering or Objective-C-support behavior."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/glideapps/quicktype/issues/2423#issuecomment-4897167948",
+          "author_association": "MEMBER",
+          "summary": "The maintainer confirms reproduction on current master, identifies the exact renderer branch, supplies a minimal schema, and states hash(into:) may be emitted unconditionally, either with or without hashValue."
+        }
+      ]
+    },
+    "related_prs": []
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "test/unit/swift-json-null-hashable.test.ts"
+    ],
+    "command": "npm run test:unit -- test/unit/swift-json-null-hashable.test.ts",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "emits hash(into:) for JSONNull by default",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix(swift): emit JSONNull hash(into:) by default",
+    "summary": "Emit JSONNull.hash(into:) in default Swift output and add a focused generated-output regression for the Swift 5.9 deprecation warning.",
+    "body_template": "## Description\n\n{{SUMMARY}}\n\n## Related Issue\n\nFixes #{{ISSUE_NUMBER}}\n\n## Motivation and Context\n\nDefault Swift output emitted only the deprecated `hashValue` protocol implementation unless `--swift-5-support` was enabled.\n\n## Previous Behaviour / Output\n\nDefault JSONNull output omitted `hash(into:)`, which produced the reported Swift 5.9 Hashable deprecation warning.\n\n## New Behaviour / Output\n\nDefault JSONNull output includes `hash(into:)` without requiring a renderer option. The Objective-C-support branch is unchanged.\n\n## How Has This Been Tested?\n\n{{CHECKS}}\n\n## Screenshots (if appropriate)\n\nNot applicable.\n\n{{RECEIPT_FOOTER}}"
+  },
+  "executor": {
+    "profile": "node",
+    "image": "node:24.16.0-bookworm",
+    "reasoning_effort": "xhigh",
+    "install_commands": [
+      "npm ci"
+    ],
+    "commands": [
+      "npm run test:unit -- test/unit/swift-json-null-hashable.test.ts"
+    ],
+    "limits": {
+      "cpus": 2,
+      "memory_mb": 4096,
+      "pids": 512,
+      "wall_clock_seconds_per_command": 600,
+      "output_bytes_per_stream": 2000000
+    }
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "url": "https://github.com/glideapps/quicktype/blob/b11081470089ca0345117951033936405d874193/AGENTS.md",
+      "checked_at": "2026-07-13T19:57:14.983Z",
+      "ai_policy_summary": "The repository documents operation by coding agents, requires npm ci, and defines Vitest as the unit-test harness. No CLA, DCO, AI-disclosure requirement, or AI-workflow prohibition was found in the qualified repository evidence. Northset still discloses substantive AI assistance in the pull request."
+    },
+    "checks_not_run": [
+      "Full npm run build",
+      "Full npm run test:unit suite",
+      "Cross-language fixture suite",
+      "Full repository lint",
+      "Swift compiler validation"
+    ],
+    "limitations": [
+      "The focused test inspects generated Swift output but does not invoke a Swift compiler.",
+      "Does not prove code quality or security.",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

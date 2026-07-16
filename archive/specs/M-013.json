@@ -1,4 +1,5 @@
 {
+  "_archive_note": "Historical pre-v2 input; not runnable by the bounded workflow.",
   "mission_id": "M-013",
   "candidate": "nodejs/doc-kit#891",
   "target_repo": "https://github.com/nodejs/doc-kit",

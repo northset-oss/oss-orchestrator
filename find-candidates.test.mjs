@@ -5,7 +5,7 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import test from 'node:test';
 
-import {taskIdForCandidate} from './core.mjs';
+import {canonical as coreCanonical, sha256 as coreSha256, taskIdForCandidate} from './core.mjs';
 
 import {
   Deadline,
@@ -13,6 +13,9 @@ import {
   buildPreflightQuery,
   buildReviewQueue,
   buildSearchPlan,
+  buildTimeWindows,
+  deterministicSemanticReject,
+  discoverRepositoryInvitationLabels,
   extractIssueKeys,
   filterDiscovered,
   isInvitationLabel,
@@ -24,14 +27,20 @@ import {
   normalizeLabel,
   normalizePreflight,
   normalizeRestSearchIssue,
+  numericReviewerInvocationArgs,
   restSearchQuery,
   parseArgs,
+  qualifyQueueRecords,
+  repositoryCaps,
+  reviewerInvocationArgs,
   runBounded,
   scorePreflight,
   validateReview,
 } from './find-candidates.mjs';
+import {candidateEvidenceKey, openCandidateLake} from './candidate-lake.mjs';
 
 const oid = (char) => char.repeat(40);
+const digest = (char) => `sha256:${char.repeat(64)}`;
 
 function config(overrides = {}) {
   return {
@@ -144,6 +153,49 @@ test('builds a deterministic, bounded invitation-label search plan', () => {
   assert.deepEqual(targeted[0].repositories, ['one/repo', 'two/repo']);
 });
 
+test('time-window shards are non-overlapping and become auditable search qualifiers', () => {
+  const windows = buildTimeWindows({field: 'created', windowDays: 30, shards: 3, now: new Date('2026-07-15T12:00:00Z')});
+  assert.deepEqual(windows.map((item) => item.qualifier), [
+    'created:2026-07-06..2026-07-15',
+    'created:2026-06-26..2026-07-05',
+    'created:2026-06-16..2026-06-25',
+  ]);
+  const plan = buildSearchPlan(config({labels: ['good first issue'], repositories: ['one/repo'],
+    createdWindowDays: 30, searchShards: 3, searchNow: new Date('2026-07-15T12:00:00Z')}));
+  assert.equal(plan.length, 3);
+  assert.match(restSearchQuery(plan[1], config()), /created:2026-06-26\.\.2026-07-05/);
+});
+
+test('documented three-shard Node crawl stays within the bounded default query plan', () => {
+  const plan = buildSearchPlan(config({
+    requested: 500,
+    createdWindowDays: 90,
+    searchShards: 3,
+    searchNow: new Date('2026-07-15T12:00:00Z'),
+  }));
+  assert.equal(plan.length, 18);
+  assert.ok(plan.length <= 20);
+  assert.ok(plan.every((query) => query.window?.field === 'created'));
+  assert.deepEqual([...new Set(plan.map((query) => query.window.qualifier))], [
+    'created:2026-06-16..2026-07-15',
+    'created:2026-05-17..2026-06-15',
+    'created:2026-04-17..2026-05-16',
+  ]);
+});
+
+test('repository label discovery is page-bounded and admits nonstandard invitations only by policy', async () => {
+  const pages = [Array.from({length: 100}, (_, index) => index === 0 ? 'up for grabs' : `label-${index}`), ['beginner friendly']];
+  const result = await discoverRepositoryInvitationLabels('owner/repo', ({page}) => pages[page - 1], {
+    maxPages: 2,
+    policy: {repositories: {'Owner/Repo': {invitation_labels: ['up for grabs']}}},
+  });
+  assert.deepEqual(result.labels, ['up for grabs']);
+  assert.equal(result.truncated, false);
+  assert.deepEqual(repositoryCaps({}, 'owner/repo'), {max_open_prs: 1, daily_pr_cap: 1});
+  assert.deepEqual(repositoryCaps({repositories: {'Owner/Repo': {max_open_prs: 3, daily_pr_cap: 4}}}, 'owner/repo'),
+    {max_open_prs: 3, daily_pr_cap: 4});
+});
+
 test('include-only mode uses the supplied corpus without wide GitHub discovery searches', () => {
   assert.deepEqual(buildSearchPlan(config({includeOnly: true})), []);
 });
@@ -226,6 +278,133 @@ test('preflight scoring favors a bounded active Node issue and hard gates collis
   const blocked = structuredClone(value);
   blocked.issue.labels.push('security');
   assert.match(mechanicalDecision(blocked, config()).reasons.join(' '), /excluded label/);
+});
+
+test('comment count is a risk signal while claims and unresolved design remain blocking', () => {
+  const discussed = preflight();
+  discussed.issue.comments_total = 500;
+  const decision = mechanicalDecision(discussed, config({maxComments: 30}));
+  assert.equal(decision.eligible, true);
+  assert.match(decision.warnings.join(' '), /discussion count/);
+  discussed.issue.recent_comments = [{author: 'maintainer', author_association: 'MEMBER',
+    created_at: new Date().toISOString(), body: 'The design is not settled; hold off.'}];
+  assert.match(mechanicalDecision(discussed, config({maxComments: 30})).reasons.join(' '), /unresolved design/);
+});
+
+test('deterministic semantic reject protects the expensive reviewer without replacing final qualification', () => {
+  const value = preflight();
+  assert.equal(deterministicSemanticReject(value, {known_test_command: true}), null);
+  assert.equal(deterministicSemanticReject(value, {known_test_command: false}), null);
+  assert.equal(deterministicSemanticReject({...value, issue: {...value.issue, title: 'Security redesign proposal'}},
+    {known_test_command: true}), 'excluded semantic class');
+  const custom = structuredClone(value);
+  custom.issue.labels = ['starter-ready'];
+  assert.equal(deterministicSemanticReject(custom, {repo_policy: {repositories: {
+    'owner/repo': {invitation_label_map: {'starter-ready': true}},
+  }}}), null);
+});
+
+test('combined crawl assigns one deterministic profile without later-profile overwrite', async () => {
+  const finder = await import('./find-candidates.mjs');
+  assert.equal(typeof finder.assignCrawlProfile, 'function');
+  assert.equal(finder.assignCrawlProfile({primary_language: 'TypeScript'}, ['rust', 'node', 'python']), 'node');
+  assert.equal(finder.assignCrawlProfile({primary_language: 'Python'}, ['rust', 'node', 'python']), 'python');
+  assert.equal(finder.assignCrawlProfile({primary_language: null}, ['rust', 'node']), 'node');
+  assert.equal(finder.assignCrawlProfile({primary_language: 'TypeScript'}, ['rust']), 'rust');
+  const facts = {candidate: 'owner/repo#12', base_commit: oid('a'), issue_updated_at: '2026-07-15T12:00:00Z'};
+  assert.notEqual(candidateEvidenceKey({...facts, profile: 'node'}),
+    candidateEvidenceKey({...facts, profile: 'rust'}));
+});
+
+test('qualifier carries exact custom-label policy bytes into the bound reviewer invocation', () => {
+  const policy = {defaults: {}, repositories: {'Owner/Repo': {
+    invitation_label_map: {'starter-ready': true},
+  }}};
+  const repoPolicySha256 = coreSha256(Buffer.from(coreCanonical(policy)));
+  const record = {
+    candidate: 'Owner/Repo#12', evidence_key: digest('8'),
+    preflight: {repo_policy_sha256: repoPolicySha256},
+    repository_profile: {repo_policy: policy},
+  };
+  const args = reviewerInvocationArgs(record, {profile: 'node', reviewScript: '/review-issue.mjs'});
+  const policyIndex = args.indexOf('--repo-policy-json');
+  assert.ok(policyIndex > 0);
+  assert.deepEqual(JSON.parse(args[policyIndex + 1]), policy);
+  assert.throws(() => reviewerInvocationArgs({...record,
+    repository_profile: {repo_policy: {...policy, repositories: {}}}},
+  {profile: 'node', reviewScript: '/review-issue.mjs'}), /policy bytes/i);
+});
+
+test('legacy numeric review carries the explicitly requested executor profile', () => {
+  for (const profile of ['node', 'python', 'go', 'rust']) {
+    assert.deepEqual(numericReviewerInvocationArgs('Owner/Repo#12', {
+      profile, reviewScript: '/review-issue.mjs',
+    }), ['/review-issue.mjs', 'Owner/Repo#12', '--profile', profile]);
+  }
+});
+
+test('qualify reuses only an unexpired exact-evidence review and refuses a stale queue', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'finder-qualify-cache-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const lake = await openCandidateLake(path.join(root, 'candidate_lake.sqlite'));
+  const value = preflight();
+  const evidenceKey = candidateEvidenceKey({
+    candidate: value.candidate, base_commit: value.repository.default_head,
+    issue_updated_at: value.issue.updated_at, labels: value.issue.labels, assignees: [],
+    comments_tail_sha256: digest('1'), timeline_prs_sha256: digest('2'), repo_policy_sha256: digest('3'),
+  });
+  await lake.upsertIssue({...value, evidence_key: evidenceKey, profile: 'node', raw: value});
+  const queue = [{candidate: value.candidate, evidence_key: evidenceKey, preflight: value,
+    repository_profile: {known_test_command: true}}];
+  let calls = 0;
+  const reviewRunner = async () => {
+    calls += 1;
+    return {
+      verdict: 'ACCEPT', candidate: value.candidate, issue_url: value.issue.url, tier: 'A', executor_profile: 'node',
+      base_commit: value.repository.default_head, test_command: 'node --test test/parser.test.mjs',
+      candidate_evidence_key: evidenceKey,
+      source_evidence: ['src/parser.mjs:1 — export function parse() {}'],
+      invitation_evidence: {type: 'label'}, acceptance_contract: {problem: 'Parser regression.'},
+      checks: {open_unassigned: 'PASS'}, task_id: taskIdForCandidate(value.candidate),
+      requested_model: 'gpt-5.6-sol', reasoning_effort: 'xhigh', service_tier: 'fast',
+      reviewed_at: '2026-07-15T12:00:00Z', qualification_expires_at: '2026-07-15T14:00:00Z',
+    };
+  };
+  const options = {lake, profile: 'node', reviewRunner, now: () => new Date('2026-07-15T13:00:00Z')};
+  assert.equal((await qualifyQueueRecords(queue, options))[0].state, 'ACCEPTED');
+  assert.equal((await qualifyQueueRecords(queue, options))[0].state, 'CACHED_ACCEPT');
+  assert.equal(calls, 1);
+  await lake.upsertIssue({...value, evidence_key: digest('9'), issue: {...value.issue, updated_at: '2026-07-15T13:01:00Z'}, raw: value});
+  assert.equal((await qualifyQueueRecords(queue, options))[0].state, 'STALE_EVIDENCE');
+  assert.equal(calls, 1);
+});
+
+test('qualify never stores a reviewer decision under stale queued evidence bytes', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'finder-qualify-drift-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const lake = await openCandidateLake(path.join(root, 'candidate_lake.sqlite'));
+  const value = preflight();
+  const evidenceKey = candidateEvidenceKey({
+    candidate: value.candidate, base_commit: value.repository.default_head,
+    issue_updated_at: value.issue.updated_at, labels: value.issue.labels, assignees: [],
+    comments_tail_sha256: digest('1'), timeline_prs_sha256: digest('2'), repo_policy_sha256: digest('3'),
+  });
+  await lake.upsertIssue({...value, evidence_key: evidenceKey, profile: 'node', raw: value});
+  const queue = [{candidate: value.candidate, evidence_key: evidenceKey, preflight: value,
+    repository_profile: {known_test_command: true}}];
+  const reviewRunner = async () => ({
+    verdict: 'ACCEPT', candidate: value.candidate, issue_url: value.issue.url, tier: 'A', executor_profile: 'node',
+    base_commit: value.repository.default_head, candidate_evidence_key: digest('9'),
+    test_command: 'node --test test/parser.test.mjs',
+    source_evidence: ['src/parser.mjs:1 — export function parse() {}'],
+    invitation_evidence: {type: 'label'}, acceptance_contract: {problem: 'Parser regression.'},
+    checks: {open_unassigned: 'PASS'}, task_id: taskIdForCandidate(value.candidate),
+    requested_model: 'gpt-5.6-sol', reasoning_effort: 'xhigh', service_tier: 'fast',
+  });
+  const [result] = await qualifyQueueRecords(queue, {lake, profile: 'node', reviewRunner});
+  assert.equal(result.state, 'REVIEW_TOOL_ERROR');
+  assert.match(result.error, /evidence/i);
+  assert.equal(await lake.getReview(value.candidate, evidenceKey), null);
 });
 
 test('injects exact include keys and exempts only those keys from repository concentration', () => {

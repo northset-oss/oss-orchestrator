@@ -1,22 +1,32 @@
 import assert from 'node:assert/strict';
-import {access, mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
   authorDockerArgs,
   attemptLineageForSpec,
+  buildBatchBoard,
+  buildWarmPlan,
   buildEconomicInput,
   assertOracleChangedPaths,
   canonicalCommitArgs,
   changedEntries,
   checkDockerArgs,
   classifyChangedFiles,
+  cloneStandaloneRepository,
+  copyDependencySnapshot,
   copyNodeDependencies,
+  copyProfileDependencies,
+  dependencyCacheKey,
   dependencyBootstrapDockerArgs,
   PREPARE_BUDGET_MS,
+  parseOssArgs,
   removeRunWorkspace,
   runAuthorContainer,
+  snapshotProfileDependencies,
+  verifyTestOnlyAuthorResult,
+  warmBatch,
 } from './oss.mjs';
 import {
   OSS_IDENTITY,
@@ -25,6 +35,8 @@ import {
   assertPatchCommitBinding,
   directoryDigest,
   authorEffort,
+  batchApprovalDigest,
+  canonical,
   git,
   manifestDigest,
   possibleOverlappingPrs,
@@ -34,6 +46,7 @@ import {
   timelineApiArgs,
   timelineCrossReferences,
   taskIdForCandidate,
+  sha256,
   validateSpec,
   validateSpecs,
 } from './core.mjs';
@@ -76,6 +89,7 @@ function spec(overrides = {}) {
         }],
       },
       related_prs: [],
+      source_evidence: ['src/parser.mjs:7 — return boundedValue;'],
     },
     oracle: {
       kind: 'regression_test', test_paths: ['test/parser.test.mjs'],
@@ -92,6 +106,182 @@ function spec(overrides = {}) {
 
 test('prepare has one shared sixty-minute budget', () => {
   assert.equal(PREPARE_BUDGET_MS, 60 * 60 * 1000);
+  assert.equal(parseOssArgs(['prepare', 'M-010']).concurrency, 3);
+  assert.throws(() => parseOssArgs(['prepare', '--concurrency', '13', 'M-010']), /1 to 12/);
+});
+
+test('warm planning deduplicates executor images and retains immutable digests without deleting data', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'warm-planning-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const one = spec();
+  const qualification = structuredClone(one.qualification);
+  qualification.invitation_evidence.url = 'https://github.com/other/repo/issues/2';
+  qualification.acceptance_contract.design_evidence[0].url = 'https://github.com/other/repo/issues/2#issuecomment-1';
+  const two = spec({mission_id: 'M-011', candidate: 'other/repo#2', target_repo: 'https://github.com/other/repo',
+    issue_url: 'https://github.com/other/repo/issues/2', qualification});
+  const plan = buildWarmPlan([one, two]);
+  assert.equal(plan.images.length, 1);
+  assert.equal(plan.repositories.length, 2);
+  const calls = [];
+  const imageDigest = `node@${digest('a')}`;
+  const runImpl = async (command, args) => {
+    calls.push([command, ...args]);
+    if (args[0] === 'pull' || args[0] === 'run') return {code: 0, stdout: '', stderr: ''};
+    if (args[0] === 'image' && args[1] === 'inspect') return {code: 0, stdout: `${JSON.stringify([imageDigest])}\n`, stderr: ''};
+    throw new Error(`unexpected command ${command} ${args.join(' ')}`);
+  };
+  const warmed = await warmBatch([one, two], {
+    runImpl,
+    mirrorRoot: path.join(root, 'mirrors'),
+    mirrorInitializer: async (value) => `/mirrors/${value.mission_id}.git`,
+    statfsImpl: async () => ({bavail: 100, bsize: 100}),
+    minimumFreeBytes: 1,
+  });
+  assert.equal(calls.filter((call) => call[1] === 'pull').length, 1);
+  assert.equal(calls.filter((call) => call[1] === 'run').length, 1);
+  assert.equal(warmed.images[0].digest, imageDigest);
+  assert.equal(warmed.disk.data_deleted, false);
+});
+
+test('writable dependency caches are isolated by repository, base, and mission identity', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'dependency-cache-key-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const first = spec();
+  const same = structuredClone(first);
+  const otherMission = spec({mission_id: 'M-011', candidate: 'other/repo#7',
+    target_repo: 'https://github.com/other/repo', issue_url: 'https://github.com/other/repo/issues/7'});
+  const otherBase = spec({base_commit: oid('b')});
+  const image = 'node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  assert.equal(await dependencyCacheKey(first, root, image), await dependencyCacheKey(same, root, image));
+  assert.notEqual(await dependencyCacheKey(first, root, image), await dependencyCacheKey(otherMission, root, image));
+  assert.notEqual(await dependencyCacheKey(first, root, image), await dependencyCacheKey(otherBase, root, image));
+});
+
+test('profile cache copying excludes host virtual environments', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'profile-cache-copy-'));
+  const fromWorkspace = path.join(root, 'from');
+  const toWorkspace = path.join(root, 'to');
+  const from = path.join(fromWorkspace, 'repo');
+  const to = path.join(toWorkspace, 'repo');
+  await mkdir(path.join(from, '.venv'), {recursive: true});
+  await mkdir(path.join(from, '__pypackages__'), {recursive: true});
+  await mkdir(path.join(fromWorkspace, '.northset', 'bootstrap-home', '.cache', 'pip'), {recursive: true});
+  await writeFile(path.join(from, '.venv', 'python'), 'host-specific');
+  await writeFile(path.join(from, '__pypackages__', 'portable.whl'), 'wheel');
+  await writeFile(path.join(fromWorkspace, '.northset', 'bootstrap-home', '.cache', 'pip', 'download.whl'), 'wheel');
+  await copyProfileDependencies('python', from, to);
+  await access(path.join(to, '__pypackages__', 'portable.whl'));
+  await access(path.join(toWorkspace, '.northset', 'bootstrap-home', '.cache', 'pip', 'download.whl'));
+  await assert.rejects(() => access(path.join(to, '.venv', 'python')), /ENOENT/);
+
+  const pythonSpec = spec({
+    executor: {
+      ...spec().executor,
+      profile: 'python',
+      image: 'python:3.12.11-bookworm',
+      install_commands: ['python -m pip install -e .'],
+      commands: ['python -m pytest test_parser.py -q'],
+    },
+  });
+  const bootstrap = dependencyBootstrapDockerArgs(pythonSpec, '/runs/M-010/author-workspace',
+    pythonSpec.executor.image, '/cache/python');
+  assert.ok(bootstrap.includes('PIP_TARGET=/workspace/.northset/bootstrap-home/python-site'));
+  assert.match(bootstrap.at(-1), /python-site/);
+  const check = checkDockerArgs(pythonSpec, '/runs/M-010/oracle', 'python@' + digest('a'),
+    pythonSpec.executor.commands[0]);
+  assert.ok(check.includes('PYTHONPATH=/workspace/.northset/bootstrap-home/python-site'));
+});
+
+test('base-red dependency bytes come from a hash-verified pre-author snapshot', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-preauthor-dependencies-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const authorRepo = path.join(root, 'author', 'repo');
+  const dependency = path.join(authorRepo, 'node_modules', 'parser', 'index.js');
+  await mkdir(path.dirname(dependency), {recursive: true});
+  await writeFile(dependency, 'trusted pre-author bytes\n');
+  const snapshot = await snapshotProfileDependencies('node', authorRepo, path.join(root, 'snapshot'));
+
+  await writeFile(dependency, 'credentialed author poison\n');
+  const redRepo = path.join(root, 'red', 'repo');
+  await mkdir(redRepo, {recursive: true});
+  await copyDependencySnapshot('node', snapshot, redRepo);
+  assert.equal(await readFile(path.join(redRepo, 'node_modules', 'parser', 'index.js'), 'utf8'),
+    'trusted pre-author bytes\n');
+
+  await writeFile(path.join(snapshot.repo, 'node_modules', 'parser', 'index.js'), 'tampered snapshot\n');
+  await assert.rejects(() => copyDependencySnapshot('node', snapshot, path.join(root, 'second', 'repo')),
+    /dependency snapshot.*changed/i);
+
+  await symlink(dependency, path.join(authorRepo, 'node_modules', 'external-link'));
+  await assert.rejects(() => snapshotProfileDependencies('node', authorRepo, path.join(root, 'unsafe-snapshot')),
+    /dependency snapshot contains an external symlink/i);
+});
+
+test('test_only_then_fix stops before the fix phase when base-red proof is absent', async () => {
+  const value = spec({authoring_mode: 'test_only_then_fix'});
+  const workspace = '/runs/M-010/author-workspace';
+  const runImpl = async (command, args) => {
+    if (command === 'git' && args.includes('rev-parse')) return {code: 0, stdout: `${value.base_commit}\n`, stderr: ''};
+    if (command === 'git' && args.includes('status')) return {code: 0, stdout: '?? test/parser.test.mjs\n', stderr: ''};
+    if (command === 'docker') return {code: 1, stdout: 'ordinary failure without marker', stderr: ''};
+    throw new Error(`unexpected ${command}`);
+  };
+  await assert.rejects(() => verifyTestOnlyAuthorResult(value, workspace, value.executor.image, {runImpl}), /FAILED_ORACLE_DESIGN/);
+});
+
+test('batch board and approval digest bind mission order, patch, PR body and risks', () => {
+  const manifest = (id, character) => ({
+    mission_id: id, repo: `${character}/repo`, issue_url: `https://github.com/${character}/repo/issues/1`,
+    pr_title: `fix: ${character}`, patch_sha256: digest(character), pr_body_sha256: digest(character),
+    pr_claim_text: `Fix bounded ${character} behavior. Contributor self-run.`,
+    patch_review_sha256: digest(character), risk_flags: [], changed_file_classes: [{path: 'src/x', class: 'source'}],
+    oracle_sha256: digest(character), bundle_digest: digest(character),
+  });
+  const a = manifest('M-100', 'a');
+  const b = manifest('M-101', 'b');
+  assert.notEqual(batchApprovalDigest([a, b]), batchApprovalDigest([b, a]));
+  assert.notEqual(batchApprovalDigest([a]), batchApprovalDigest([{...a, pr_body_sha256: digest('c')}]))
+  const results = [a, b].map((value) => ({state: 'READY', manifest: value,
+    spec: spec({mission_id: value.mission_id}), classes: value.changed_file_classes}));
+  const board = buildBatchBoard(results);
+  assert.equal(board.machine.batch_digest, batchApprovalDigest([a, b]));
+  assert.deepEqual(board.machine.ordered_mission_ids, ['M-100', 'M-101']);
+  assert.match(board.markdown, /Fix bounded a behavior\. Contributor self-run\./);
+  assert.match(board.markdown, /Approval binds the ordered manifest bytes/);
+});
+
+test('canonical verifier base clone remains standalone after shared mirror removal', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-standalone-base-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const source = path.join(root, 'source');
+  const mirror = path.join(root, 'mirror.git');
+  const author = path.join(root, 'author');
+  const standalone = path.join(root, 'standalone');
+  await mkdir(source);
+  await git(source, 'init');
+  await git(source, 'config', 'user.name', OSS_IDENTITY.name);
+  await git(source, 'config', 'user.email', OSS_IDENTITY.email);
+  await writeFile(path.join(source, 'value.txt'), 'base\n');
+  await git(source, 'add', '.');
+  await git(source, 'commit', '-m', 'base');
+  const base = (await git(source, 'rev-parse', 'HEAD')).stdout.trim();
+  await git(root, 'clone', '--mirror', source, mirror);
+  await git(root, 'clone', '--shared', mirror, author);
+  await cloneStandaloneRepository(author, standalone, base);
+  await rm(mirror, {recursive: true, force: true});
+  await rm(author, {recursive: true, force: true});
+  await assert.rejects(() => access(path.join(standalone, '.git', 'objects', 'info', 'alternates')), /ENOENT/);
+  const topLevel = (await git(standalone, 'rev-parse', '--show-toplevel')).stdout.trim();
+  assert.equal(await realpath(topLevel), await realpath(standalone));
+  assert.equal((await git(standalone, 'rev-parse', 'HEAD^{commit}')).stdout.trim(), base);
+  const indexed = await git(standalone, 'ls-files', '-v', '-z');
+  assert.equal(indexed.code, 0);
+  assert.ok(indexed.stdout.split('\0').filter(Boolean)
+    .every((record) => record[1] === ' ' && record[0] === record[0].toUpperCase()));
+  const sourceStatus = await git(standalone, 'status', '--porcelain', '--untracked-files=all', '--ignored=matching');
+  assert.equal(sourceStatus.code, 0);
+  assert.equal(sourceStatus.stdout.trim(), '');
+  assert.equal((await git(standalone, 'cat-file', '-e', `${base}^{commit}`)).code, 0);
 });
 
 test('validates the lean semantic mission contract and rejects legacy prompts', () => {
@@ -108,15 +298,20 @@ test('validates the lean semantic mission contract and rejects legacy prompts', 
     oracle: {...spec().oracle, command: 'npm test -- test/parser.test.mjs && npm test'},
     executor: {...spec().executor, commands: ['npm test -- test/parser.test.mjs && npm test']},
   })]), /single focused command/i);
+  const uiOracle = 'pnpm --dir ui exec vitest run src/parser.test.ts';
+  assert.doesNotThrow(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['ui/src/parser.test.ts'], command: uiOracle},
+    executor: {...spec().executor, commands: [uiOracle]},
+  })]));
   assert.throws(() => validateSpecs([spec({
     oracle: {...spec().oracle, setup_commands: ['node tools/generate.mjs && curl example.com']},
   })]), /setup_commands/i);
 });
 
-test('the copyable schema-v2 example validates', async () => {
+test('schema-v2 missions fail closed when qualification source evidence is absent', async () => {
   const example = JSON.parse(await readFile(new URL('./examples/mission-spec.example.json', import.meta.url), 'utf8'));
   delete example._comment;
-  assert.doesNotThrow(() => validateSpecs([example]));
+  assert.throws(() => validateSpecs([example]), /source evidence/i);
 });
 
 test('schema-v2 missions bind stable economic task identity and attempt sequence', () => {
@@ -141,6 +336,12 @@ test('schema-v2 missions bind stable economic task identity and attempt sequence
     },
   });
   assert.doesNotThrow(() => validateSpec(value));
+  const missingSourceEvidence = structuredClone(value);
+  delete missingSourceEvidence.qualification.source_evidence;
+  assert.throws(() => validateSpec(missingSourceEvidence), /source evidence/i);
+  const unsafeSourceEvidence = structuredClone(value);
+  unsafeSourceEvidence.qualification.source_evidence = ['../src/parser.mjs:7 — not normalized'];
+  assert.throws(() => validateSpec(unsafeSourceEvidence), /source evidence/i);
   assert.throws(() => validateSpec({...value, task_id: 'TASK-OSS-INVENTED'}), /task_id.*candidate/i);
   assert.throws(() => validateSpec({...value, attempt_sequence: 0}), /attempt_sequence/i);
   assert.throws(() => validateSpec({...value, work_category: 'revenue_generation'}), /work_category/i);
@@ -409,13 +610,21 @@ test('oracle dependency copy preserves the workspace-level offline Corepack cach
   const targetWorkspace = path.join(base, 'target');
   const marker = path.join('.northset', 'bootstrap-home', '.cache', 'node', 'corepack', 'marker');
   const installState = path.join('repo', '.yarn', 'install-state.gz');
+  const uiDependency = path.join('repo', 'ui', 'node_modules', '.bin', 'vitest');
+  const clientDependency = path.join('repo', 'client', 'node_modules', '.bin', 'vitest');
   await mkdir(path.dirname(path.join(sourceWorkspace, marker)), {recursive: true});
   await writeFile(path.join(sourceWorkspace, marker), 'offline cache');
   await mkdir(path.dirname(path.join(sourceWorkspace, installState)), {recursive: true});
   await writeFile(path.join(sourceWorkspace, installState), 'install state');
+  await mkdir(path.dirname(path.join(sourceWorkspace, uiDependency)), {recursive: true});
+  await writeFile(path.join(sourceWorkspace, uiDependency), 'ui dependency');
+  await mkdir(path.dirname(path.join(sourceWorkspace, clientDependency)), {recursive: true});
+  await writeFile(path.join(sourceWorkspace, clientDependency), 'client dependency');
   await copyNodeDependencies(path.join(sourceWorkspace, 'repo'), path.join(targetWorkspace, 'repo'));
   assert.equal(await readFile(path.join(targetWorkspace, marker), 'utf8'), 'offline cache');
   assert.equal(await readFile(path.join(targetWorkspace, installState), 'utf8'), 'install state');
+  assert.equal(await readFile(path.join(targetWorkspace, uiDependency), 'utf8'), 'ui dependency');
+  assert.equal(await readFile(path.join(targetWorkspace, clientDependency), 'utf8'), 'client dependency');
 });
 
 test('host normalization bypasses repository hooks before isolated verification', () => {
@@ -436,23 +645,42 @@ test('differential oracle checks use a read-only root and network-off sandbox', 
   ]);
   assert.ok(args.includes('COREPACK_HOME=/workspace/.northset/bootstrap-home/.cache/node/corepack'));
   assert.equal(args.at(-1).trim().endsWith(value.oracle.command), true);
+
+  const uiValue = spec({oracle: {...spec().oracle, test_paths: ['ui/src/parser.test.ts']}});
+  const uiArgs = checkDockerArgs(uiValue, '/runs/M-010/oracle', 'node@sha256:' + '9'.repeat(64), uiValue.oracle.command);
+  assert.ok(uiArgs.includes('/workspace/repo/ui/node_modules/.vite-temp:rw,exec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=700'));
 });
 
-test('changed-file risk classes reject dependency, CI, binary, and existing-test mutations', () => {
+test('changed-file risk classes reject dependency, CI, generated, binary, and profile-specific existing tests', () => {
   const classes = classifyChangedFiles(
-    ['src/index.mjs', 'test/existing.test.mjs', 'package.json', '.github/workflows/test.yml'],
+    ['src/index.mjs', 'test/existing.test.mjs', 'test_parser.py', 'parser_test.go',
+      'src/client.generated.ts', 'package.json', '.github/workflows/test.yml'],
     [
       {path: 'src/index.mjs'}, {path: 'test/existing.test.mjs'}, {path: 'test/new.test.mjs'},
+      {path: 'test_parser.py'}, {path: 'parser_test.go'}, {path: 'src/client.generated.ts'},
       {path: 'package.json'}, {path: '.github/workflows/test.yml'}, {path: 'blob.dat', binary: true},
+      {path: 'README.md'}, {path: 'CONTRIBUTING.md'}, {path: 'Makefile'},
+      {path: '.github/dependabot.yml'}, {path: 'notes.unknown'}, {path: 'src/types.d.ts'},
+      {path: 'src/types.pyi'}, {path: 'runtime.config.js'}, {path: 'config/runtime.js'},
+      {path: 'examples/demo.py'}, {path: 'scripts/release.mjs'},
     ],
   );
   const byPath = Object.fromEntries(classes.map((item) => [item.path, item]));
   assert.equal(byPath['src/index.mjs'].flagged, false);
   assert.equal(byPath['test/new.test.mjs'].class, 'added-test');
   assert.equal(byPath['test/existing.test.mjs'].flagged, true);
+  assert.equal(byPath['test_parser.py'].class, 'modified-existing-test');
+  assert.equal(byPath['parser_test.go'].class, 'modified-existing-test');
+  assert.equal(byPath['src/client.generated.ts'].class, 'generated-output');
   assert.equal(byPath['package.json'].class, 'dependency-manifest');
   assert.equal(byPath['.github/workflows/test.yml'].class, 'check-or-CI-config');
   assert.equal(byPath['blob.dat'].class, 'binary');
+  for (const file of ['README.md', 'CONTRIBUTING.md', 'Makefile', '.github/dependabot.yml',
+    'notes.unknown', 'src/types.d.ts', 'src/types.pyi', 'runtime.config.js',
+    'config/runtime.js', 'examples/demo.py', 'scripts/release.mjs']) {
+    assert.notEqual(byPath[file].class, 'source', file);
+    assert.equal(byPath[file].flagged, true, file);
+  }
 });
 
 test('the differential oracle is bound to newly added test files', () => {
@@ -621,6 +849,9 @@ test('live recheck fails closed on invitation drift, issue drift, overlap, and N
   };
   const options = {gh, now: () => new Date('2026-07-13T12:00:00Z')};
   assert.equal((await recheck(value, async () => {}, options)).clean, true);
+  state.labels = ['E-help-wanted'];
+  assert.equal((await recheck(value, async () => {}, options)).clean, true);
+  state.labels = ['help wanted'];
   const issueAuthSpec = structuredClone(value);
   issueAuthSpec.qualification.acceptance_contract.design_evidence = [{
     url: value.issue_url, author_association: 'OWNER', summary: 'Owner-authored issue contract.',
@@ -655,4 +886,35 @@ test('live recheck fails closed on invitation drift, issue drift, overlap, and N
   assert.equal((await recheck(noticeSpec, async () => {}, {...options, gh: noticeGh})).clean, true);
   state.noticePresent = false;
   assert.match((await recheck(noticeSpec, async () => {}, {...options, gh: noticeGh})).reasons.join(' '), /pre-author notice/);
+
+  const customPolicy = {
+    schema_version: 2,
+    defaults: {max_open_prs: 1, daily_pr_cap: 1},
+    repositories: {'Owner/Repo': {invitation_label_map: {'starter-ready': true}}},
+  };
+  const customDigest = sha256(Buffer.from(canonical(customPolicy)));
+  const customSpec = spec({
+    receipt: {repo_policy_snapshot: customPolicy},
+    qualification: {
+      ...spec().qualification,
+      invitation_evidence: {
+        type: 'label', url: value.issue_url, observed_at: '2026-07-13T12:00:00Z',
+        label: 'starter-ready', repo_policy_sha256: customDigest,
+      },
+    },
+  });
+  assert.doesNotThrow(() => validateSpec(customSpec));
+  assert.throws(() => validateSpec({
+    ...customSpec,
+    receipt: {repo_policy_snapshot: {...customPolicy, repositories: {}}},
+  }), /custom invitation label.*snapshot/i);
+  state.noticePresent = true;
+  state.labels = ['starter-ready'];
+  assert.equal((await recheck(customSpec, async () => {}, {...options, repoPolicy: customPolicy})).clean, true);
+  state.labels = ['Starter-Ready'];
+  assert.match((await recheck(customSpec, async () => {}, {...options, repoPolicy: customPolicy})).reasons.join(' '), /invitation/);
+  state.labels = ['starter-ready'];
+  assert.match((await recheck(customSpec, async () => {}, {
+    ...options, repoPolicy: {...customPolicy, repositories: {}},
+  })).reasons.join(' '), /invitation/);
 });

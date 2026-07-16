@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "mission_id": "M-021",
+  "candidate": "KaotoIO/kaoto#3301",
+  "target_repo": "https://github.com/KaotoIO/kaoto",
+  "issue_url": "https://github.com/KaotoIO/kaoto/issues/3301",
+  "base_branch": "main",
+  "base_commit": "b419d921c8de0b68e7eb7054f412b05ee69336a2",
+  "problem_statement": "Switching away from and back to the Design tab remounts Canvas while retaining its shared visualization controller, but the remounted Canvas treats that controller as new, rebuilds without restoring collapse state, and auto-fits away the user's zoom and pan position.",
+  "acceptance_criteria": [
+    "Groups retain their collapsed or expanded state when Canvas remounts with the same visualization controller.",
+    "The graph retains its zoom level and pan position when Canvas remounts with the same visualization controller.",
+    "The first Canvas mount still initializes the graph and schedules the existing fit behavior.",
+    "Later model updates continue to restore persisted collapse state without an unexpected delayed visual change."
+  ],
+  "constraints": [
+    "Do not add dependencies, change public APIs, edit CI, update documentation, lockfiles, generated output, snapshots, or version numbers.",
+    "Keep the change limited to packages/ui/src/components/Visualization/Canvas/Canvas.tsx and packages/ui/src/components/Visualization/Canvas/Canvas.test.tsx.",
+    "Do not persist canvas state across a browser reload or editor restart.",
+    "Do not change drag-and-drop behavior, graph layout selection, reset-view behavior, or unrelated visualization rendering."
+  ],
+  "implementation_hints": [
+    "The VisualizationProvider controller survives routed tab content while Canvas-local initialized state resets on remount.",
+    "Distinguish a true first mount from a remount backed by an already-populated controller; preserve the existing graph instance state on the latter path, apply the stored collapse state, and avoid the initial auto-fit.",
+    "Extend the existing Canvas lifecycle test seam with a red/green remount regression that reuses one controller and asserts collapse restoration plus unchanged graph scale and position. Name the regression test `preserves collapse and viewport state when remounted`."
+  ],
+  "process_requirements": [
+    "A human must review, approve, and sign all AI-generated code; the AI agent may not submit the pull request independently.",
+    "Use a contributor-created descriptive branch on a fork; never push to another contributor's branch.",
+    "Before submission run the UI lint, style lint, and test commands required by AGENTS.md.",
+    "Keep under 10 pull requests per operator per day and provide active human follow-up within two weeks.",
+    "AI-use disclosure is optional but recommended."
+  ],
+  "qualification": {
+    "review_id": "sha256:dbec72197ed0c6b4e0aa007625d173a94226a954b4ccd2d2a5ce8fe751bc32ad",
+    "review_prompt_version": 2,
+    "reviewed_at": "2026-07-14T14:09:25.770Z",
+    "qualification_expires_at": "2026-07-14T16:09:25.770Z",
+    "evidence_sha256": "sha256:f3852e1fc106a6d79ef79b9fff31bae441e0abc9b3a80d83d01270fd65a561b8",
+    "issue_updated_at": "2026-06-10T14:28:17Z",
+    "invitation_evidence": {
+      "type": "label",
+      "url": "https://github.com/KaotoIO/kaoto/issues/3301",
+      "observed_at": "2026-07-14T14:08:38Z"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "Switching away from and back to the Design tab remounts Canvas while retaining the shared controller. The remounted Canvas treats itself as newly initialized, rebuilds and auto-fits the graph without restoring controller-backed collapse or viewport state; a later model update then reapplies collapse state, causing the delayed visual change reported by the issue.",
+      "expected_behavior": [
+        "Groups retain their collapsed or expanded state after switching tabs.",
+        "The canvas retains its zoom level and pan position after switching tabs.",
+        "A subsequent route edit does not unexpectedly change group collapse state because rendered and persisted state remain synchronized."
+      ],
+      "non_goals": [
+        "Persisting canvas state across a full editor restart or browser reload.",
+        "Changing drag-and-drop behavior for collapsed or expanded groups."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/KaotoIO/kaoto/issues/3301#issuecomment-4671296624",
+          "author_association": "MEMBER",
+          "summary": "The maintainer confirms collapse status should be saved and explicitly adds preservation of canvas zoom level and position."
+        }
+      ]
+    },
+    "related_prs": [
+      {
+        "url": "https://github.com/KaotoIO/kaoto/pull/3036",
+        "state": "MERGED",
+        "relationship": "not_related",
+        "disposition": "This merged pull request implements drag-and-drop compatibility and feedback for collapsed or expanded groups under issue #3022; it does not preserve state across tab remounts.",
+        "reopened_by": null
+      }
+    ]
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "packages/ui/src/components/Visualization/Canvas/Canvas.test.tsx"
+    ],
+    "command": "corepack yarn workspace @kaoto/kaoto test src/components/Visualization/Canvas/Canvas.test.tsx packages/ui/src/components/Visualization/Canvas/Canvas.test.tsx --configLoader runner",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "preserves collapse and viewport state when remounted",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix(Canvas): preserve state across tab switches",
+    "summary": "Preserve collapsed groups and the current canvas viewport when the Design tab remounts with its existing visualization controller, while retaining first-load fit behavior, and add a focused lifecycle regression test.",
+    "body_template": "### Description\n\n{{SUMMARY}}\n\nFixes #{{ISSUE_NUMBER}}\n\n#### Type of Change\n- [x] Bug fix\n- [ ] New feature\n- [ ] Improvement\n- [ ] Documentation update\n- [ ] Other\n\n#### How Has This Been Tested?\n{{CHECKS}}\n\n#### Checklist\n- [x] I have read the Contributing Guidelines.\n- [x] I have followed the coding style and conventions of the project.\n- [x] I have tested my changes and ensured that they work as expected.\n- [ ] I have updated relevant documentation (not applicable: behavior and regression-test change only).\n- [x] I have added tests that prove the fix works.\n\n{{RECEIPT_FOOTER}}"
+  },
+  "executor": {
+    "profile": "node",
+    "image": "node:24.16.0-bookworm",
+    "reasoning_effort": "high",
+    "install_commands": [
+      "corepack yarn install --immutable"
+    ],
+    "commands": [
+      "corepack yarn workspace @kaoto/kaoto test src/components/Visualization/Canvas/Canvas.test.tsx packages/ui/src/components/Visualization/Canvas/Canvas.test.tsx --configLoader runner",
+      "corepack yarn workspace @kaoto/kaoto lint",
+      "corepack yarn workspace @kaoto/kaoto lint:style",
+      "corepack yarn workspace @kaoto/kaoto test --configLoader runner --maxWorkers 2"
+    ],
+    "limits": {
+      "cpus": 6,
+      "memory_mb": 6144,
+      "pids": 512,
+      "wall_clock_seconds_per_command": 2700,
+      "output_bytes_per_stream": 2000000
+    }
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "url": "https://github.com/KaotoIO/kaoto/blob/b419d921c8de0b68e7eb7054f412b05ee69336a2/AGENTS.md",
+      "checked_at": "2026-07-14T14:09:25Z",
+      "ai_policy_summary": "Kaoto permits AI-assisted contributions but requires human review, approval, signing, and responsibility. Contributors must use their own fork and branch, stay under 10 PRs per operator per day, follow up within two weeks, and run UI lint, style lint, and tests before submission. AI-use disclosure is optional but recommended."
+    },
+    "checks_not_run": [
+      "Application production build",
+      "Storybook",
+      "Cypress end-to-end suite",
+      "Full monorepo checks outside @kaoto/kaoto",
+      "Manual browser validation"
+    ],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "The focused regression exercises Canvas remount lifecycle behavior with a shared visualization controller but does not navigate the full application router in a browser.",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

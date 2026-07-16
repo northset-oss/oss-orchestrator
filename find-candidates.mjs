@@ -28,24 +28,49 @@ import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
-import {taskIdForCandidate} from './core.mjs';
+import {PROFILE_REGISTRY, isInvitationLabel, normalizeLabel, taskIdForCandidate} from './core.mjs';
+import {candidateEvidenceKey, canonicalCandidate, openCandidateLake} from './candidate-lake.mjs';
+
+export {isInvitationLabel, normalizeLabel};
 
 export const FINDER_SCHEMA_VERSION = 2;
-export const FINDER_VERSION = '2.0.4';
+export const FINDER_VERSION = '3.0.0';
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = path.dirname(SCRIPT_FILE);
 const DEFAULT_HISTORY = path.join(SCRIPT_DIR, 'runs', 'candidate-history-v2.jsonl');
 const DEFAULT_REVIEWER = path.join(SCRIPT_DIR, 'review-issue.mjs');
 const DEFAULT_REPO_POLICY = path.join(SCRIPT_DIR, 'repo-policy.json');
+const DEFAULT_LAKE = path.join(SCRIPT_DIR, 'candidate_lake.sqlite');
 const DEFAULT_LABELS = ['good first issue', 'help wanted'];
-const SUPPORTED_PROFILES = ['node'];
-const PROFILE_LANGUAGES = {
-  node: ['JavaScript', 'TypeScript'],
-};
+export const SUPPORTED_PROFILES = Object.freeze(Object.keys(PROFILE_REGISTRY.profiles));
+export const PROFILE_LANGUAGES = Object.freeze(Object.fromEntries(
+  Object.entries(PROFILE_REGISTRY.profiles).map(([name, value]) => [name, value.languages]),
+));
+export const INVITATION_LABEL_PATTERNS = [
+  /good.?first.?issue/i,
+  /help.?wanted/i,
+  /up.?for.?grabs/i,
+  /beginner.?friendly/i,
+  /\beasy\b/i,
+  /e[-: ]?help.?wanted/i,
+  /status[: ]?help.?wanted/i,
+  /effort[: ]?good.?first.?issue/i,
+];
 const MAX_SEARCH_QUERIES = 20;
 const DEFAULT_MAX_OUTPUT_BYTES = 4_000_000;
 const GITHUB_REST_API_VERSION = '2026-03-10';
+
+export function assignCrawlProfile(repository, requestedProfiles, policyProfile = null) {
+  const requested = new Set(requestedProfiles ?? []);
+  const available = SUPPORTED_PROFILES.filter((profile) => requested.has(profile));
+  if (!available.length) throw new Error('crawl profile assignment requires at least one supported profile');
+  if (available.length === 1) return available[0];
+  if (policyProfile && available.includes(policyProfile)) return policyProfile;
+  const language = String(repository?.primary_language ?? repository?.primaryLanguage ?? '').toLowerCase();
+  return available.find((profile) => (PROFILE_LANGUAGES[profile] ?? [])
+    .some((candidate) => candidate.toLowerCase() === language)) ?? available[0];
+}
 
 function nowIso() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -204,6 +229,14 @@ export function parseArgs(argv, env = process.env) {
   const maxPerOwner = positiveInteger(options.get('--max-per-owner') ?? env.OSS_FIND_MAX_PER_OWNER ?? '2', '--max-per-owner');
   const qualificationTtlMinutes = positiveInteger(options.get('--qualification-ttl-minutes')
     ?? env.OSS_FIND_QUALIFICATION_TTL_MINUTES ?? '120', '--qualification-ttl-minutes');
+  const createdWindowDays = options.has('--created-window-days')
+    ? positiveInteger(options.get('--created-window-days'), '--created-window-days') : null;
+  const updatedWindowDays = options.has('--updated-window-days')
+    ? positiveInteger(options.get('--updated-window-days'), '--updated-window-days') : null;
+  const searchShards = positiveInteger(options.get('--search-shards') ?? '1', '--search-shards');
+  if (searchShards > 12) throw new Error('--search-shards must be at most 12');
+  const labelPages = positiveInteger(options.get('--label-pages') ?? '3', '--label-pages');
+  if (labelPages > 10) throw new Error('--label-pages must be at most 10');
 
   const historyFile = path.resolve(options.get('--history') ?? env.OSS_FIND_HISTORY ?? DEFAULT_HISTORY);
   const reviewScript = path.resolve(options.get('--review-script') ?? env.OSS_FIND_REVIEW_SCRIPT ?? DEFAULT_REVIEWER);
@@ -215,7 +248,8 @@ export function parseArgs(argv, env = process.env) {
     '--review-timeout-seconds', '--concurrency', '--search-limit', '--max-reviews',
     '--preflight-limit', '--stars-min', '--max-comments', '--max-push-age-days',
     '--min-score', '--max-per-owner', '--qualification-ttl-minutes', '--history',
-    '--review-script', '--repo-policy', '--output', '--audit',
+    '--review-script', '--repo-policy', '--output', '--audit', '--created-window-days',
+    '--updated-window-days', '--search-shards', '--label-pages',
   ]);
   for (const key of options.keys()) if (!known.has(key)) throw new Error(`unknown argument ${key}`);
 
@@ -241,6 +275,10 @@ export function parseArgs(argv, env = process.env) {
     minScore,
     maxPerOwner,
     qualificationTtlMs: qualificationTtlMinutes * 60_000,
+    createdWindowDays,
+    updatedWindowDays,
+    searchShards,
+    labelPages,
     historyFile,
     reviewScript,
     repoPolicyFile,
@@ -255,9 +293,13 @@ export function usage() {
 
 Usage:
   node find-candidates.mjs N [options]
+  node find-candidates.mjs import --out candidate_lake.sqlite batch3.json [...]
+  node find-candidates.mjs crawl --profile node,python,go,rust --out candidate_lake.sqlite
+  node find-candidates.mjs rank --lake candidate_lake.sqlite --count 500 --profile node --out queue.json
+  node find-candidates.mjs qualify --lake candidate_lake.sqlite --queue queue.json --count 100
 
 Core options:
-  --profile node                    Fast-lane executor profile (default: node)
+  --profile node                    Explicit executor profile: node, python, go, or rust
   --budget-seconds 1200             One non-resetting wall-clock budget
   --review-timeout-seconds 300      Per-candidate semantic-review cap
   --concurrency 4                   Concurrent semantic reviews
@@ -265,7 +307,7 @@ Core options:
   --preflight-limit N               Maximum candidates hydrated mechanically
   --search-limit N                  Results per auditable REST search stratum (max: 100)
   --stars-min N                     Minimum repository stars (default: 10)
-  --max-comments N                  Reject discussion-heavy issues (default: 30)
+  --max-comments N                  Comment-count risk threshold; never a sole rejection
   --min-score N                     Minimum deterministic preflight score (default: 60)
   --max-per-owner N                 Maximum selected candidates per GitHub owner (default: 2)
 
@@ -273,6 +315,9 @@ Search controls:
   --labels a,b                      Invitation labels (default: good first issue,help wanted)
   --terms a,b                       Optional high-signal phrases; labels remain mandatory
   --repos owner/repo,...            Optional targeted repository set
+  --created-window-days N           Shard searches by bounded created-date windows
+  --updated-window-days N           Shard searches by bounded updated-date windows
+  --search-shards N                 Number of non-overlapping time shards (max: 12)
   --exclude-file path               Repeatable prior-register exclusion file
   --include-file path               Repeatable exact issue-key priority file
   --include-only                    Review only exact keys from inclusion files
@@ -454,15 +499,6 @@ export function extractIssueKeys(text) {
   return keys;
 }
 
-export function normalizeLabel(value) {
-  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-}
-
-export function isInvitationLabel(value) {
-  const normalized = normalizeLabel(value);
-  return normalized.includes('good first issue') || normalized.endsWith('help wanted') || normalized === 'help wanted';
-}
-
 function labelsOf(issue) {
   return (issue.labels ?? []).map((label) => typeof label === 'string' ? label : label?.name).filter(Boolean);
 }
@@ -495,14 +531,72 @@ function chunks(items, size) {
   return result;
 }
 
+export function buildTimeWindows({field, windowDays, shards = 1, now = new Date()} = {}) {
+  if (!['created', 'updated'].includes(field)) throw new Error('time-window field must be created or updated');
+  if (!Number.isInteger(windowDays) || windowDays < 1) throw new Error('windowDays must be positive');
+  if (!Number.isInteger(shards) || shards < 1 || shards > 12) throw new Error('shards must be 1..12');
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const remaining = {days: windowDays};
+  const result = [];
+  let cursor = end;
+  for (let index = 0; index < shards && remaining.days > 0; index += 1) {
+    const slots = shards - index;
+    const days = Math.ceil(remaining.days / slots);
+    const start = new Date(cursor.getTime() - (days - 1) * 86_400_000);
+    const date = (value) => value.toISOString().slice(0, 10);
+    result.push({field, from: date(start), to: date(cursor), qualifier: `${field}:${date(start)}..${date(cursor)}`});
+    cursor = new Date(start.getTime() - 86_400_000);
+    remaining.days -= days;
+  }
+  return result;
+}
+
+function policyEntry(policy, repository) {
+  const wanted = String(repository ?? '').toLowerCase();
+  return Object.entries(policy?.repositories ?? {}).find(([key]) => key.toLowerCase() === wanted)?.[1] ?? {};
+}
+
+export function repositoryCaps(policy, repository) {
+  const entry = policyEntry(policy, repository);
+  return {
+    max_open_prs: entry.max_open_prs ?? policy?.defaults?.max_open_prs ?? 1,
+    daily_pr_cap: entry.daily_pr_cap ?? policy?.defaults?.daily_pr_cap ?? 1,
+  };
+}
+
+export function invitationLabelsForRepository(labels, policy, repository) {
+  const entry = policyEntry(policy, repository);
+  const approved = new Set([
+    ...(entry.invitation_labels ?? []),
+    ...Object.entries(entry.invitation_label_map ?? {}).filter(([, enabled]) => enabled === true).map(([label]) => label),
+  ].map(normalizeLabel));
+  return [...new Set((labels ?? []).map((label) => typeof label === 'string' ? label : label?.name).filter(Boolean))]
+    .filter((label) => isInvitationLabel(label) || approved.has(normalizeLabel(label)));
+}
+
+export async function discoverRepositoryInvitationLabels(repository, fetchPage, {
+  policy = {}, maxPages = 3, perPage = 100,
+} = {}) {
+  const labels = [];
+  let truncated = false;
+  for (let page = 1; page <= maxPages; page += 1) {
+    const values = await fetchPage({repository, page, perPage});
+    if (!Array.isArray(values)) throw new Error(`label page ${page} for ${repository} was not an array`);
+    labels.push(...values);
+    if (values.length < perPage) break;
+    if (page === maxPages) truncated = true;
+  }
+  return {labels: invitationLabelsForRepository(labels, policy, repository), pages_bounded: maxPages, truncated};
+}
+
 export function buildSearchPlan(config) {
   if (config.includeOnly) return [];
   const plan = [];
-  const add = ({label, term = null, language = null, repositories = [], sort = 'updated', order = 'desc'}) => {
+  const add = ({label, term = null, language = null, repositories = [], sort = 'updated', order = 'desc', window = null}) => {
     const queryParts = [];
     if (term) queryParts.push(quoteSearchPhrase(term));
     const id = `q${String(plan.length + 1).padStart(2, '0')}`;
-    plan.push({id, label, term, language, repositories, sort, order, query: queryParts.join(' ')});
+    plan.push({id, label, term, language, repositories, sort, order, window, query: queryParts.join(' ')});
   };
 
   if (config.repositories.length) {
@@ -518,12 +612,25 @@ export function buildSearchPlan(config) {
     for (const label of config.labels) {
       add({label});
       for (const language of languages) add({label, language});
-      if (config.requested >= 10) {
+      // A time-window qualifier already supplies the broad created/updated coverage. Keeping
+      // the unwindowed sort duplicate would turn the documented 3-shard Node plan into 30
+      // queries and breach the deliberately fail-closed 20-query ceiling.
+      if (config.requested >= 10 && !config.createdWindowDays && !config.updatedWindowDays) {
         for (const language of languages) add({label, language, sort: 'created'});
       }
     }
   }
 
+  const windowPlans = [];
+  if (config.createdWindowDays) windowPlans.push(...buildTimeWindows({field: 'created', windowDays: config.createdWindowDays, shards: config.searchShards ?? 1, now: config.searchNow ?? new Date()}));
+  if (config.updatedWindowDays) windowPlans.push(...buildTimeWindows({field: 'updated', windowDays: config.updatedWindowDays, shards: config.searchShards ?? 1, now: config.searchNow ?? new Date()}));
+  if (windowPlans.length) {
+    const bases = [...plan];
+    plan.length = 0;
+    for (const base of bases) {
+      for (const window of windowPlans) plan.push({...base, id: `q${String(plan.length + 1).padStart(2, '0')}`, window});
+    }
+  }
   if (plan.length > MAX_SEARCH_QUERIES) {
     throw new Error(`search plan has ${plan.length} queries; maximum is ${MAX_SEARCH_QUERIES}`);
   }
@@ -549,6 +656,7 @@ export function restSearchQuery(query, config) {
   if (query.repositories.length) {
     for (const repository of query.repositories) parts.push(`repo:${repository}`);
   }
+  if (query.window?.qualifier) parts.push(query.window.qualifier);
   return parts.join(' ');
 }
 
@@ -810,54 +918,65 @@ async function discover(config, plan, deadline, audit) {
   return [...discovered.values()];
 }
 
-async function openNorthsetRepositories(config, deadline, audit) {
-  const query = 'is:pr is:open author:AysajanE';
-  let response = await commandJson('Northset open-PR repository check', 'gh', [
+async function northsetPrSearch(config, deadline, query, label) {
+  let response = await commandJson(label, 'gh', [
     'api', '--method', 'GET',
     '-H', 'Accept: application/vnd.github+json',
     '-H', `X-GitHub-Api-Version: ${GITHUB_REST_API_VERSION}`,
-    'search/issues',
-    '-f', `q=${query}`,
-    '-f', 'sort=updated',
-    '-f', 'order=desc',
-    '-f', 'per_page=100',
-    '--jq', '{total_count,incomplete_results,items:[.items[]|{repository_url}]}',
-  ], {
-    deadline,
-    timeoutMs: config.ghTimeoutMs,
-  });
+    'search/issues', '-f', `q=${query}`, '-f', 'sort=updated', '-f', 'order=desc', '-f', 'per_page=100',
+    '--jq', '{total_count,incomplete_results,items:[.items[]|{repository_url,created_at}]}',
+  ], {deadline, timeoutMs: config.ghTimeoutMs});
   if (response?.incomplete_results === true && !deadline.expired()) {
     await pause(500, deadline);
-    response = await commandJson('Northset open-PR repository retry', 'gh', [
+    response = await commandJson(`${label} retry`, 'gh', [
       'api', '--method', 'GET',
       '-H', 'Accept: application/vnd.github+json',
       '-H', `X-GitHub-Api-Version: ${GITHUB_REST_API_VERSION}`,
-      'search/issues',
-      '-f', `q=${query}`,
-      '-f', 'sort=updated',
-      '-f', 'order=desc',
-      '-f', 'per_page=100',
-      '--jq', '{total_count,incomplete_results,items:[.items[]|{repository_url}]}',
+      'search/issues', '-f', `q=${query}`, '-f', 'sort=updated', '-f', 'order=desc', '-f', 'per_page=100',
+      '--jq', '{total_count,incomplete_results,items:[.items[]|{repository_url,created_at}]}',
     ], {deadline, timeoutMs: config.ghTimeoutMs, retries: 0});
   }
   if (!response || !Array.isArray(response.items) || response.incomplete_results === true) {
-    throw new Error('Northset open-PR search was incomplete or invalid');
+    throw new Error(`${label} was incomplete or invalid`);
   }
   if (Number(response.total_count ?? 0) > 100) {
-    throw new Error(`Northset has more than 100 open PRs; repository-cap evidence is intentionally bounded and cannot be trusted`);
+    throw new Error(`${label} exceeded 100 results; repository-cap evidence is intentionally bounded and cannot be trusted`);
   }
-  const repositories = new Set(response.items.map((item) => repositoryFromApiUrl(item.repository_url)?.toLowerCase()).filter(Boolean));
+  return response;
+}
+
+function repositoryCounts(items) {
+  const counts = new Map();
+  for (const item of items) {
+    const repository = repositoryFromApiUrl(item.repository_url)?.toLowerCase();
+    if (repository) counts.set(repository, (counts.get(repository) ?? 0) + 1);
+  }
+  return counts;
+}
+
+async function openNorthsetPolicyCounts(config, deadline, audit) {
+  const query = 'is:pr is:open author:AysajanE';
+  const today = new Date().toISOString().slice(0, 10);
+  const [response, dailyResponse] = await Promise.all([
+    northsetPrSearch(config, deadline, query, 'Northset open-PR repository check'),
+    northsetPrSearch(config, deadline, `is:pr author:AysajanE created:>=${today}`, 'Northset daily-PR repository check'),
+  ]);
+  const openCounts = repositoryCounts(response.items);
+  const dailyCounts = repositoryCounts(dailyResponse.items);
   audit.add('northset_open_pr_repositories_checked', {
-    repositories: [...repositories].sort(),
-    count: repositories.size,
+    repositories: [...openCounts.keys()].sort(),
+    open_counts: Object.fromEntries([...openCounts].sort()),
+    daily_counts: Object.fromEntries([...dailyCounts].sort()),
+    count: openCounts.size,
     total_count: response.total_count ?? null,
     incomplete_results: false,
   });
-  return repositories;
+  return {openCounts, dailyCounts};
 }
 
 export function filterDiscovered(candidates, {
-  seen, cooldowns, northsetOpenRepositories, preflightLimit, included = new Set(), includeOnly = false,
+  seen, cooldowns, northsetOpenRepositories = new Set(), northsetOpenCounts = new Map(),
+  northsetDailyCounts = new Map(), repoPolicy = {}, preflightLimit, included = new Set(), includeOnly = false,
 }) {
   const accepted = [];
   const rejected = [];
@@ -869,10 +988,17 @@ export function filterDiscovered(candidates, {
     let reason = null;
     if (includeOnly && !included.has(candidate.key.toLowerCase())) reason = 'not explicitly included';
     else if (seen.has(candidate.key.toLowerCase())) reason = 'previously reviewed or excluded';
-    else if (northsetOpenRepositories.has(candidate.repository.toLowerCase())) reason = 'Northset already has an open PR in repository';
-    else if (cooldowns[candidate.repository.toLowerCase()]) reason = 'repository cooldown';
-    else if (candidate.assignees.length) reason = 'assigned';
-    else reason = lowValueReason(candidate.raw_search);
+    else {
+      const repository = candidate.repository.toLowerCase();
+      const caps = repositoryCaps(repoPolicy, candidate.repository);
+      const openCount = northsetOpenCounts.get(repository) ?? Number(northsetOpenRepositories.has(repository));
+      const dailyCount = northsetDailyCounts.get(repository) ?? 0;
+      if (openCount >= caps.max_open_prs) reason = `Northset open PR cap reached for repository (${caps.max_open_prs})`;
+      else if (dailyCount >= caps.daily_pr_cap) reason = `Northset daily PR cap reached for repository (${caps.daily_pr_cap})`;
+    }
+    if (!reason && cooldowns[candidate.repository.toLowerCase()]) reason = 'repository cooldown';
+    else if (!reason && candidate.assignees.length) reason = 'assigned';
+    else if (!reason) reason = lowValueReason(candidate.raw_search);
     if (!reason && !included.has(candidate.key.toLowerCase())
       && (perRepo.get(candidate.repository.toLowerCase()) ?? 0) >= 3) reason = 'preflight repository concentration cap';
     if (reason) {
@@ -1105,8 +1231,10 @@ export function mechanicalDecision(preflight, config, nowMs = Date.now()) {
   if (issue?.state !== 'OPEN') reasons.push('issue is not open');
   if (issue?.locked) reasons.push('issue is locked');
   if ((issue?.assignees ?? []).length) reasons.push('issue is assigned');
-  if (!(issue?.labels ?? []).some(isInvitationLabel)) reasons.push('qualifying invitation label is missing');
-  if (Number(issue?.comments_total ?? 0) > config.maxComments) reasons.push(`issue has more than ${config.maxComments} comments`);
+  const approvedLabels = invitationLabelsForRepository(issue?.labels ?? [], config.repoPolicy ?? {}, repository?.name_with_owner);
+  if (!approvedLabels.length) reasons.push('qualifying invitation label is missing');
+  const commentCount = Number(issue?.comments_total ?? 0);
+  if (commentCount > config.maxComments) warnings.push(`high discussion count (${commentCount})`);
   if (issue?.timeline_has_next_page) reasons.push('issue has more than 50 cross-reference events');
   const blockedReason = issue && lowValueReason({
     isLocked: issue.locked,
@@ -1120,6 +1248,12 @@ export function mechanicalDecision(preflight, config, nowMs = Date.now()) {
   const openCrossReferences = (issue?.cross_referenced_prs ?? []).filter((pr) =>
     pr.state === 'OPEN' && pr.repository?.toLowerCase() === sameRepository);
   if (openCrossReferences.length) reasons.push(`open cross-referenced PR(s): ${openCrossReferences.map((pr) => pr.url).join(', ')}`);
+  const relatedImplementationPrs = (issue?.cross_referenced_prs ?? []).filter((pr) => pr.repository?.toLowerCase() === sameRepository);
+  if (relatedImplementationPrs.length > 12) reasons.push(`issue has excessive related implementation PRs (${relatedImplementationPrs.length})`);
+
+  const unresolvedDesign = (issue?.recent_comments ?? []).find((comment) =>
+    /\b(?:unresolved|do not agree|disagree|needs design|design is not settled|which approach|hold off|do not implement)\b/i.test(comment.body ?? ''));
+  if (unresolvedDesign) reasons.push(`unresolved design disagreement in recent comment by ${unresolvedDesign.author ?? 'unknown author'}`);
 
   const claim = activeClaimComment(preflight, nowMs);
   if (claim) reasons.push(`recent active-claim comment by ${claim.author} at ${claim.created_at}`);
@@ -1138,6 +1272,32 @@ export function mechanicalDecision(preflight, config, nowMs = Date.now()) {
   };
 }
 
+export function deterministicSemanticReject(preflight, repositoryProfile = {}) {
+  const record = preflight?.preflight ?? preflight;
+  const issue = record.issue ?? {};
+  const repository = record.repository ?? {};
+  const text = `${issue.title ?? record.title ?? ''}\n${record.discovery?.body_excerpt ?? record.body_excerpt ?? ''}`;
+  if (!invitationLabelsForRepository(issue.labels ?? record.labels ?? [], repositoryProfile.repo_policy ?? {}, repository.name_with_owner ?? record.repository_name).length &&
+      !record.invitation_kind) return 'no invitation signal';
+  if (/\b(proposal|rfc|redesign|performance|security|dependency update|translation|documentation|docs?)\b/i.test(text)) {
+    return 'excluded semantic class';
+  }
+  if ((issue.recent_comments ?? []).some((comment) =>
+    /\b(?:unresolved|disagree|needs design|hold off|do not implement)\b/i.test(comment.body ?? ''))) {
+    return 'unresolved design disagreement';
+  }
+  if (activeClaimComment(record)) return 'active claimant';
+  if ((issue.cross_referenced_prs ?? []).filter((pr) =>
+    pr.repository?.toLowerCase() === repository.name_with_owner?.toLowerCase()).length > 12) {
+    return 'excessive related implementation PRs';
+  }
+  if (!/\b(expected|actual|repro|fails?|wrong|incorrect|regression|test|assert)\b/i.test(text) &&
+      !['OWNER', 'MEMBER', 'COLLABORATOR'].includes(issue.author_association ?? record.author_association)) {
+    return 'no observable behavior signal';
+  }
+  return null;
+}
+
 async function preflightCandidates(candidates, config, deadline, audit) {
   const records = [];
   for (const group of chunks(candidates, 10)) {
@@ -1152,7 +1312,23 @@ async function preflightCandidates(candidates, config, deadline, audit) {
     for (let index = 0; index < group.length; index += 1) {
       const normalized = normalizePreflight(group[index], response?.data?.[`c${index}`] ?? null);
       const decision = mechanicalDecision(normalized, config, deadline.startedAtMs);
-      records.push({...normalized, decision, evidence_sha256: sha256(Buffer.from(canonical(normalized)))});
+      const commentsTailSha = sha256(Buffer.from(canonical(normalized.issue?.recent_comments ?? [])));
+      const timelinePrsSha = sha256(Buffer.from(canonical(normalized.issue?.cross_referenced_prs ?? [])));
+      const evidenceKey = candidateEvidenceKey({
+        candidate: normalized.candidate,
+        profile: config.profile,
+        base_commit: normalized.repository?.default_head,
+        issue_updated_at: normalized.issue?.updated_at,
+        labels: normalized.issue?.labels,
+        assignees: normalized.issue?.assignees,
+        comments_tail_sha256: commentsTailSha,
+        timeline_prs_sha256: timelinePrsSha,
+        repo_policy_sha256: config.repoPolicySha ?? null,
+      });
+      records.push({...normalized, decision, comments_tail_sha256: commentsTailSha,
+        timeline_prs_sha256: timelinePrsSha, repo_policy_sha256: config.repoPolicySha ?? null,
+        repo_policy_snapshot: config.repoPolicy ?? null,
+        evidence_sha256: evidenceKey});
       audit.add('preflight_decision', {
         candidate: group[index].key,
         terminal_state: decision.terminal_state,
@@ -1195,12 +1371,17 @@ export function buildReviewQueue(records, maxReviews) {
   return queue;
 }
 
-export function validateReview(review, candidate, resultCode, profile, {expectedBaseCommit, expectedIssueUrl} = {}) {
+export function validateReview(review, candidate, resultCode, profile, {
+  expectedBaseCommit, expectedIssueUrl, expectedEvidenceKey,
+} = {}) {
   if (!review || typeof review !== 'object' || Array.isArray(review)) throw new Error('reviewer returned a non-object');
   if (!['ACCEPT', 'REJECT'].includes(review.verdict)) throw new Error('reviewer returned no ACCEPT/REJECT verdict');
   if (String(review.candidate).toLowerCase() !== candidate.toLowerCase()) throw new Error('reviewer candidate does not match requested candidate');
   if (review.verdict === 'ACCEPT' && resultCode !== 0) throw new Error(`reviewer returned ACCEPT with exit ${resultCode}`);
   if (review.verdict === 'REJECT' && resultCode !== 2) throw new Error(`reviewer returned REJECT with exit ${resultCode}`);
+  if (expectedEvidenceKey && review.candidate_evidence_key !== expectedEvidenceKey) {
+    throw new Error(`reviewer evidence does not match queued evidence ${expectedEvidenceKey}`);
+  }
   if (review.verdict === 'ACCEPT') {
     if (review.task_id !== taskIdForCandidate(candidate)) throw new Error('reviewer ACCEPT task ID does not match the candidate');
     if (!String(review.requested_model ?? '').trim()) throw new Error('reviewer ACCEPT has no requested model');
@@ -1357,7 +1538,7 @@ async function reviewQueue(queue, config, deadline, audit, history, runId) {
         preflight_evidence_sha256: candidate.evidence_sha256,
       });
 
-      const result = await runBounded(process.execPath, [config.reviewScript, candidate.candidate], {
+      const result = await runBounded(process.execPath, numericReviewerInvocationArgs(candidate.candidate, config), {
         deadline,
         timeoutMs: config.reviewTimeoutMs,
         maxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -1523,6 +1704,345 @@ function publicConfig(config) {
   };
 }
 
+function takeOption(argv, names, fallback = null) {
+  for (let index = 0; index < argv.length; index += 1) {
+    if (!names.includes(argv[index])) continue;
+    const value = argv[index + 1];
+    if (value === undefined) throw new Error(`${argv[index]} requires a value`);
+    argv.splice(index, 2);
+    return value;
+  }
+  return fallback;
+}
+
+function commandOutput(value, fallback) {
+  return path.resolve(value ?? fallback);
+}
+
+export function reviewerProfileInvocationArgs(candidate, {profile = 'node', reviewScript = DEFAULT_REVIEWER} = {}) {
+  parseCandidateKey(candidate);
+  if (!SUPPORTED_PROFILES.includes(profile)) throw new Error(`profile must be one of ${SUPPORTED_PROFILES.join(', ')}`);
+  return [reviewScript, candidate, '--profile', profile];
+}
+
+export function numericReviewerInvocationArgs(candidate, config = {}) {
+  return reviewerProfileInvocationArgs(candidate, {
+    profile: config.profile,
+    reviewScript: config.reviewScript,
+  });
+}
+
+export function reviewerInvocationArgs(record, {profile = 'node', reviewScript = DEFAULT_REVIEWER} = {}) {
+  const repoPolicySha256 = record.preflight?.repo_policy_sha256;
+  if (!validReviewDigest(repoPolicySha256)) {
+    throw new Error('queued evidence is missing its canonical repo policy digest');
+  }
+  const args = [...reviewerProfileInvocationArgs(record.candidate, {profile, reviewScript}),
+    '--expected-evidence-key', record.evidence_key, '--repo-policy-sha256', repoPolicySha256];
+  const policy = record.repository_profile?.repo_policy ?? record.preflight?.repo_policy_snapshot ?? null;
+  if (policy !== null) {
+    const observed = sha256(Buffer.from(canonical(policy)));
+    if (observed !== repoPolicySha256) {
+      throw new Error(`queued repository policy bytes do not match ${repoPolicySha256}`);
+    }
+    args.push('--repo-policy-json', JSON.stringify(policy));
+  }
+  return args;
+}
+
+export async function qualifyQueueRecords(records, {
+  lake,
+  profile = 'node',
+  count = records.length,
+  concurrency = 4,
+  reviewScript = DEFAULT_REVIEWER,
+  reviewTimeoutMs = 5 * 60 * 1000,
+  qualificationTtlMs = 2 * 60 * 60 * 1000,
+  now = () => new Date(),
+  reviewRunner = null,
+} = {}) {
+  if (!lake) throw new Error('qualify requires a candidate lake');
+  if (!SUPPORTED_PROFILES.includes(profile)) throw new Error(`profile must be one of ${SUPPORTED_PROFILES.join(', ')}`);
+  if (!Number.isInteger(count) || count < 1) throw new Error('qualify count must be positive');
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 12) throw new Error('qualify concurrency must be 1..12');
+  const unique = [];
+  const seen = new Set();
+  for (const record of records) {
+    const key = `${canonicalCandidate(record.candidate)}\0${record.evidence_key}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(record);
+    if (unique.length >= count) break;
+  }
+  const results = new Array(unique.length);
+  let cursor = 0;
+  const runner = reviewRunner ?? (async (record) => {
+    return runBounded(process.execPath, reviewerInvocationArgs(record, {profile, reviewScript}),
+    {timeoutMs: reviewTimeoutMs, maxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES});
+  });
+
+  async function lane() {
+    while (cursor < unique.length) {
+      const index = cursor++;
+      const record = unique[index];
+      try {
+        const current = await lake.getIssue(record.candidate);
+        if (!current || current.evidence_key !== record.evidence_key) {
+          results[index] = {candidate: record.candidate, evidence_key: record.evidence_key, state: 'STALE_EVIDENCE'};
+          continue;
+        }
+        if ((record.profile && record.profile !== profile) || (current.profile && current.profile !== profile)) {
+          results[index] = {candidate: record.candidate, evidence_key: record.evidence_key,
+            state: 'PROFILE_MISMATCH', cache_hit: false, error: `queue profile does not match requested ${profile}`};
+          continue;
+        }
+        const cached = await lake.getCachedReview(record.candidate, record.evidence_key, now(), {profile});
+        if (cached) {
+          results[index] = {candidate: record.candidate, evidence_key: record.evidence_key,
+            state: `CACHED_${cached.verdict}`, cache_hit: true, review: cached.result};
+          continue;
+        }
+        const deterministicReason = deterministicSemanticReject(record, record.repository_profile ?? {});
+        if (deterministicReason) {
+          const latest = await lake.getIssue(record.candidate);
+          if (!latest || latest.evidence_key !== record.evidence_key) {
+            results[index] = {candidate: record.candidate, evidence_key: record.evidence_key, state: 'STALE_EVIDENCE'};
+            continue;
+          }
+          const reviewedAt = now();
+          const result = {
+            verdict: 'REJECT', candidate: record.candidate, issue_url: record.preflight?.issue?.url ?? null,
+            tier: 'C', executor_profile: profile, deterministic: true, reasons: [deterministicReason],
+          };
+          const reviewId = sha256(Buffer.from(canonical({kind: 'deterministic-semantic-reject-v1',
+            candidate: canonicalCandidate(record.candidate), evidence_key: record.evidence_key, reason: deterministicReason})));
+          await lake.putReview({
+            candidate: record.candidate, evidence_key: record.evidence_key, verdict: 'REJECT', tier: 'C',
+            executor_profile: profile, review_id: reviewId, result,
+            provenance: {source: 'find-candidates qualify', kind: 'deterministic_semantic_reject'},
+            reviewed_at: reviewedAt.toISOString(),
+            expires_at: new Date(reviewedAt.getTime() + qualificationTtlMs).toISOString(),
+          });
+          results[index] = {candidate: record.candidate, evidence_key: record.evidence_key,
+            state: 'REJECTED_DETERMINISTIC', cache_hit: false, review: result};
+          continue;
+        }
+        const executed = await runner(record);
+        const review = executed?.verdict ? executed : JSON.parse(executed.stdout);
+        const code = executed?.verdict ? (review.verdict === 'ACCEPT' ? 0 : 2) : executed.code;
+        validateReview(review, record.candidate, code, profile, {
+          expectedBaseCommit: record.preflight?.repository?.default_head,
+          expectedIssueUrl: record.preflight?.issue?.url,
+          expectedEvidenceKey: record.evidence_key,
+        });
+        const latest = await lake.getIssue(record.candidate);
+        if (!latest || latest.evidence_key !== record.evidence_key) {
+          results[index] = {candidate: record.candidate, evidence_key: record.evidence_key, state: 'STALE_EVIDENCE'};
+          continue;
+        }
+        const reviewedAt = Number.isFinite(Date.parse(review.reviewed_at ?? '')) ? new Date(review.reviewed_at) : now();
+        const expiresAt = Number.isFinite(Date.parse(review.qualification_expires_at ?? ''))
+          ? new Date(review.qualification_expires_at)
+          : new Date(reviewedAt.getTime() + qualificationTtlMs);
+        const reviewId = validReviewDigest(review.review_id) ? review.review_id : sha256(Buffer.from(canonical({
+          candidate: canonicalCandidate(record.candidate), evidence_key: record.evidence_key, review,
+        })));
+        await lake.putReview({
+          candidate: record.candidate, evidence_key: record.evidence_key, verdict: review.verdict,
+          tier: review.tier, executor_profile: review.executor_profile, review_id: reviewId,
+          result: review, provenance: {source: 'find-candidates qualify', reviewer: reviewScript},
+          reviewed_at: reviewedAt.toISOString(), expires_at: expiresAt.toISOString(),
+        });
+        results[index] = {candidate: record.candidate, evidence_key: record.evidence_key,
+          state: review.verdict === 'ACCEPT' ? 'ACCEPTED' : 'REJECTED_SEMANTIC', cache_hit: false, review};
+      } catch (error) {
+        results[index] = {candidate: record.candidate, evidence_key: record.evidence_key,
+          state: 'REVIEW_TOOL_ERROR', cache_hit: false, error: error.message};
+      }
+    }
+  }
+  await Promise.all(Array.from({length: Math.min(concurrency, unique.length || 1)}, () => lane()));
+  return results;
+}
+
+function validReviewDigest(value) {
+  return /^sha256:[0-9a-f]{64}$/i.test(String(value ?? ''));
+}
+
+async function runCrawlCommand(argv) {
+  const values = [...argv];
+  const lakeFile = commandOutput(takeOption(values, ['--out', '--lake']), DEFAULT_LAKE);
+  const count = positiveInteger(takeOption(values, ['--count'], '500'), '--count');
+  const profiles = [...new Set(commaList(takeOption(values, ['--profile'], 'node'), '--profile'))];
+  if (!profiles.every((profile) => SUPPORTED_PROFILES.includes(profile))) {
+    throw new Error(`--profile must contain only ${SUPPORTED_PROFILES.join(', ')}`);
+  }
+  const lake = await openCandidateLake(lakeFile);
+  const discoveredKeys = new Set();
+  const preflightedKeys = new Set();
+  const eligibleKeys = new Set();
+  const persistedThisRun = new Set();
+  const preflightPersisted = new Set();
+  for (const profile of profiles) {
+    const config = parseArgs([String(count), '--profile', profile, ...values]);
+    const deadline = new Deadline(config.totalBudgetMs);
+    const audit = new AuditLog(randomUUID());
+    const [seen, included, repoPolicy] = await Promise.all([
+      loadSeen(config.historyFile, config.exclusionFiles),
+      loadIncluded(config.inclusionFiles),
+      loadRepoPolicy(config.repoPolicyFile),
+    ]);
+    config.repoPolicy = repoPolicy;
+    config.repoPolicySha = sha256(Buffer.from(canonical(repoPolicy)));
+    if (config.repositories.length) {
+      for (const repository of config.repositories) {
+        const scanned = await discoverRepositoryInvitationLabels(repository, async ({page, perPage}) =>
+          commandJson(`repository labels ${repository} page ${page}`, 'gh', [
+            'api', `repos/${repository}/labels?per_page=${perPage}&page=${page}`, '--jq', '[.[]|.name]',
+          ], {deadline, timeoutMs: config.ghTimeoutMs}), {policy: repoPolicy, maxPages: config.labelPages});
+        config.labels = [...new Set([...config.labels, ...scanned.labels])];
+        audit.add('repository_invitation_labels_scanned', {repository, ...scanned});
+      }
+    }
+    const plan = buildSearchPlan(config);
+    await checkRateLimits(config, plan, deadline, audit);
+    const counts = await openNorthsetPolicyCounts(config, deadline, audit);
+    const searched = await discover(config, plan, deadline, audit);
+    const discovered = mergeIncludedCandidates(searched, included);
+    for (const candidate of discovered) discoveredKeys.add(candidate.key.toLowerCase());
+    for (const candidate of discovered) {
+      const key = candidate.key.toLowerCase();
+      if (persistedThisRun.has(key)) continue;
+      const existing = profiles.length > 1 ? await lake.getIssue(candidate.key) : null;
+      // In a combined crawl, a new candidate is persisted only after live preflight can assign
+      // one profile. Existing current state is invalidated once without changing its profile.
+      if (profiles.length > 1 && !existing?.profile) continue;
+      await lake.upsertIssue({
+        candidate: candidate.key, repository: candidate.repository, issue: {
+          title: candidate.title, state: 'OPEN', updated_at: candidate.updated_at, labels: candidate.labels,
+          assignees: candidate.assignees, comments_count: candidate.comments_count,
+          author_association: candidate.author_association,
+        }, profile: existing?.profile ?? profile, clear_evidence: true,
+        mechanical_reasons: ['pending live mechanical preflight'],
+        raw: candidate, provenance: {finder_version: FINDER_VERSION, phase: 'crawl_discovery'},
+      });
+      persistedThisRun.add(key);
+    }
+    const cooldowns = Object.fromEntries(Object.entries(repoPolicy.cooldowns ?? {})
+      .map(([repository, value]) => [repository.toLowerCase(), value]));
+    const filtered = filterDiscovered(discovered, {
+      seen, cooldowns, northsetOpenCounts: counts.openCounts, northsetDailyCounts: counts.dailyCounts,
+      repoPolicy, preflightLimit: config.preflightLimit, included, includeOnly: config.includeOnly,
+    });
+    const preflight = await preflightCandidates(filtered.accepted, config, deadline, audit);
+    for (const record of preflight) {
+      const entry = policyEntry(repoPolicy, record.repository.name_with_owner);
+      const assignedProfile = assignCrawlProfile(record.repository, profiles, entry.test_profile);
+      const key = record.candidate.toLowerCase();
+      if (preflightPersisted.has(key)) continue;
+      const assignedRecord = assignedProfile === profile ? record : (() => {
+        const decision = mechanicalDecision(record, {...config, profile: assignedProfile}, deadline.startedAtMs);
+        const evidenceSha256 = candidateEvidenceKey({
+          candidate: record.candidate,
+          profile: assignedProfile,
+          base_commit: record.repository.default_head,
+          issue_updated_at: record.issue.updated_at,
+          labels: record.issue.labels,
+          assignees: record.issue.assignees,
+          comments_tail_sha256: record.comments_tail_sha256,
+          timeline_prs_sha256: record.timeline_prs_sha256,
+          repo_policy_sha256: record.repo_policy_sha256,
+        });
+        return {...record, decision, evidence_sha256: evidenceSha256};
+      })();
+      audit.add('candidate_profile_assigned', {candidate: record.candidate, observed_profile: profile,
+        assigned_profile: assignedProfile, primary_language: record.repository.primary_language,
+        evidence_sha256: assignedRecord.evidence_sha256});
+      preflightedKeys.add(key);
+      if (assignedRecord.decision.eligible) eligibleKeys.add(key);
+      const caps = repositoryCaps(repoPolicy, record.repository.name_with_owner);
+      const invitationLabelMap = Object.fromEntries([
+        ...(entry.invitation_labels ?? []).map((label) => [label, true]),
+        ...Object.entries(entry.invitation_label_map ?? {}).filter(([, enabled]) => enabled === true),
+      ]);
+      await lake.upsertRepository({
+        repo: record.repository.name_with_owner, ...record.repository, test_profile: assignedProfile,
+        install_command: entry.install_command, full_check_commands: entry.full_check_commands ?? [],
+        invitation_label_map: invitationLabelMap, ...caps,
+        raw: record.repository, provenance: {finder_version: FINDER_VERSION, phase: 'crawl_preflight'},
+      });
+      await lake.upsertIssue({
+        ...assignedRecord, profile: assignedProfile, evidence_key: assignedRecord.evidence_sha256,
+        base_commit: assignedRecord.repository.default_head,
+        mechanical_score: assignedRecord.decision.score.total,
+        mechanical_reasons: assignedRecord.decision.reasons,
+        raw: assignedRecord, provenance: {finder_version: FINDER_VERSION, phase: 'crawl_preflight'},
+      });
+      persistedThisRun.add(key);
+      preflightPersisted.add(key);
+    }
+  }
+  return {schema_version: 1, command: 'crawl', profiles, lake: lake.database,
+    discovered: discoveredKeys.size, preflighted: preflightedKeys.size, eligible: eligibleKeys.size,
+    lake_stats: await lake.stats()};
+}
+
+async function runRankCommand(argv) {
+  const values = [...argv];
+  const lakeFile = commandOutput(takeOption(values, ['--lake']), DEFAULT_LAKE);
+  const output = commandOutput(takeOption(values, ['--out', '--output']), path.join(SCRIPT_DIR, 'runs', 'review-queue.json'));
+  const count = positiveInteger(takeOption(values, ['--count'], '100'), '--count');
+  const profile = takeOption(values, ['--profile'], 'node');
+  if (values.length) throw new Error(`unknown rank argument ${values[0]}`);
+  if (!SUPPORTED_PROFILES.includes(profile)) throw new Error(`--profile must be one of ${SUPPORTED_PROFILES.join(', ')}`);
+  const lake = await openCandidateLake(lakeFile);
+  const queue = await lake.rank({profile, count});
+  const report = {schema_version: 1, command: 'rank', profile, count: queue.length, queue};
+  await atomicWrite(output, `${JSON.stringify(report, null, 2)}\n`);
+  return {...report, output};
+}
+
+async function runQualifyCommand(argv) {
+  const values = [...argv];
+  const queueFile = commandOutput(takeOption(values, ['--queue']), path.join(SCRIPT_DIR, 'runs', 'review-queue.json'));
+  const lakeFile = commandOutput(takeOption(values, ['--lake']), DEFAULT_LAKE);
+  const output = commandOutput(takeOption(values, ['--out', '--output']), path.join(SCRIPT_DIR, 'runs', 'qualifications.json'));
+  const countValue = takeOption(values, ['--count'], null);
+  const concurrency = positiveInteger(takeOption(values, ['--concurrency'], '4'), '--concurrency');
+  if (concurrency > 12) throw new Error('--concurrency must be at most 12');
+  const profile = takeOption(values, ['--profile'], 'node');
+  const reviewScript = commandOutput(takeOption(values, ['--review-script']), DEFAULT_REVIEWER);
+  const timeoutSeconds = positiveInteger(takeOption(values, ['--review-timeout-seconds'], '300'), '--review-timeout-seconds');
+  if (values.length) throw new Error(`unknown qualify argument ${values[0]}`);
+  const loaded = JSON.parse(await readFile(queueFile, 'utf8'));
+  const queue = Array.isArray(loaded) ? loaded : loaded.queue;
+  if (!Array.isArray(queue)) throw new Error('review queue must be an array or an object with queue[]');
+  const lake = await openCandidateLake(lakeFile);
+  const results = await qualifyQueueRecords(queue, {
+    lake, profile, count: countValue ? positiveInteger(countValue, '--count') : queue.length,
+    concurrency, reviewScript, reviewTimeoutMs: timeoutSeconds * 1000,
+  });
+  const report = {schema_version: 1, command: 'qualify', profile, queue_file: queueFile,
+    accepted: results.filter((item) => ['ACCEPTED', 'CACHED_ACCEPT'].includes(item.state)).length, results};
+  await atomicWrite(output, `${JSON.stringify(report, null, 2)}\n`);
+  return {...report, output};
+}
+
+async function runImportCommand(argv) {
+  const values = [...argv];
+  const lakeFile = commandOutput(takeOption(values, ['--lake', '--out']), DEFAULT_LAKE);
+  if (!values.length) throw new Error('import requires one or more Batch 3 JSON/JSONL files');
+  if (values.some((value) => value.startsWith('--'))) throw new Error(`unknown import argument ${values.find((value) => value.startsWith('--'))}`);
+  const lake = await openCandidateLake(lakeFile);
+  return {schema_version: 1, command: 'import', lake: lake.database, ...(await lake.importFiles(values))};
+}
+
+async function subcommandMain(command, argv) {
+  const handlers = {crawl: runCrawlCommand, rank: runRankCommand, qualify: runQualifyCommand, import: runImportCommand};
+  const report = await handlers[command](argv);
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+}
+
 async function main() {
   let config;
   try {
@@ -1557,9 +2077,11 @@ async function main() {
     ]);
     const cooldowns = Object.fromEntries(Object.entries(repoPolicy.cooldowns ?? {})
       .map(([repository, value]) => [repository.toLowerCase(), value]));
+    config.repoPolicy = repoPolicy;
+    config.repoPolicySha = sha256(Buffer.from(canonical(repoPolicy)));
     const plan = buildSearchPlan(config);
     await checkRateLimits(config, plan, deadline, audit);
-    const northsetOpen = await openNorthsetRepositories(config, deadline, audit);
+    const northsetPolicyCounts = await openNorthsetPolicyCounts(config, deadline, audit);
     const searched = await discover(config, plan, deadline, audit);
     const discovered = mergeIncludedCandidates(searched, included);
     audit.add('discovery_completed', {
@@ -1572,7 +2094,9 @@ async function main() {
     const filtered = filterDiscovered(discovered, {
       seen,
       cooldowns,
-      northsetOpenRepositories: northsetOpen,
+      northsetOpenCounts: northsetPolicyCounts.openCounts,
+      northsetDailyCounts: northsetPolicyCounts.dailyCounts,
+      repoPolicy,
       preflightLimit: config.preflightLimit,
       included,
       includeOnly: config.includeOnly,
@@ -1703,5 +2227,14 @@ async function main() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT_FILE) {
-  await main();
+  const command = process.argv[2];
+  if (['crawl', 'rank', 'qualify', 'import'].includes(command)) {
+    try { await subcommandMain(command, process.argv.slice(3)); }
+    catch (error) {
+      console.error(`find ${command} error: ${error.message}`);
+      process.exitCode = 1;
+    }
+  } else {
+    await main();
+  }
 }
