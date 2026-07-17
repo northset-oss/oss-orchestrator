@@ -27,7 +27,7 @@ function auditedPatchPaths(patch) {
   for (const line of String(patch).split('\n')) {
     if (line.startsWith('diff --git ')) {
       if (current) sections.push(current);
-      current = {oldPath: null, newPath: null, addedLines: []};
+      current = {oldPath: null, newPath: null, addedLines: [], removedLines: []};
       continue;
     }
     if (!current) continue;
@@ -37,6 +37,8 @@ function auditedPatchPaths(patch) {
       current.newPath = line === '+++ /dev/null' ? null : parsePatchPath(line.slice(4), 'b/');
     } else if (line.startsWith('+') && !line.startsWith('+++')) {
       current.addedLines.push(line.slice(1));
+    } else if (line.startsWith('-') && !line.startsWith('---')) {
+      current.removedLines.push(line.slice(1));
     }
   }
   if (current) sections.push(current);
@@ -53,6 +55,11 @@ function patchAddsToPaths(audited, text, paths) {
   return audited.sections.some((section) =>
     allowed.has(section.newPath ?? section.oldPath) &&
     section.addedLines.some((line) => line.includes(text)));
+}
+
+function assertionSyntaxOutsideStrings(line) {
+  const code = line.replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '');
+  return /\bexpect\s*(?:\.|\()|(?:^|[^\w])(?:debug_)?assert(?:_[a-z0-9_]+)?!\s*\(|\bassert(?:\s+|[.(!])|\bassert[A-Z][A-Za-z0-9_]*\s*\(|\b(?:must|should)\s*(?:\.|\()|\.(?:must|should)\b/i.test(code);
 }
 
 export function normalizedPrClaimText(body) {
@@ -118,7 +125,9 @@ export function reviewPatch({spec, classes, patch, prBody}) {
     }
   }
 
-  const blocked = classes.filter((item) => FAST_LANE_BLOCKED_CLASSES.has(item.class));
+  const allowedNonproduction = new Set(spec.allow_nonproduction_paths ?? []);
+  const blocked = classes.filter((item) => FAST_LANE_BLOCKED_CLASSES.has(item.class) &&
+    !(item.class === 'nonproduction' && allowedNonproduction.has(item.path)));
   if (blocked.length) {
     blocking.push(`fast lane forbids ${blocked.map((item) => `${item.class}:${item.path}`).join(', ')}`);
   }
@@ -127,6 +136,10 @@ export function reviewPatch({spec, classes, patch, prBody}) {
     blocking.push(`fast lane forbids modified existing tests unless the spec explicitly elevates them: ${modifiedTests.map((item) => item.path).join(', ')}`);
   } else if (modifiedTests.length) {
     risks.push({code: 'modified-existing-test-elevated', files: modifiedTests.map((item) => item.path)});
+  }
+  const elevatedNonproduction = classes.filter((item) => item.class === 'nonproduction' && allowedNonproduction.has(item.path));
+  if (elevatedNonproduction.length) {
+    risks.push({code: 'nonproduction-path-elevated', files: elevatedNonproduction.map((item) => item.path)});
   }
   if (/^GIT binary patch$/m.test(patch) || /^new file mode 120000$/m.test(patch) || /^rename (?:from|to) /m.test(patch)) {
     blocking.push('patch bytes contain binary, symlink, or rename metadata');
@@ -159,7 +172,11 @@ export function reviewPatch({spec, classes, patch, prBody}) {
     blocking.push('production change does not touch any source-evidence path');
   }
 
-  if (modifiedTests.length && /^-.*\b(?:assert|expect|should|must)\b/im.test(patch)) {
+  const modifiedTestPaths = new Set(modifiedTests.map((item) => item.path));
+  const removesTestAssertion = audited.sections.some((section) =>
+    modifiedTestPaths.has(section.newPath ?? section.oldPath) &&
+    section.removedLines.some(assertionSyntaxOutsideStrings));
+  if (removesTestAssertion) {
     blocking.push('modified existing test removes an assertion-like line');
   }
   const overclaims = lintPrOverclaims(prBody);

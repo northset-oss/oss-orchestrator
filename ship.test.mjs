@@ -227,6 +227,21 @@ test('attestation selection prefers success and treats same-head skipped runs as
   assert.deepEqual(ship.workflowRunOutcome(runs.slice(0, 1), oid('a')), {status: 'pending'});
 });
 
+test('release asset download falls back only for GitHub REST 503', async () => {
+  const ship = await import('./ship.mjs');
+  assert.equal(ship.releaseAssetUrl('run-record-M-176-abc', 'M-176-abc.tar.gz'),
+    'https://github.com/northset-oss/verification-pilot/releases/download/run-record-M-176-abc/M-176-abc.tar.gz');
+  assert.equal(ship.shouldFallbackReleaseDownload({code: 1, stdout: '', stderr: 'HTTP 503: 503 Service Unavailable'}), true);
+  assert.equal(ship.shouldFallbackReleaseDownload({code: 1, stdout: '', stderr: 'HTTP 404: Not Found'}), false);
+  assert.equal(ship.publicAttestationApiUrl('sha256:abc'),
+    'https://api.github.com/repos/northset-oss/verification-pilot/attestations/sha256:abc?per_page=30&predicate_type=https%3A%2F%2Fslsa.dev%2Fprovenance%2Fv1');
+  assert.equal(ship.decodeSnappyBlock(Buffer.from([
+    9,
+    8, 97, 98, 99,
+    22, 3, 0,
+  ])).toString('utf8'), 'abcabcabc');
+});
+
 test('a changed manifest archives a terminal attempt while the same terminal manifest stays terminal', async () => {
   const ship = await import('./ship.mjs');
   const existing = {
@@ -238,6 +253,9 @@ test('a changed manifest archives a terminal attempt while the same terminal man
   ), 'archive-and-retry');
   assert.equal(ship.terminalJournalDisposition(existing, digest('c'), digest('d')), 'archive-and-restart');
   assert.equal(ship.terminalJournalDisposition(existing, digest('c'), digest('b')), 'terminal');
+  assert.equal(ship.terminalJournalDisposition(
+    existing, digest('c'), digest('b'), {retryInfraTerminal: true},
+  ), 'reject');
   assert.deepEqual(existing, {
     state: 'FAILED_INFRA_TERMINAL', approved_manifest: digest('a'), mission_manifest: digest('b'),
   });
@@ -245,8 +263,10 @@ test('a changed manifest archives a terminal attempt while the same terminal man
 
 test('an explicit infrastructure retry resumes after the last completed state and preserves evidence', async () => {
   const ship = await import('./ship.mjs');
+  const originalApproval = new Date('2026-07-14T12:00:00Z');
   const prior = {
-    ...ship.newJournal(subject('M-021', 'one/repo'), digest('a'), digest('b'), new Date('2026-07-14T12:00:00Z')),
+    ...ship.newJournal(subject('M-021', 'one/repo'), digest('a'), digest('b'), originalApproval,
+      {approvedBy: 'internal-user:original'}),
     state: 'FAILED_INFRA_TERMINAL', retry_count: 1, terminal_reason: 'checks lagged',
     transitions: [
       {state: 'APPROVED', at: '2026-07-14T12:00:00Z'},
@@ -257,12 +277,28 @@ test('an explicit infrastructure retry resumes after the last completed state an
     pr: {url: 'https://github.com/one/repo/pull/21'}, disclosure: {verified_at: '2026-07-14T12:05:00Z'},
   };
   const retried = ship.retryJournal(prior, subject('M-021', 'one/repo'), digest('a'), digest('b'),
-    'ship-journal-archive/prior.json', new Date('2026-07-14T12:07:00Z'));
+    'ship-journal-archive/prior.json', {
+      approvedBy: 'internal-user:original', approvedAt: originalApproval,
+      retriedAt: new Date('2026-07-14T12:07:00Z'),
+    });
   assert.equal(retried.state, 'DISCLOSURE_SYNCED');
   assert.equal(retried.retry_count, 0);
+  assert.equal(retried.approved_by, 'internal-user:original');
+  assert.equal(retried.approved_at, originalApproval.toISOString());
+  assert.equal(retried.started_at, '2026-07-14T12:07:00.000Z');
   assert.deepEqual(retried.pr, prior.pr);
   assert.deepEqual(retried.disclosure, prior.disclosure);
   assert.equal(retried.prior_attempt.archive_file, 'ship-journal-archive/prior.json');
+  const currentApproval = new Date('2026-07-14T12:08:00Z');
+  const reapproved = ship.retryJournal(prior, subject('M-021', 'one/repo'), digest('c'), digest('b'),
+    'ship-journal-archive/reapproved.json', {
+      approvedBy: 'internal-user:current', approvedAt: currentApproval,
+      retriedAt: new Date('2026-07-14T12:09:00Z'),
+    });
+  assert.equal(reapproved.approved_manifest, digest('c'));
+  assert.equal(reapproved.approved_by, 'internal-user:current');
+  assert.equal(reapproved.approved_at, currentApproval.toISOString());
+  assert.equal(reapproved.transitions[0].at, '2026-07-14T12:09:00.000Z');
 });
 
 test('a final envelope already merged on main is adopted only when its exact bytes match', async () => {
@@ -270,6 +306,20 @@ test('a final envelope already merged on main is adopted only when its exact byt
   const publication = Buffer.from('{"state":"open"}\n');
   assert.equal(ship.samePublishedEnvelope(publication, Buffer.from(publication)), true);
   assert.equal(ship.samePublishedEnvelope(publication, Buffer.from('{"state":"prepared"}\n')), false);
+});
+
+test('an already-merged prepared batch is adopted only from its exact branch', async () => {
+  const ship = await import('./ship.mjs');
+  const branch = 'northset/batch-0123456789abcdef-prepared';
+  const recovered = ship.selectMergedLedgerPublication([
+    {headRefName: 'northset/other-prepared', baseRefName: 'main', state: 'MERGED', url: 'https://github.com/northset-oss/verification-pilot/pull/1', mergeCommit: {oid: oid('a')}},
+    {headRefName: branch, baseRefName: 'main', state: 'MERGED', url: 'https://github.com/northset-oss/verification-pilot/pull/2', mergeCommit: {oid: oid('b')}},
+  ], branch);
+  assert.deepEqual(recovered, {
+    commitSha: oid('b'),
+    prUrl: 'https://github.com/northset-oss/verification-pilot/pull/2',
+  });
+  assert.equal(ship.selectMergedLedgerPublication([], branch), null);
 });
 
 test('ledger publication stages the whole generated site and never targets main directly', async () => {

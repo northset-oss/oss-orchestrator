@@ -63,6 +63,14 @@ export function ledgerBranch(missionId, phase) {
   return `northset/${missionId.toLowerCase()}-${phase}`;
 }
 
+export function selectMergedLedgerPublication(pullRequests, branch) {
+  const match = pullRequests.find((item) => item.headRefName === branch
+    && item.baseRefName === 'main'
+    && item.state === 'MERGED'
+    && /^[0-9a-f]{40}$/i.test(item.mergeCommit?.oid ?? ''));
+  return match ? {commitSha: match.mergeCommit.oid, prUrl: match.url} : null;
+}
+
 export function disclosureSyncArgs(ledgerDir, missionId, prUrl, now) {
   return [
     path.join(ledgerDir, 'bin', 'pr-receipt-disclosure.mjs'), 'sync',
@@ -75,8 +83,8 @@ export function disclosureSyncArgs(ledgerDir, missionId, prUrl, now) {
 export function terminalJournalDisposition(journal, approvedManifest, missionManifest, {retryInfraTerminal = false} = {}) {
   if (!journal || !isTerminalShipState(journal.state)) return 'resume';
   if (journal.mission_manifest === missionManifest) {
-    if (retryInfraTerminal && journal.state === 'FAILED_INFRA_TERMINAL' && journal.approved_manifest === approvedManifest) {
-      return 'archive-and-retry';
+    if (retryInfraTerminal && journal.state === 'FAILED_INFRA_TERMINAL') {
+      return journal.approved_manifest === approvedManifest ? 'archive-and-retry' : 'reject';
     }
     return 'terminal';
   }
@@ -136,16 +144,25 @@ export function approvalRecord({spec, manifest, journal}) {
   };
 }
 
-export function retryJournal(prior, manifest, approvedManifest, missionManifest, archiveFile, now = new Date()) {
+export function retryJournal(prior, manifest, approvedManifest, missionManifest, archiveFile, {
+  approvedBy, approvedAt, retriedAt = new Date(),
+} = {}) {
+  if (typeof approvedBy !== 'string' || !approvedBy.trim()) {
+    throw new Error('infrastructure retry requires the current approval actor');
+  }
+  if (!(approvedAt instanceof Date) || !Number.isFinite(approvedAt.getTime()) ||
+      !(retriedAt instanceof Date) || !Number.isFinite(retriedAt.getTime())) {
+    throw new Error('infrastructure retry requires valid approval and retry times');
+  }
   const resumeState = [...(prior.transitions ?? [])].reverse()
     .find((transition) => !isTerminalShipState(transition.state))?.state ?? 'APPROVED';
-  const next = newJournal(manifest, approvedManifest, missionManifest, now, {approvedBy: prior.approved_by ?? null});
-  next.approved_at = prior.approved_at;
+  const next = newJournal(manifest, approvedManifest, missionManifest, retriedAt, {approvedBy});
+  next.approved_at = approvedAt.toISOString();
   for (const field of ['fork', 'ledger', 'pr', 'disclosure', 'envelope']) {
     if (prior[field] !== undefined) next[field] = prior[field];
   }
   next.state = resumeState;
-  next.transitions = [{state: resumeState, at: now.toISOString(), reason: 'explicit retry of archived infrastructure failure'}];
+  next.transitions = [{state: resumeState, at: retriedAt.toISOString(), reason: 'explicit retry of archived infrastructure failure'}];
   next.prior_attempt = {
     archive_file: archiveFile,
     state: prior.state,
@@ -477,6 +494,123 @@ function expectedRelease(manifest) {
     asset,
     uri: `https://github.com/${VERIFICATION_REPO}/releases/download/${tag}/${asset}`,
   };
+}
+
+export function releaseAssetUrl(tag, asset) {
+  return `https://github.com/${VERIFICATION_REPO}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(asset)}`;
+}
+
+export function shouldFallbackReleaseDownload(result) {
+  return result?.code !== 0 && /(?:HTTP\s+503|503\s+Service\s+Unavailable)/i
+    .test(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`);
+}
+
+export function publicAttestationApiUrl(digest) {
+  const predicate = encodeURIComponent('https://slsa.dev/provenance/v1');
+  return `https://api.github.com/repos/${VERIFICATION_REPO}/attestations/${digest}?per_page=30&predicate_type=${predicate}`;
+}
+
+export function decodeSnappyBlock(input, {maxOutputBytes = 10_000_000} = {}) {
+  const source = Buffer.from(input);
+  let inputOffset = 0;
+  let expectedLength = 0;
+  let shift = 0;
+  while (inputOffset < source.length && shift <= 28) {
+    const byte = source[inputOffset++];
+    expectedLength += (byte & 0x7f) * (2 ** shift);
+    if ((byte & 0x80) === 0) break;
+    shift += 7;
+  }
+  if (!Number.isSafeInteger(expectedLength) || expectedLength < 0 || expectedLength > maxOutputBytes || shift > 28) {
+    throw new Error('Snappy bundle declares an invalid output length');
+  }
+  const output = Buffer.alloc(expectedLength);
+  let outputOffset = 0;
+  while (outputOffset < expectedLength) {
+    if (inputOffset >= source.length) throw new Error('Snappy bundle ended before its declared output length');
+    const tag = source[inputOffset++];
+    const type = tag & 0x03;
+    if (type === 0) {
+      let length = tag >>> 2;
+      if (length < 60) {
+        length += 1;
+      } else {
+        const bytes = length - 59;
+        if (inputOffset + bytes > source.length) throw new Error('Snappy literal length is truncated');
+        length = 1;
+        for (let index = 0; index < bytes; index += 1) {
+          length += source[inputOffset++] * (2 ** (8 * index));
+        }
+      }
+      if (inputOffset + length > source.length || outputOffset + length > expectedLength) {
+        throw new Error('Snappy literal exceeds its input or output bounds');
+      }
+      source.copy(output, outputOffset, inputOffset, inputOffset + length);
+      inputOffset += length;
+      outputOffset += length;
+      continue;
+    }
+
+    let length;
+    let offset;
+    if (type === 1) {
+      if (inputOffset >= source.length) throw new Error('Snappy one-byte copy is truncated');
+      length = 4 + ((tag >>> 2) & 0x07);
+      offset = ((tag & 0xe0) << 3) | source[inputOffset++];
+    } else {
+      const bytes = type === 2 ? 2 : 4;
+      if (inputOffset + bytes > source.length) throw new Error('Snappy copy offset is truncated');
+      length = 1 + (tag >>> 2);
+      offset = 0;
+      for (let index = 0; index < bytes; index += 1) {
+        offset += source[inputOffset++] * (2 ** (8 * index));
+      }
+    }
+    if (!Number.isSafeInteger(offset) || offset < 1 || offset > outputOffset || outputOffset + length > expectedLength) {
+      throw new Error('Snappy copy exceeds its output bounds');
+    }
+    for (let index = 0; index < length; index += 1) {
+      output[outputOffset] = output[outputOffset - offset];
+      outputOffset += 1;
+    }
+  }
+  if (inputOffset !== source.length) throw new Error('Snappy bundle has trailing bytes');
+  return output;
+}
+
+async function downloadPublicAttestationBundle(asset, root, deadline) {
+  const digest = sha256(await readFile(asset));
+  const responseFile = path.join(root, 'attestations.json');
+  await must('download public attestation bundle', await shipRun(deadline, 'curl', [
+    '--fail', '--location', '--silent', '--show-error',
+    '--header', 'Accept: application/vnd.github+json',
+    '--output', responseFile, publicAttestationApiUrl(digest),
+  ]));
+  const response = JSON.parse(await readFile(responseFile, 'utf8'));
+  const bundles = [];
+  const attestations = Array.isArray(response?.attestations) ? response.attestations : [];
+  for (let index = 0; index < attestations.length; index += 1) {
+    const item = attestations[index];
+    if (item?.bundle && typeof item.bundle === 'object' && !Array.isArray(item.bundle)) {
+      bundles.push(item.bundle);
+      continue;
+    }
+    let bundleUrl;
+    try { bundleUrl = new URL(item?.bundle_url); }
+    catch { continue; }
+    if (bundleUrl.protocol !== 'https:' || bundleUrl.username || bundleUrl.password || bundleUrl.port
+        || !bundleUrl.hostname.endsWith('.blob.core.windows.net')) continue;
+    const compressed = path.join(root, `attestation-${index}.snappy`);
+    await must('download public attestation blob', await shipRun(deadline, 'curl', [
+      '--fail', '--location', '--silent', '--show-error', '--output', compressed, bundleUrl.href,
+    ]));
+    const bundle = JSON.parse(decodeSnappyBlock(await readFile(compressed)).toString('utf8'));
+    if (bundle && typeof bundle === 'object' && !Array.isArray(bundle)) bundles.push(bundle);
+  }
+  if (!bundles.length) throw new Error('public attestation endpoint returned no bundles');
+  const bundleFile = path.join(root, 'attestations.jsonl');
+  await writeFile(bundleFile, `${bundles.map((bundle) => JSON.stringify(bundle)).join('\n')}\n`, {mode: 0o600});
+  return bundleFile;
 }
 
 export function canonicalReceiptUrl(missionId) {
@@ -835,10 +969,27 @@ async function verifyReleasedBundle(subject, journal, journalFile, log) {
   const root = await mkdtemp(path.join(os.tmpdir(), `${subject.manifest.mission_id}-attestation-`));
   try {
     const asset = path.join(root, release.asset);
-    await must('download release asset', await shipRun(deadline, 'gh', ['release', 'download', release.tag, '--repo', VERIFICATION_REPO,
-      '--pattern', release.asset, '--dir', root]));
-    await must('verify GitHub attestation', await shipRun(deadline, 'gh', ['attestation', 'verify', asset, '--repo', VERIFICATION_REPO,
-      '--signer-workflow', `${VERIFICATION_REPO}/.github/workflows/${WORKFLOW_FILE}`]));
+    const download = await shipRun(deadline, 'gh', ['release', 'download', release.tag, '--repo', VERIFICATION_REPO,
+      '--pattern', release.asset, '--dir', root]);
+    if (download.code !== 0) {
+      if (!shouldFallbackReleaseDownload(download)) await must('download release asset', download);
+      await must('download public release asset fallback', await shipRun(deadline, 'curl', [
+        '--fail', '--location', '--silent', '--show-error', '--output', asset,
+        releaseAssetUrl(release.tag, release.asset),
+      ]));
+    }
+    const verifyArgs = ['attestation', 'verify', asset, '--repo', VERIFICATION_REPO,
+      '--signer-workflow', `${VERIFICATION_REPO}/.github/workflows/${WORKFLOW_FILE}`];
+    const onlineVerification = await shipRun(deadline, 'gh', verifyArgs);
+    if (onlineVerification.code !== 0) {
+      if (!shouldFallbackReleaseDownload(onlineVerification)) {
+        await must('verify GitHub attestation', onlineVerification);
+      }
+      const bundleFile = await downloadPublicAttestationBundle(asset, root, deadline);
+      await must('verify offline GitHub attestation', await shipRun(deadline, 'gh', [
+        ...verifyArgs, '--bundle', bundleFile,
+      ]));
+    }
     const extract = path.join(root, 'extract');
     await mkdir(extract);
     await must('extract release bundle', await shipRun(deadline, 'tar', ['-xzf', asset, '-C', extract]));
@@ -1184,15 +1335,26 @@ async function publishPreparedLedgerBatch(subjects, approvedDigest, log) {
   }
   const accepted = staging.accepted;
   if (!accepted.length) return {published: null, accepted, rejected: staging.rejected};
-  await rebuildLedger(deadline);
   const short = approvedDigest.slice('sha256:'.length, 'sha256:'.length + 16);
+  const branch = ledgerBranch(`batch-${short}`, 'prepared');
+  let published = null;
+  if (staging.created.length === 0) {
+    const listed = JSON.parse((await must('find merged prepared ledger batch', await shipRun(deadline, 'gh', [
+      'pr', 'list', '--repo', VERIFICATION_REPO, '--state', 'all', '--head', branch, '--limit', '10',
+      '--json', 'number,url,state,headRefName,baseRefName,mergeCommit',
+    ]))).stdout);
+    published = selectMergedLedgerPublication(listed, branch);
+  }
   const paths = [...new Set(accepted.flatMap((subject) => ledgerPaths(subject.manifest.mission_id)))];
-  const published = await publishLedgerPullRequest(
-    paths,
-    `batch: publish ${accepted.length} prepared receipt${accepted.length === 1 ? '' : 's'} ${short}`,
-    `missions/${accepted[0].manifest.mission_id}/bundle/bundle.manifest.json`,
-    {missionId: `batch-${short}`, phase: 'prepared'}, deadline,
-  );
+  if (published === null) {
+    await rebuildLedger(deadline);
+    published = await publishLedgerPullRequest(
+      paths,
+      `batch: publish ${accepted.length} prepared receipt${accepted.length === 1 ? '' : 's'} ${short}`,
+      `missions/${accepted[0].manifest.mission_id}/bundle/bundle.manifest.json`,
+      {missionId: `batch-${short}`, phase: 'prepared'}, deadline,
+    );
+  }
   for (const subject of accepted) {
     const remote = JSON.parse((await remotePublicFile(
       `missions/${subject.manifest.mission_id}/bundle/bundle.manifest.json`, published.commitSha, deadline,
@@ -1464,6 +1626,7 @@ export async function shipBatch(items, {
         const archiveFile = await archiveTerminalJournal(subject);
         subject.journal = retryJournal(
           prior, subject.manifest, approvedDigest, missionManifest, archiveFile,
+          {approvedBy, approvedAt, retriedAt: new Date()},
         );
         await saveJournal(subject.journalFile, subject.journal);
       } else if (disposition === 'archive-and-restart') {

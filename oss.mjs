@@ -41,6 +41,7 @@ const RUN_MISSION = path.join(NORTHSET_OSS, 'bin', 'run-mission.mjs');
 const BUNDLE_CLI = path.join(NORTHSET_OSS, 'bin', 'bundle.mjs');
 const READY_TTL_HOURS = 8;
 export const PREPARE_BUDGET_MS = 60 * 60 * 1000;
+export const MAX_ELEVATED_EXISTING_TESTS = 2;
 const AUTHOR_IMAGE = process.env.OSS_AUTHOR_IMAGE ?? 'northset-oss-author:0.144.1';
 const DEPENDENCY_CACHE_ROOT = process.env.OSS_DEPENDENCY_CACHE_DIR ?? path.join(HERE, 'cache', 'dependencies');
 const REPOSITORY_MIRROR_ROOT = process.env.OSS_REPOSITORY_MIRROR_DIR ?? path.join(HERE, 'cache', 'repos');
@@ -296,7 +297,7 @@ export async function dependencyCacheKey(spec, repo, image) {
   return sha256(Buffer.from(canonical({
     repository: `${candidate.owner}/${candidate.repo}`.toLowerCase(),
     candidate: spec.candidate.toLowerCase(),
-    mission_id: spec.mission_id,
+    mission_id: spec.task_id ?? spec.mission_id,
     base_commit: spec.base_commit.toLowerCase(),
     profile: spec.executor.profile,
     image,
@@ -734,13 +735,17 @@ export async function normalizeAuthorResult(spec, repo, ready, deadline = null) 
   const classes = classifyChangedFiles(changed.baseFiles, changed.entries);
   const permitted = spec.allow_modified_existing_tests === true
     ? ['source', 'added-test', 'modified-existing-test'] : ['source', 'added-test'];
-  const forbidden = classes.filter((item) => !permitted.includes(item.class));
+  const allowedNonproduction = new Set(spec.allow_nonproduction_paths ?? []);
+  const forbidden = classes.filter((item) => !permitted.includes(item.class) &&
+    !(item.class === 'nonproduction' && allowedNonproduction.has(item.path)));
   if (forbidden.length) throw new Error(`initial lane forbids changed class(es): ${forbidden.map((item) => `${item.class}:${item.path}`).join(', ')}`);
   const modifiedTests = classes.filter((item) => item.class === 'modified-existing-test');
   if (modifiedTests.length && spec.allow_modified_existing_tests !== true) {
     throw new Error(`fast lane forbids modified existing tests: ${modifiedTests.map((item) => item.path).join(', ')}`);
   }
-  if (modifiedTests.length > 1) throw new Error(`elevated lane allows at most one modified existing test, got ${modifiedTests.length}`);
+  if (modifiedTests.length > MAX_ELEVATED_EXISTING_TESTS) {
+    throw new Error(`elevated lane allows at most ${MAX_ELEVATED_EXISTING_TESTS} modified existing tests, got ${modifiedTests.length}`);
+  }
   assertOracleChangedPaths(spec, classes);
   if (spec.work_category === 'defect_fix' && !classes.some((item) => item.class === 'source')) {
     throw new Error('defect_fix must modify at least one production-source file');
@@ -957,7 +962,7 @@ export async function completeOracleWithCanonicalVerification(oracle, bundle) {
 
 export function buildEconomicInput(spec, {
   missionSha256, issueSnapshotSha256, result, authorUsage, timings,
-  totalDurationMs, attempts,
+  totalDurationMs, attempts, issueUrl = spec.issue_url,
 }) {
   if (spec.schema_version !== 2) return null;
   const resource = limits(spec);
@@ -973,7 +978,7 @@ export function buildEconomicInput(spec, {
       work_category: spec.work_category,
       external_demand: {
         source: 'public_github_issue',
-        issue_url: spec.issue_url,
+        issue_url: issueUrl,
         acceptance_contract_digest: sha256(Buffer.from(canonical(qualification.acceptance_contract), 'utf8')),
         invitation_type: qualification.invitation_evidence.type,
         invitation_url: qualification.invitation_evidence.url,
@@ -1094,8 +1099,38 @@ export function buildEconomicInput(spec, {
   };
 }
 
+export function canonicalIssueUrlFromSnapshot(specIssueUrl, issueSnapshotBytes) {
+  let snapshot;
+  try { snapshot = JSON.parse(issueSnapshotBytes); }
+  catch { throw new Error('issue snapshot is not valid JSON'); }
+  const canonicalUrl = snapshot?.issue?.html_url;
+  if (typeof canonicalUrl !== 'string' || !canonicalUrl) {
+    throw new Error('issue snapshot is missing issue.html_url');
+  }
+  let expected;
+  let observed;
+  try {
+    expected = new URL(specIssueUrl);
+    observed = new URL(canonicalUrl);
+  } catch {
+    throw new Error('issue snapshot issue.html_url is not a valid URL');
+  }
+  const sameIdentity = expected.protocol === 'https:'
+    && observed.protocol === 'https:'
+    && expected.hostname.toLowerCase() === 'github.com'
+    && observed.hostname.toLowerCase() === 'github.com'
+    && expected.pathname.toLowerCase() === observed.pathname.toLowerCase()
+    && expected.search === observed.search
+    && expected.hash === observed.hash;
+  if (!sameIdentity) throw new Error('issue snapshot issue.html_url does not match the mission issue URL');
+  return canonicalUrl;
+}
+
 function publicMissionInput(spec, repoDir, patchFile, issueSnapshotFile, image, result, economicContext = null) {
   const {owner} = parseCandidate(spec.candidate);
+  const issueOrTask = economicContext?.issueSnapshotBytes
+    ? canonicalIssueUrlFromSnapshot(spec.issue_url, economicContext.issueSnapshotBytes)
+    : spec.issue_url;
   const mission = {
       mission_id: spec.mission_id,
       variant: 'author_contribution',
@@ -1106,7 +1141,7 @@ function publicMissionInput(spec, repoDir, patchFile, issueSnapshotFile, image, 
       northset_role: 'worker_runtime_operator',
       external_counterparty: `${owner} maintainers`,
       target_repo: spec.target_repo,
-      issue_or_task: spec.issue_url,
+      issue_or_task: issueOrTask,
       consent_artifact: null,
       repo_policy_snapshot: spec.receipt?.repo_policy_snapshot ?? null,
       worker_identity: {runtime: 'northset-oss executor v1', human_operator: 'aeziz'},
@@ -1149,6 +1184,7 @@ function publicMissionInput(spec, repoDir, patchFile, issueSnapshotFile, image, 
     if (!economicContext?.issueSnapshotBytes) throw new Error('schema-v2 verification requires economic capture context');
     input.economic = buildEconomicInput(spec, {
       ...economicContext,
+      issueUrl: issueOrTask,
       missionSha256: sha256(Buffer.from(`${JSON.stringify(mission, null, 2)}\n`)),
       issueSnapshotSha256: sha256(economicContext.issueSnapshotBytes),
     });

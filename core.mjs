@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const DEFAULT_OUTPUT_LIMIT_BYTES = 2_000_000;
+export const LIVE_RECHECK_OUTPUT_LIMIT_BYTES = 10_000_000;
 const KILL_GRACE_MS = 2_000;
 const ACTIVE_CHILDREN = new Set();
 let shuttingDown = false;
@@ -356,17 +357,47 @@ export function qualificationSourceEvidencePaths(spec, {required = false} = {}) 
 }
 
 function oracleCommandTargets(command, testPaths) {
-  if (/[\n;&|`]/.test(command)) throw new Error('oracle.command must be one single focused command');
-  const tokens = command.trim().split(/\s+/).map((token) => {
+  const vitestScratchPrefixes = [
+    'ln -s /workspace/repo/node_modules /tmp/node_modules && cp vitest.config.ts /tmp/vitest.config.ts && ',
+    'ln -s "$PWD/node_modules" /tmp/node_modules && cp vitest.config.ts /tmp/vitest.config.ts && ',
+  ];
+  const vitestScratchPrefix = vitestScratchPrefixes.find((prefix) => command.startsWith(prefix));
+  const focusedCommand = vitestScratchPrefix ? command.slice(vitestScratchPrefix.length) : command;
+  if (/[\n;&|`]/.test(focusedCommand)) throw new Error('oracle.command must be one single focused command');
+  const tokens = focusedCommand.trim().split(/\s+/).map((token) => {
     if ((token.startsWith("'") && token.endsWith("'")) || (token.startsWith('"') && token.endsWith('"'))) {
       return token.slice(1, -1);
     }
     return token;
   });
-  const dirIndex = tokens.indexOf('--dir');
-  const workingDirectory = dirIndex >= 0 ? tokens[dirIndex + 1]?.replace(/^\.\//, '').replace(/\/$/, '') : null;
+  const noncanonicalDirectoryControl = tokens.find((token) =>
+    token === '-C' || /^-C(?:=|[^-])/.test(token) || /^--(?:dir|prefix)=/.test(token));
+  if (noncanonicalDirectoryControl) {
+    throw new Error(`oracle.command directory control ${noncanonicalDirectoryControl} is unsupported; use one canonical --dir PATH or --prefix PATH form`);
+  }
+  const directoryControlIndexes = tokens
+    .map((token, index) => ['--dir', '--prefix'].includes(token) ? index : -1)
+    .filter((index) => index >= 0);
+  if (directoryControlIndexes.length > 1) {
+    throw new Error('oracle.command may use only a single directory control flag');
+  }
+  const directoryIndex = directoryControlIndexes[0] ?? -1;
+  const workingDirectory = directoryIndex >= 0 ? tokens[directoryIndex + 1]?.replace(/^\.\//, '').replace(/\/$/, '') : null;
+  const fileNameIndex = tokens.indexOf('--file-name');
+  const fileName = fileNameIndex >= 0 ? tokens[fileNameIndex + 1] : null;
+  const treeSitterCommand = (tokens[0] === 'tree-sitter' && tokens[1] === 'test')
+    || (tokens[0] === 'npx' && tokens[1] === 'tree-sitter' && tokens[2] === 'test');
+  if (treeSitterCommand && fileName && tokens.some((token) =>
+    token === '-p' || token === '--grammar-path' || /^-p(?:=|[^-])/.test(token) || token.startsWith('--grammar-path='))) {
+    throw new Error('oracle.command tree-sitter --file-name shortcut cannot be combined with a grammar path');
+  }
+  const treeSitterFileNameTarget = typeof fileName === 'string'
+    && /^[^/]+$/.test(fileName)
+    && testPaths.length === 1
+    && treeSitterCommand;
   return testPaths.every((testPath) => {
     if (tokens.includes(testPath) || tokens.includes(`./${testPath}`)) return true;
+    if (treeSitterFileNameTarget && testPath === `test/corpus/${fileName}`) return true;
     if (!workingDirectory || workingDirectory.includes('..') || !testPath.startsWith(`${workingDirectory}/`)) return false;
     const relative = testPath.slice(workingDirectory.length + 1);
     return tokens.includes(relative) || tokens.includes(`./${relative}`);
@@ -676,6 +707,14 @@ export function validateSpec(spec) {
   if (spec.allow_modified_existing_tests !== undefined && typeof spec.allow_modified_existing_tests !== 'boolean') {
     throw new Error('allow_modified_existing_tests must be boolean when present');
   }
+  if (spec.allow_nonproduction_paths !== undefined) {
+    if (!Array.isArray(spec.allow_nonproduction_paths) || spec.allow_nonproduction_paths.length > 2 ||
+        !spec.allow_nonproduction_paths.every((item) => typeof item === 'string' && item.trim() &&
+          item === path.posix.normalize(item) && !path.posix.isAbsolute(item) && !item.startsWith('../')) ||
+        new Set(spec.allow_nonproduction_paths).size !== spec.allow_nonproduction_paths.length) {
+      throw new Error('allow_nonproduction_paths must contain at most two unique normalized relative paths');
+    }
+  }
   if (!spec.executor.commands.includes(spec.oracle.command)) throw new Error('oracle.command must be included in executor.commands');
   authorEffort(spec); // validates the optional executor.reasoning_effort override
   return spec;
@@ -758,20 +797,48 @@ export async function recheck(spec, log, options = {}) {
   const mode = options.mode ?? 'prepare';
   if (!['prepare', 'pre-public', 'pre-pr'].includes(mode)) throw new Error(`unknown recheck mode ${mode}`);
   const now = options.now ?? (() => new Date());
-  const gh = options.gh ?? ((args) => ghJson(args, {deadline: options.deadline, timeoutMs: 60_000}));
+  const gh = options.gh ?? ((args) => ghJson(args, {
+    deadline: options.deadline,
+    timeoutMs: 60_000,
+    outputLimitBytes: LIVE_RECHECK_OUTPUT_LIMIT_BYTES,
+  }));
   const {owner, repo, issue: num} = parseCandidate(spec.candidate);
   const repositoryKey = `${owner}/${repo}`;
   const policy = options.repoPolicy ?? await loadRepoPolicy();
   const policyEntry = repositoryPolicyEntry(policy, repositoryKey);
-  const repoData = await gh(['api', `repos/${owner}/${repo}`,
-    '--jq', '{default_branch,archived,fork,html_url}']);
+  let repoData;
+  try {
+    repoData = await gh(['api', `repos/${owner}/${repo}`,
+      '--jq', '{default_branch,archived,fork,html_url}']);
+  } catch (error) {
+    await log(`recheck: repository REST metadata failed; retrying through GitHub GraphQL — ${error.message}`);
+    repoData = await gh([
+      'api', 'graphql',
+      '-f', 'query=query($owner:String!, $name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}} isArchived isFork url}}',
+      '-F', `owner=${owner}`, '-F', `name=${repo}`,
+      '--jq', '.data.repository | {default_branch:.defaultBranchRef.name,default_head:.defaultBranchRef.target.oid,archived:.isArchived,fork:.isFork,html_url:.url}',
+    ]);
+  }
   const issue = await gh(['api', `repos/${owner}/${repo}/issues/${num}`,
     '--jq', '{number,state,title,html_url,assignees:[.assignees[].login],labels:[.labels[].name],created_at,updated_at,body,author_association,user:.user.login}']);
-  const commentPages = await gh(['api', `repos/${owner}/${repo}/issues/${num}/comments?per_page=100`, '--paginate', '--slurp']);
-  const comments = Array.isArray(commentPages) ? commentPages.flat() : [];
+  let comments;
+  try {
+    const commentPages = await gh(['api', `repos/${owner}/${repo}/issues/${num}/comments?per_page=100`, '--paginate', '--slurp']);
+    comments = Array.isArray(commentPages) ? commentPages.flat() : [];
+  } catch (error) {
+    await log(`recheck: issue comments REST check failed; retrying through GitHub GraphQL — ${error.message}`);
+    const response = await gh([
+      'api', 'graphql',
+      '-f', 'query=query($owner:String!, $name:String!, $number:Int!){repository(owner:$owner,name:$name){issue(number:$number){comments(last:100){nodes{url authorAssociation createdAt author{login __typename}} pageInfo{hasPreviousPage}}}}}',
+      '-F', `owner=${owner}`, '-F', `name=${repo}`, '-F', `number=${num}`,
+      '--jq', '{comments:[.data.repository.issue.comments.nodes[]|{html_url:.url,author_association:.authorAssociation,created_at:.createdAt,user:{login:(.author.login//""),type:(.author.__typename//"")}}],truncated:.data.repository.issue.comments.pageInfo.hasPreviousPage}',
+    ]);
+    if (response?.truncated || !Array.isArray(response?.comments)) throw new Error('issue comments GraphQL fallback was incomplete');
+    comments = response.comments;
+  }
   const defaultRef = mode === 'pre-pr' ? null
-    : await gh(['api', `repos/${owner}/${repo}/git/ref/heads/${repoData.default_branch}`]);
-  const defaultHead = defaultRef?.object?.sha ?? null;
+    : repoData.default_head ? null : await gh(['api', `repos/${owner}/${repo}/git/ref/heads/${repoData.default_branch}`]);
+  const defaultHead = repoData.default_head ?? defaultRef?.object?.sha ?? null;
   const allPrs = await gh(['pr', 'list', '--repo', `${owner}/${repo}`, '--state', 'all', '--limit', '500',
     '--json', 'number,title,body,url,state,headRefName,author,createdAt,updatedAt,closedAt,mergedAt']);
   const openPrs = allPrs.filter((pr) => pr.state === 'OPEN');
@@ -780,8 +847,20 @@ export async function recheck(spec, log, options = {}) {
   try {
     timeline = timelineCrossReferences(await gh(timelineApiArgs(owner, repo, num)));
   } catch (error) {
-    await log(`recheck: timeline check FAILED — ${error.message} (fail-closed → FAILED)`);
-    throw new Error(`timeline recheck failed (fail-closed): ${error.message}`);
+    await log(`recheck: timeline REST check failed; retrying through GitHub GraphQL — ${error.message}`);
+    try {
+      const response = await gh([
+        'api', 'graphql',
+        '-f', 'query=query($owner:String!, $name:String!, $number:Int!){repository(owner:$owner,name:$name){issue(number:$number){timelineItems(last:100,itemTypes:[CROSS_REFERENCED_EVENT]){nodes{... on CrossReferencedEvent{createdAt source{__typename ... on PullRequest{url state title} ... on Issue{url state title}}}} pageInfo{hasPreviousPage}}}}}',
+        '-F', `owner=${owner}`, '-F', `name=${repo}`, '-F', `number=${num}`,
+        '--jq', '{timeline:[.data.repository.issue.timelineItems.nodes[]|select(.source!=null)|{source:.source.url,state:(.source.state|ascii_downcase),title:.source.title,is_pr:(.source.__typename=="PullRequest"),created_at:.createdAt}],truncated:.data.repository.issue.timelineItems.pageInfo.hasPreviousPage}',
+      ]);
+      if (response?.truncated || !Array.isArray(response?.timeline)) throw new Error('timeline GraphQL fallback was incomplete');
+      timeline = response.timeline;
+    } catch (fallbackError) {
+      await log(`recheck: timeline check FAILED — ${fallbackError.message} (fail-closed → FAILED)`);
+      throw new Error(`timeline recheck failed (fail-closed): ${fallbackError.message}`);
+    }
   }
   const reviewedAt = Date.parse(spec.qualification.reviewed_at);
   const cleared = new Set(spec.qualification.related_prs.filter((item) => item.blocking === false).map((item) => item.url));

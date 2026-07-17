@@ -38,6 +38,30 @@ test('deterministic patch review accepts source plus an oracle-bound added regre
   assert.match(result.review_digest, /^sha256:[0-9a-f]{64}$/);
 });
 
+test('deterministic patch review permits only explicitly elevated nonproduction paths', () => {
+  const elevatedPatch = `${patch}diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1111111..2222222 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1 +1,2 @@
+ # Changelog
++- Preserve the final parser token.
+`;
+  const classes = [
+    {path: 'CHANGELOG.md', class: 'nonproduction'},
+    {path: 'src/parser.mjs', class: 'source'},
+    {path: 'test/parser-regression.test.mjs', class: 'added-test'},
+  ];
+  const blocked = reviewPatch({spec: spec(), patch: elevatedPatch, classes, prBody: 'Fixes #12'});
+  assert.equal(blocked.ready, false);
+  const elevated = reviewPatch({
+    spec: spec({allow_nonproduction_paths: ['CHANGELOG.md']}),
+    patch: elevatedPatch, classes, prBody: 'Fixes #12',
+  });
+  assert.equal(elevated.ready, true);
+  assert.deepEqual(elevated.risks, [{code: 'nonproduction-path-elevated', files: ['CHANGELOG.md']}]);
+});
+
 test('fast-lane patch review blocks elevated file classes, existing tests and test-only defect fixes', () => {
   assert.equal(reviewPatch({
     spec: spec(), patch,
@@ -83,6 +107,92 @@ test('fast-lane patch review blocks elevated file classes, existing tests and te
     prBody: 'Contributor self-run; not maintainer verification.',
   });
   assert.match(unrelatedEvidence.blocking_reasons.join(' '), /source-evidence path/i);
+});
+
+test('modified-test assertion guard ignores assertion-like words removed from production source', () => {
+  const mixedPatch = `diff --git a/src/parser.mjs b/src/parser.mjs
+index 1111111..2222222 100644
+--- a/src/parser.mjs
++++ b/src/parser.mjs
+@@ -1 +1 @@
+-throw new Error('module must export a parser');
++throw new Error('parser export is missing');
+diff --git a/test/parser-regression.test.mjs b/test/parser-regression.test.mjs
+index 1111111..2222222 100644
+--- a/test/parser-regression.test.mjs
++++ b/test/parser-regression.test.mjs
+@@ -1 +1,2 @@
+ test('existing behavior', () => {});
++test('retains the final token', () => {});
+`;
+  const result = reviewPatch({
+    spec: spec({allow_modified_existing_tests: true}), patch: mixedPatch,
+    classes: [{path: 'src/parser.mjs', class: 'source'},
+      {path: 'test/parser-regression.test.mjs', class: 'modified-existing-test'}],
+    prBody: 'Contributor self-run; not maintainer verification.',
+  });
+  assert.equal(result.ready, true);
+});
+
+test('modified-test assertion guard ignores should in a renamed test title', () => {
+  const renamedTitlePatch = `diff --git a/src/parser.mjs b/src/parser.mjs
+index 1111111..2222222 100644
+--- a/src/parser.mjs
++++ b/src/parser.mjs
+@@ -1 +1 @@
+-return tokens.slice(0, -1);
++return tokens;
+diff --git a/test/parser-regression.test.mjs b/test/parser-regression.test.mjs
+index 1111111..2222222 100644
+--- a/test/parser-regression.test.mjs
++++ b/test/parser-regression.test.mjs
+@@ -1 +1,2 @@
+-test('expect(value) should retain the final token', () => {});
++test('retains the final token', () => {});
++expect(parse()).toEqual(['final']);
+`;
+  const result = reviewPatch({
+    spec: spec({allow_modified_existing_tests: true}), patch: renamedTitlePatch,
+    classes: [{path: 'src/parser.mjs', class: 'source'},
+      {path: 'test/parser-regression.test.mjs', class: 'modified-existing-test'}],
+    prBody: 'Contributor self-run; not maintainer verification.',
+  });
+  assert.equal(result.ready, true);
+});
+
+test('modified-test assertion guard still blocks removed test assertions across supported syntaxes', () => {
+  const weakenedPatch = (removedAssertion) => `diff --git a/src/parser.mjs b/src/parser.mjs
+index 1111111..2222222 100644
+--- a/src/parser.mjs
++++ b/src/parser.mjs
+@@ -1 +1 @@
+-return tokens.slice(0, -1);
++return tokens;
+diff --git a/test/parser-regression.test.mjs b/test/parser-regression.test.mjs
+index 1111111..2222222 100644
+--- a/test/parser-regression.test.mjs
++++ b/test/parser-regression.test.mjs
+@@ -1 +1 @@
+-${removedAssertion}
++test('retains the final token', () => {});
+`;
+  for (const removedAssertion of [
+    "expect(parse()).toEqual(['final']);",
+    "assert parse() == ['final']",
+    'assert!(parse().is_ok());',
+    'assertEquals(expected, parse());',
+    'must(parse()).equal(expected);',
+    'return expect(parse()).toEqual(expected);',
+    'await assert.rejects(operation);',
+  ]) {
+    const result = reviewPatch({
+      spec: spec({allow_modified_existing_tests: true}), patch: weakenedPatch(removedAssertion),
+      classes: [{path: 'src/parser.mjs', class: 'source'},
+        {path: 'test/parser-regression.test.mjs', class: 'modified-existing-test'}],
+      prBody: 'Contributor self-run; not maintainer verification.',
+    });
+    assert.match(result.blocking_reasons.join(' '), /assertion-like/i, removedAssertion);
+  }
 });
 
 test('PR overclaim lint is conservative and preserves the contributor claim boundary', () => {

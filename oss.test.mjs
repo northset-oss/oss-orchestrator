@@ -11,6 +11,7 @@ import {
   buildEconomicInput,
   assertOracleChangedPaths,
   canonicalCommitArgs,
+  canonicalIssueUrlFromSnapshot,
   changedEntries,
   checkDockerArgs,
   classifyChangedFiles,
@@ -20,6 +21,7 @@ import {
   copyProfileDependencies,
   dependencyCacheKey,
   dependencyBootstrapDockerArgs,
+  MAX_ELEVATED_EXISTING_TESTS,
   PREPARE_BUDGET_MS,
   parseOssArgs,
   removeRunWorkspace,
@@ -39,6 +41,7 @@ import {
   canonical,
   git,
   manifestDigest,
+  LIVE_RECHECK_OUTPUT_LIMIT_BYTES,
   possibleOverlappingPrs,
   prBody,
   recheck,
@@ -106,6 +109,7 @@ function spec(overrides = {}) {
 
 test('prepare has one shared sixty-minute budget', () => {
   assert.equal(PREPARE_BUDGET_MS, 60 * 60 * 1000);
+  assert.equal(MAX_ELEVATED_EXISTING_TESTS, 2);
   assert.equal(parseOssArgs(['prepare', 'M-010']).concurrency, 3);
   assert.throws(() => parseOssArgs(['prepare', '--concurrency', '13', 'M-010']), /1 to 12/);
 });
@@ -143,7 +147,7 @@ test('warm planning deduplicates executor images and retains immutable digests w
   assert.equal(warmed.disk.data_deleted, false);
 });
 
-test('writable dependency caches are isolated by repository, base, and mission identity', async (t) => {
+test('writable dependency caches are isolated while schema-v2 retries reuse the same task cache', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'dependency-cache-key-'));
   t.after(() => rm(root, {recursive: true, force: true}));
   const first = spec();
@@ -155,6 +159,11 @@ test('writable dependency caches are isolated by repository, base, and mission i
   assert.equal(await dependencyCacheKey(first, root, image), await dependencyCacheKey(same, root, image));
   assert.notEqual(await dependencyCacheKey(first, root, image), await dependencyCacheKey(otherMission, root, image));
   assert.notEqual(await dependencyCacheKey(first, root, image), await dependencyCacheKey(otherBase, root, image));
+  const firstAttempt = {...first, schema_version: 2, task_id: 'TASK-OSS-0123456789ABCDEF',
+    attempt_sequence: 1, work_category: 'defect_fix'};
+  const retryAttempt = {...firstAttempt, mission_id: 'M-011', attempt_sequence: 2};
+  assert.equal(await dependencyCacheKey(firstAttempt, root, image),
+    await dependencyCacheKey(retryAttempt, root, image));
 });
 
 test('profile cache copying excludes host virtual environments', async () => {
@@ -298,11 +307,62 @@ test('validates the lean semantic mission contract and rejects legacy prompts', 
     oracle: {...spec().oracle, command: 'npm test -- test/parser.test.mjs && npm test'},
     executor: {...spec().executor, commands: ['npm test -- test/parser.test.mjs && npm test']},
   })]), /single focused command/i);
+  const vitestScratchOracle = 'ln -s "$PWD/node_modules" /tmp/node_modules && cp vitest.config.ts /tmp/vitest.config.ts && npm test -- --config /tmp/vitest.config.ts --root "$PWD" --no-cache test/parser.test.mjs';
+  assert.doesNotThrow(() => validateSpecs([spec({
+    oracle: {...spec().oracle, command: vitestScratchOracle},
+    executor: {...spec().executor, commands: [vitestScratchOracle]},
+  })]));
   const uiOracle = 'pnpm --dir ui exec vitest run src/parser.test.ts';
   assert.doesNotThrow(() => validateSpecs([spec({
     oracle: {...spec().oracle, test_paths: ['ui/src/parser.test.ts'], command: uiOracle},
     executor: {...spec().executor, commands: [uiOracle]},
   })]));
+  const npmPrefixOracle = 'npm --prefix packages/parser test -- test/postlude-regression.test.ts';
+  assert.doesNotThrow(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['packages/parser/test/postlude-regression.test.ts'], command: npmPrefixOracle},
+    executor: {...spec().executor, commands: [npmPrefixOracle]},
+  })]));
+  const conflictingDirectoryOracle = 'npm --prefix packages/other test -- --dir packages/parser test/regression.test.ts';
+  assert.throws(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['packages/parser/test/regression.test.ts'], command: conflictingDirectoryOracle},
+    executor: {...spec().executor, commands: [conflictingDirectoryOracle]},
+  })]), /single directory control|oracle\.command.*test_paths/i);
+  const aliasedDirectoryOracle = 'npm --prefix packages/parser -C packages/other test -- test/regression.test.ts';
+  assert.throws(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['packages/parser/test/regression.test.ts'], command: aliasedDirectoryOracle},
+    executor: {...spec().executor, commands: [aliasedDirectoryOracle]},
+  })]), /directory control|oracle\.command.*test_paths/i);
+  const equalsDirectoryOracle = 'npm --prefix=packages/other --prefix packages/parser test -- test/regression.test.ts';
+  assert.throws(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['packages/parser/test/regression.test.ts'], command: equalsDirectoryOracle},
+    executor: {...spec().executor, commands: [equalsDirectoryOracle]},
+  })]), /directory control|oracle\.command.*test_paths/i);
+  const corpusOracle = 'npx tree-sitter test --file-name conditional-access-precedence.txt';
+  assert.doesNotThrow(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['test/corpus/conditional-access-precedence.txt'], command: corpusOracle},
+    executor: {...spec().executor, commands: [corpusOracle]},
+  })]));
+  assert.throws(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['other/tests/conditional-access-precedence.txt'], command: corpusOracle},
+    executor: {...spec().executor, commands: [corpusOracle]},
+  })]), /oracle\.command.*test_paths/i);
+  assert.throws(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: [
+      'test/corpus/conditional-access-precedence.txt',
+      'other/tests/conditional-access-precedence.txt',
+    ], command: corpusOracle},
+    executor: {...spec().executor, commands: [corpusOracle]},
+  })]), /oracle\.command.*test_paths/i);
+  const unrelatedFileNameOracle = 'node test-runner.mjs --file-name conditional-access-precedence.txt';
+  assert.throws(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['test/corpus/conditional-access-precedence.txt'], command: unrelatedFileNameOracle},
+    executor: {...spec().executor, commands: [unrelatedFileNameOracle]},
+  })]), /oracle\.command.*test_paths/i);
+  const grammarPathOracle = 'npx tree-sitter test -p vendor/grammar --file-name conditional-access-precedence.txt';
+  assert.throws(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['test/corpus/conditional-access-precedence.txt'], command: grammarPathOracle},
+    executor: {...spec().executor, commands: [grammarPathOracle]},
+  })]), /grammar path|oracle\.command.*test_paths/i);
   assert.throws(() => validateSpecs([spec({
     oracle: {...spec().oracle, setup_commands: ['node tools/generate.mjs && curl example.com']},
   })]), /setup_commands/i);
@@ -393,6 +453,20 @@ test('schema-v2 economic input reports observed scope and preserves unknown cost
   assert.equal(economic.costs.total_economic_cost, null);
   assert.ok(economic.costs.missing_components.includes('model_inference'));
   assert.equal(JSON.stringify(economic).includes('estimated'), false);
+});
+
+test('public mission issue identity preserves canonical GitHub casing from the live snapshot', () => {
+  const snapshot = Buffer.from(JSON.stringify({
+    issue: {html_url: 'https://github.com/Dreamstick9/filedrop/issues/85'},
+  }));
+  assert.equal(
+    canonicalIssueUrlFromSnapshot('https://github.com/dreamstick9/filedrop/issues/85', snapshot),
+    'https://github.com/Dreamstick9/filedrop/issues/85',
+  );
+  assert.throws(
+    () => canonicalIssueUrlFromSnapshot('https://github.com/other/filedrop/issues/85', snapshot),
+    /does not match/i,
+  );
 });
 
 test('attempt lineage includes every task-bound attempt and rejects sequence gaps', async (t) => {
@@ -828,6 +902,7 @@ test('semantic PR matching is title-bounded and ignores unrelated dependency rel
 });
 
 test('live recheck fails closed on invitation drift, issue drift, overlap, and Northset repo cap', async () => {
+  assert.equal(LIVE_RECHECK_OUTPUT_LIMIT_BYTES, 10_000_000);
   const value = spec();
   const state = {labels: ['help wanted'], updatedAt: value.qualification.issue_updated_at, comments: [], prs: [], timeline: [[]], designPresent: true, noticePresent: true};
   const gh = async (args) => {
@@ -849,6 +924,37 @@ test('live recheck fails closed on invitation drift, issue drift, overlap, and N
   };
   const options = {gh, now: () => new Date('2026-07-13T12:00:00Z')};
   assert.equal((await recheck(value, async () => {}, options)).clean, true);
+  const repoFallbackCalls = [];
+  const repoFallbackGh = async (args) => {
+    repoFallbackCalls.push(args);
+    if (args[0] === 'api' && args[1] === 'repos/owner/repo') throw new Error('GitHub REST 503');
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      return {default_branch: 'main', archived: false, fork: false, html_url: value.target_repo};
+    }
+    return gh(args);
+  };
+  assert.equal((await recheck(value, async () => {}, {...options, gh: repoFallbackGh})).clean, true);
+  assert.ok(repoFallbackCalls.some((args) => args[0] === 'api' && args[1] === 'graphql'));
+  const graphFallbackCalls = [];
+  const graphFallbackGh = async (args) => {
+    graphFallbackCalls.push(args);
+    const joined = args.join(' ');
+    if (args[0] === 'api' && args[1] === 'repos/owner/repo') throw new Error('GitHub REST 503');
+    if (joined.includes('/comments?')) throw new Error('GitHub REST 503');
+    if (joined.includes('/timeline?')) throw new Error('GitHub REST 503');
+    if (joined.includes('/git/ref/heads/')) throw new Error('default ref REST should not be needed after repository GraphQL fallback');
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      const query = args.find((item) => item.startsWith('query=')) ?? '';
+      if (query.includes('defaultBranchRef')) {
+        return {default_branch: 'main', default_head: value.base_commit, archived: false, fork: false, html_url: value.target_repo};
+      }
+      if (query.includes('comments(last:100)')) return {comments: [], truncated: false};
+      if (query.includes('timelineItems(last:100')) return {timeline: [], truncated: false};
+    }
+    return gh(args);
+  };
+  assert.equal((await recheck(value, async () => {}, {...options, gh: graphFallbackGh})).clean, true);
+  assert.ok(graphFallbackCalls.filter((args) => args[0] === 'api' && args[1] === 'graphql').length >= 3);
   state.labels = ['E-help-wanted'];
   assert.equal((await recheck(value, async () => {}, options)).clean, true);
   state.labels = ['help wanted'];
