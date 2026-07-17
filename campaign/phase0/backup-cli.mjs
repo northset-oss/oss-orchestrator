@@ -26,7 +26,7 @@ if (command === 'keygen') {
   const result = await createEncryptedOperationalBackup({
     repo: path.resolve(options['--repo']), output: path.resolve(options['--out']), keyFile: path.resolve(options['--key']),
   });
-  process.stdout.write(`${result.sha256}  ${result.file}\n`);
+  process.stdout.write(`${JSON.stringify({sha256: result.sha256, created_at: result.manifest.created_at, file: result.file})}\n`);
 } else if (command === 'restore') {
   for (const name of ['--backup', '--out', '--key', '--expected-sha256', '--expected-created-at']) if (!options[name]) throw new Error(`restore requires ${name}`);
   const result = await restoreEncryptedOperationalBackup({
