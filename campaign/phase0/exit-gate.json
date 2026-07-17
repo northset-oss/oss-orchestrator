@@ -2,25 +2,27 @@
   "schema_version": 1,
   "phase": "Phase 0",
   "status": "HOLD",
-  "updated_at": "2026-07-17T00:00:00Z",
+  "updated_at": "2026-07-17T18:00:09Z",
   "gates": [
-    {"id":"source_seal","status":"PENDING_DEFINITIVE_COMMIT","evidence":".phase0-artifacts/2026-07-17/source-seal"},
-    {"id":"clean_vm_source_restore","status":"PENDING_DEFINITIVE_COMMIT","evidence":".phase0-artifacts/2026-07-17/clean-vm-restore"},
-    {"id":"custom_image_archive_restore","status":"PENDING_CLEAN_INVENTORY_RERUN","evidence":".phase0-artifacts/2026-07-17/clean-vm-restore"},
+    {"id":"source_seal","status":"PENDING_FINAL_RESEAL","evidence":".phase0-artifacts/2026-07-17/source-seal-final"},
+    {"id":"clean_vm_source_restore","status":"PENDING_FINAL_RESEAL","evidence":".phase0-artifacts/2026-07-17/clean-vm-restore"},
+    {"id":"custom_image_archive_restore","status":"PASS_UNCHANGED_BUILD_INPUTS","evidence":".phase0-artifacts/2026-07-17/clean-vm-restore/image-restore-ec6d1c2/image-restore-result.json"},
     {"id":"protocol_freeze","status":"PASS","evidence":".phase0-artifacts/2026-07-17/protocol/protocol-freeze.aysajan.json"},
     {"id":"counter_dedup_tests","status":"PASS","evidence":"campaign/phase0/phase0.test.mjs"},
-    {"id":"batch_recovery_tests","status":"MODEL_ONLY_PENDING_PRODUCTION_ADAPTER","evidence":".phase0-artifacts/2026-07-17/batch-rehearsal/report.json"},
+    {"id":"batch_recovery_tests","status":"PASS_PRODUCTION_ENTRYPOINT_REHEARSAL_ADAPTERS","evidence":".phase0-artifacts/2026-07-17/batch-rehearsal/report.json"},
     {"id":"founder_decisions","status":"PASS","evidence":"campaign/phase0/protocol.v1.json"},
     {"id":"github_support_inquiry","status":"PREPARED_NOT_SENT","evidence":"campaign/phase0/github-support-inquiry.draft.md"},
     {"id":"reviewer_accounts_and_keys","status":"BLOCKED_SECOND_OPERATOR","evidence":"campaign/phase0/roster/reviewers.json"},
+    {"id":"reviewer_calibration","status":"BLOCKED_SECOND_OPERATOR","evidence":"campaign/phase0/calibration-schedule.json"},
     {"id":"handoff_rehearsal","status":"BLOCKED_SECOND_OPERATOR","evidence":"campaign/phase0/handoff-template.json"},
-    {"id":"resource_breakers","status":"PARTIAL_NEEDS_DURABLE_DISAGREEMENT_CONTROL","evidence":"campaign/phase0/resource-breakers.mjs"},
-    {"id":"off_machine_lake_journal_restore","status":"PASS_LOCAL_RESTORE_FROM_ICLOUD_PATH","evidence":".phase0-artifacts/2026-07-17/operational-backup-restore/backup-manifest.json"}
+    {"id":"resource_breakers","status":"PASS_DURABLE_REVIEW_AND_RESOURCE_CONTROLS","evidence":"campaign/phase0/review-policy.mjs"},
+    {"id":"off_machine_lake_journal_restore","status":"PASS_CONTROLS_INCLUDED","evidence":"campaign/phase0/backup.test.mjs"}
   ],
   "launch_authorized": false,
   "blocking_owner_actions": [
     "Create or confirm a separate macOS account for Shehide without access to Aysajan GitHub credentials.",
     "From that account, provision Shehide's signing key and add its public key and key-derived reviewer ID to the roster.",
+    "Complete the 20 blind dual-review calibration missions and resolve checklist disagreements.",
     "Complete and verify one outgoing and incoming signed handoff rehearsal."
   ]
 }

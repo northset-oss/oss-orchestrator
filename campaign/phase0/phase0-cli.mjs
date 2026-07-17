@@ -121,11 +121,17 @@ async function main() {
     verifyReviewedBoard(board, manifests);
     if (command === 'sign-batch-approval') {
       requireOptions(value, ['--private']);
-      const privatePem = await readFile(path.resolve(value['--private']), 'utf8');
+      const [privatePem, founderAdjudications] = await Promise.all([
+        readFile(path.resolve(value['--private']), 'utf8'),
+        value['--founder-adjudications']
+          ? readFile(path.resolve(value['--founder-adjudications']), 'utf8').then(JSON.parse)
+          : Promise.resolve([]),
+      ]);
       const record = createBatchApproval(manifests, {
         privateKey: createPrivateKey(privatePem),
         approvedDigest: board.batch_digest,
         approvedAt: value['--approved-at'] ?? new Date().toISOString(),
+        founderAdjudications,
       });
       const output = path.resolve(value['--record']);
       await mkdir(path.dirname(output), {recursive: true, mode: 0o700});

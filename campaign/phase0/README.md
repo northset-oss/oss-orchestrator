@@ -34,11 +34,17 @@ manifest until independently completed.
 
 - `protocol.v1.json` is the preregistered campaign protocol. A signed freeze record must be
   verified against a rostered public key before launch.
-- `batch-rehearsal.mjs` models the 25-mission happy path and every required recovery
-  scenario without contacting GitHub. Its automated test records external-action counts,
-  state transitions, and counter outcomes for each scenario. It is model evidence, not a
-  substitute for driving the production shipping state machine through fake GitHub
-  adapters; the exit gate remains pending until that production-path suite exists.
+- `batch-rehearsal.mjs` drives the exported production `shipBatch` orchestration through
+  no-network rehearsal adapters for the 25-mission happy path and every required recovery
+  scenario. Its report records external-action counts, state transitions, and production
+  counter outcomes. The adapters intentionally replace irreversible GitHub, Pages, and
+  signing I/O; this is production-entrypoint rehearsal evidence, not a live-platform test.
+- `review-policy.mjs` maintains the canonical, integrity-chained dual-review history at
+  `runs/phase0/review-control.json`. Shipment records verified dual reviews before outbound
+  action, blocks unresolved SHIP/HOLD disagreement, and pauses above 10% disagreement over
+  the trailing 20. A founder override must be included in the key-derived signed batch
+  approval and bound to the exact disputed review-set digest. The control and its
+  initialization marker are included in encrypted operational backups.
 - `roster/reviewers.json`, `calibration-schedule.json`, and `handoff-template.json` are
   deliberately honest about pending second-operator work. A template or scheduled review
   is not evidence that a handoff or calibration has happened.
@@ -56,3 +62,12 @@ first outbound action. A free-form `--approved-by` value is no longer accepted.
 SQLite-consistent backup and restores it with per-file digest and `PRAGMA integrity_check`
 verification. The encryption key must remain outside the repository and should be escrowed
 separately from the cloud archive.
+
+When a batch contains an actual SHIP/HOLD disagreement, pass a JSON array of exact
+adjudications while signing the batch:
+
+```sh
+node campaign/phase0/phase0-cli.mjs sign-batch-approval \
+  --private <founder-key.pem> --board <reviewed-board.json> --runs <runs-dir> \
+  --founder-adjudications <adjudications.json> --record <signed-batch-approval.json>
+```

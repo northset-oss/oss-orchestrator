@@ -55,6 +55,21 @@ async function journalPaths(repo) {
   return result.sort();
 }
 
+async function controlPaths(repo) {
+  const directory = path.join(repo, 'runs', 'phase0');
+  const names = [
+    'review-control.json',
+    'review-control.json.initialized',
+    'resource-control.json',
+  ];
+  const result = [];
+  for (const name of names) {
+    const file = path.join(directory, name);
+    if (await exists(file)) result.push(file);
+  }
+  return result.sort();
+}
+
 function sqliteString(value) {
   return `'${value.replaceAll("'", "''")}'`;
 }
@@ -83,7 +98,8 @@ export async function createEncryptedOperationalBackup({repo, output, keyFile, c
 
     const relativeFiles = ['candidate_lake.sqlite'];
     const journals = await journalPaths(absoluteRepo);
-    for (const source of journals) {
+    const controls = await controlPaths(absoluteRepo);
+    for (const source of [...journals, ...controls]) {
       const relative = path.relative(absoluteRepo, source);
       const target = path.join(stage, relative);
       await mkdir(path.dirname(target), {recursive: true, mode: 0o700});
@@ -91,11 +107,12 @@ export async function createEncryptedOperationalBackup({repo, output, keyFile, c
       relativeFiles.push(relative);
     }
     const manifest = {
-      schema_version: 1,
+      schema_version: 2,
       kind: 'northset_phase0_operational_backup',
       created_at: createdAt,
       source_repository: path.basename(absoluteRepo),
       journal_files: journals.length,
+      control_files: controls.length,
       files: await inventory(stage, relativeFiles),
     };
     await writeFile(path.join(stage, 'backup-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, {mode: 0o600});

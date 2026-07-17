@@ -284,9 +284,63 @@ test('calibration and Amber manifests require two distinct signed review records
   ];
   const manifest = bindReviewSet(base, records);
   assert.equal(verifyReviewSet(manifest, records, roster, {minimumReviewers: 2}), true);
+  const disputed = [records[0], createReviewRecord(base, {
+    privateKey: second.privateKey, disposition: 'HOLD', riskTier: 'AMBER', reviewedAt: '2026-07-17T12:01:00Z',
+  })];
+  const disputedManifest = bindReviewSet(base, disputed);
+  assert.equal(verifyReviewSet(disputedManifest, disputed, roster, {
+    minimumReviewers: 2, requireShip: false,
+  }), true);
+  assert.throws(() => verifyReviewSet(disputedManifest, disputed, roster, {minimumReviewers: 2}), /SHIP/i);
   assert.throws(() => verifyReviewSet(manifest, [records[0]], roster, {minimumReviewers: 2}), /two distinct/i);
   assert.throws(() => verifyReviewSet(manifest, [{...records[0], disposition: 'HOLD'}, records[1]], roster,
     {minimumReviewers: 2}), /digest|signature|SHIP/i);
+});
+
+test('signed batch approval binds explicit founder adjudication to the disputed review set', () => {
+  const founder = keyPair();
+  const reviewer = keyPair();
+  const roster = new Map([
+    [reviewerIdFromPublicKey(founder.publicKey), founder.publicKey],
+    [reviewerIdFromPublicKey(reviewer.publicKey), reviewer.publicKey],
+  ]);
+  const base = {mission_id: 'CAL-002', patch_sha256: `sha256:${'a'.repeat(64)}`};
+  const records = [
+    createReviewRecord(base, {privateKey: founder.privateKey, disposition: 'SHIP', riskTier: 'AMBER', reviewedAt: '2026-07-17T12:00:00Z'}),
+    createReviewRecord(base, {privateKey: reviewer.privateKey, disposition: 'HOLD', riskTier: 'AMBER', reviewedAt: '2026-07-17T12:01:00Z'}),
+  ];
+  const manifest = bindReviewSet(base, records);
+  const approvedDigest = `sha256:${'c'.repeat(64)}`;
+  const approval = createBatchApproval([manifest], {
+    privateKey: founder.privateKey,
+    approvedDigest,
+    approvedAt: '2026-07-17T12:05:00Z',
+    founderAdjudications: [{
+      mission_id: manifest.mission_id,
+      review_event_id: manifest.review_record_sha256,
+      decision: 'SHIP',
+      rationale: 'The bounded concern does not block this exact publication.',
+    }],
+  });
+  assert.deepEqual(approval.founder_adjudications, [{
+    mission_id: manifest.mission_id,
+    review_event_id: manifest.review_record_sha256,
+    decision: 'SHIP',
+    rationale: 'The bounded concern does not block this exact publication.',
+  }]);
+  assert.equal(verifyBatchApproval(approval, [manifest], approvedDigest, roster, {
+    authorizedApprovers: new Set([approval.reviewer_id]),
+  }), true);
+  assert.throws(() => createBatchApproval([manifest], {
+    privateKey: founder.privateKey,
+    approvedDigest,
+    founderAdjudications: [{
+      mission_id: manifest.mission_id,
+      review_event_id: `sha256:${'d'.repeat(64)}`,
+      decision: 'SHIP',
+      rationale: 'Wrong review set.',
+    }],
+  }), /review event/i);
 });
 
 test('tracked reviewer roster verifies provisioned key identities and reports pending operators', async () => {
