@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "status": "template_not_a_completed_handoff",
+  "shift_id": null,
+  "created_at": null,
+  "active_prepares": [],
+  "expiring_qualifications": [],
+  "expiring_ready_packs": [],
+  "pending_boards": [],
+  "maintainer_comments": [],
+  "upstream_ci_failures": [],
+  "sev_events": [],
+  "budget_remaining": {},
+  "exception_lane_tasks": [],
+  "machine_disk_status": {},
+  "outgoing_signature": null,
+  "incoming_confirmation": null
+}

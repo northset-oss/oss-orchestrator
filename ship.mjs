@@ -22,6 +22,11 @@ import {
 } from './core.mjs';
 import {changedEntries, classifyChangedFiles} from './oss.mjs';
 import {normalizedPrClaimText, reviewPatch} from './review-patch.mjs';
+import {verifyBatchApproval, verifyReviewSet} from './campaign/phase0/approvals.mjs';
+import {signedRecordDigest, reviewableManifestDigest} from './campaign/phase0/integrity.mjs';
+import {loadReviewerRoster} from './campaign/phase0/roster.mjs';
+import {reviewRequirement} from './campaign/phase0/review-policy.mjs';
+import {assertPhase0Spec, resourceUsageForTask} from './campaign/phase0/resource-breakers.mjs';
 
 const NORTHSET_OSS = process.env.NORTHSET_OSS_DIR ?? '/Users/aeziz-local/northset-oss';
 const VERIFICATION_REPO = 'northset-oss/verification-pilot';
@@ -129,6 +134,7 @@ export function approvalRecord({spec, manifest, journal}) {
     attempt_id: spec.mission_id,
     approved_manifest_digest: journal.approved_manifest,
     approved_by: journal.approved_by,
+    batch_approval_record_sha256: journal.approval_record_sha256 ?? null,
     approved_at: journal.approved_at,
     funding_program: 'Northset OSS Fund',
     initiative: 'OSS mission experimentation',
@@ -139,7 +145,10 @@ export function approvalRecord({spec, manifest, journal}) {
       qualification_wall_seconds: 300,
       prepare_wall_seconds: 3600,
       ship_wall_seconds: 3600,
-      maximum_attempts: null,
+      model_attempt_wall_seconds: 720,
+      maximum_standard_attempts: 3,
+      standard_task_lane_hours: 2,
+      maximum_attempts: 3,
     },
   };
 }
@@ -626,7 +635,7 @@ export function upstreamPrIdentity(value) {
   return Number.isSafeInteger(number) ? {repository: `${match[1]}/${match[2]}`, number} : null;
 }
 
-async function loadReadySubject(spec, missionDir, deadline) {
+async function loadReadySubject(spec, missionDir, deadline, reviewerRoster) {
   const ready = path.join(missionDir, 'ready-pack');
   const files = {
     manifest: path.join(ready, 'manifest.json'),
@@ -637,6 +646,7 @@ async function loadReadySubject(spec, missionDir, deadline) {
     policy: path.join(ready, 'policy_snapshot.json'),
     oracle: path.join(ready, 'oracle.json'),
     patchReview: path.join(ready, 'patch-review.json'),
+    reviewRecords: path.join(ready, 'review-records.json'),
     publicMission: path.join(ready, 'public-mission'),
     authorRepo: path.join(missionDir, 'author-workspace', 'repo'),
   };
@@ -662,6 +672,19 @@ async function loadReadySubject(spec, missionDir, deadline) {
     if (manifest.economic_sha256 !== sha256(await readFile(economic))) {
       throw new Error(`${spec.mission_id} economic evidence digest changed after preparation`);
     }
+    const reviews = JSON.parse(await readFile(files.reviewRecords, 'utf8'));
+    if (!Array.isArray(reviews) || !reviews.length) throw new Error(`${spec.mission_id} signed review records are required`);
+    const riskTiers = new Set(reviews.map((record) => record.risk_tier));
+    if (riskTiers.size !== 1) throw new Error(`${spec.mission_id} reviewer risk-tier disagreement requires founder adjudication`);
+    const riskTier = [...riskTiers][0];
+    const expectedRisk = (manifest.risk_flags ?? []).length ? 'AMBER' : 'GREEN';
+    if (riskTier !== expectedRisk) throw new Error(`${spec.mission_id} signed risk tier does not match the prepared risk flags`);
+    const requirement = reviewRequirement({
+      calibration_ordinal: manifest.calibration_ordinal,
+      risk_tier: riskTier,
+      receipt_subject_id: reviewableManifestDigest(manifest),
+    });
+    verifyReviewSet(manifest, reviews, reviewerRoster, {minimumReviewers: requirement.minimum_reviewers});
   }
   if (!readyPackMayStart(manifest, journal)) throw new Error(`${spec.mission_id} ready pack expired before ship initiation`);
   if (canonical(manifest.planned_actions) !== canonical(PLANNED_ACTIONS)) throw new Error(`${spec.mission_id} manifest has unexpected actions`);
@@ -1561,19 +1584,10 @@ async function prePublicPushForBatch(subject, log) {
   }
 }
 
-async function writeBatchApproval(subjects, approvedDigest, approvedBy, approvedAt) {
+async function writeBatchApproval(subjects, record) {
   const root = path.dirname(subjects[0].missionDir);
   const directory = path.join(root, 'batch-approvals');
-  const file = path.join(directory, `${approvedDigest.replace(/^sha256:/, '')}.json`);
-  const record = {
-    schema_version: 1,
-    approved_manifest_digest: approvedDigest,
-    approved_by: approvedBy,
-    approved_at: approvedAt.toISOString(),
-    ordered_missions: subjects.map((subject) => ({mission_id: subject.manifest.mission_id,
-      mission_manifest: manifestDigest([subject.manifest]), pr_body_sha256: subject.manifest.pr_body_sha256,
-      patch_sha256: subject.manifest.patch_sha256})),
-  };
+  const file = path.join(directory, `${record.approved_manifest_digest.replace(/^sha256:/, '')}.json`);
   await mkdir(directory, {recursive: true, mode: 0o700});
   if (await exists(file)) {
     const existing = JSON.parse(await readFile(file, 'utf8'));
@@ -1585,30 +1599,40 @@ async function writeBatchApproval(subjects, approvedDigest, approvedBy, approved
 }
 
 export async function shipBatch(items, {
-  approvedDigest, approvedBy = null, retryInfraTerminal = false,
+  approvedDigest, signedBatchApproval = null, reviewerRoster = null, retryInfraTerminal = false,
   concurrency = DEFAULT_SHIP_CONCURRENCY, log = async () => {},
 } = {}) {
+  const loadedRoster = reviewerRoster ?? await loadReviewerRoster();
+  const roster = loadedRoster.keys ?? loadedRoster;
+  const authorizedApprovers = new Set([...(loadedRoster.capabilities ?? new Map()).entries()]
+    .filter(([, capabilities]) => capabilities.has('batch_approve')).map(([reviewerId]) => reviewerId));
   const subjects = [];
   for (const item of items) {
+    assertPhase0Spec(item.spec);
     const deadline = createDeadline(SHIP_BUDGET_MS);
-    subjects.push(await loadReadySubject(item.spec, item.missionDir, deadline));
+    subjects.push(await loadReadySubject(item.spec, item.missionDir, deadline, roster));
   }
   validateApprovedBatch(subjects.map((subject) => subject.manifest), approvedDigest);
-  if (typeof approvedBy !== 'string' || !approvedBy.trim()) {
-    throw new Error('batch shipping requires --approved-by <stable-operator-id>');
-  }
+  verifyBatchApproval(signedBatchApproval, subjects.map((subject) => subject.manifest), approvedDigest, roster,
+    {authorizedApprovers});
+  const approvedBy = signedBatchApproval.reviewer_id;
+  const approvalRecordSha256 = signedRecordDigest(signedBatchApproval);
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 12) throw new Error('ship concurrency must be 1..12');
   const priorApprovalTimes = new Set(subjects
     .filter((subject) => subject.journal?.approved_manifest === approvedDigest)
     .map((subject) => subject.journal?.approved_at).filter(Boolean));
   if (priorApprovalTimes.size > 1) throw new Error('existing mission journals disagree on the one batch approval time');
-  const approvedAt = priorApprovalTimes.size ? new Date([...priorApprovalTimes][0]) : new Date();
+  const approvedAt = new Date(signedBatchApproval.approved_at);
   if (!Number.isFinite(approvedAt.getTime())) throw new Error('existing batch approval time is invalid');
+  if (priorApprovalTimes.size && [...priorApprovalTimes][0] !== approvedAt.toISOString()) {
+    throw new Error('signed batch approval time does not match the existing mission journals');
+  }
   // Bind every approved journal before the first outbound action.
   for (const subject of subjects) {
     const missionManifest = manifestDigest([subject.manifest]);
     if (subject.journal === null) {
       subject.journal = newJournal(subject.manifest, approvedDigest, missionManifest, approvedAt, {approvedBy});
+      subject.journal.approval_record_sha256 = approvalRecordSha256;
       await saveJournal(subject.journalFile, subject.journal);
     } else {
       if (subject.journal.schema_version !== 2 || typeof subject.journal.state !== 'string') {
@@ -1621,6 +1645,10 @@ export async function shipBatch(items, {
       if (subject.journal.approved_manifest === approvedDigest && subject.journal.approved_by !== approvedBy) {
         throw new Error(`${subject.manifest.mission_id} approval actor does not match the existing journal`);
       }
+      if (subject.journal.approved_manifest === approvedDigest &&
+          subject.journal.approval_record_sha256 !== approvalRecordSha256) {
+        throw new Error(`${subject.manifest.mission_id} signed batch approval record does not match the existing journal`);
+      }
       if (disposition === 'archive-and-retry') {
         const prior = subject.journal;
         const archiveFile = await archiveTerminalJournal(subject);
@@ -1628,12 +1656,14 @@ export async function shipBatch(items, {
           prior, subject.manifest, approvedDigest, missionManifest, archiveFile,
           {approvedBy, approvedAt, retriedAt: new Date()},
         );
+        subject.journal.approval_record_sha256 = approvalRecordSha256;
         await saveJournal(subject.journalFile, subject.journal);
       } else if (disposition === 'archive-and-restart') {
         const prior = subject.journal;
         const archiveFile = await archiveTerminalJournal(subject);
         subject.journal = {
           ...newJournal(subject.manifest, approvedDigest, missionManifest, approvedAt, {approvedBy}),
+          approval_record_sha256: approvalRecordSha256,
           prior_attempt: {
             archive_file: archiveFile,
             state: prior.state,
@@ -1653,7 +1683,7 @@ export async function shipBatch(items, {
       }
     }
   }
-  await writeBatchApproval(subjects, approvedDigest, approvedBy, approvedAt);
+  await writeBatchApproval(subjects, signedBatchApproval);
 
   const pushed = await runIndependentBatch(subjects, (subject) => prePublicPushForBatch(subject, log), {concurrency});
   const publishable = pushed.filter((item) => item.ok).map((item) => item.subject);
@@ -1681,6 +1711,15 @@ export async function shipBatch(items, {
       await transitionJournal(subject.journal, 'FAILED_INFRA_TERMINAL',
         {save: (journal) => saveJournal(subject.journalFile, journal)}, `final envelope batch: ${error.message}`);
     }
+  }
+  for (const subject of subjects.filter((item) => item.journal.state === 'SHIPPED')) {
+    const laneHours = await resourceUsageForTask(path.dirname(subject.missionDir), subject.spec.task_id);
+    subject.journal.resource_usage = {
+      measurement_class: 'observed_usage',
+      lane_hours: laneHours,
+      flagged_above_two_lane_hours: laneHours > 2,
+    };
+    await saveJournal(subject.journalFile, subject.journal);
   }
   return subjects.map((subject) => ({
     mission_id: subject.manifest.mission_id,

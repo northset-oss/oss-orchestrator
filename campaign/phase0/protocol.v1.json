@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "protocol_id": "northset-receipt-campaign",
+  "version": "1.0.0",
+  "status": "frozen",
+  "frozen_at": "2026-07-17T00:00:00Z",
+  "effective_at": "2026-07-17T00:00:00Z",
+  "units_of_analysis": [
+    "invocation",
+    "receipt_subject",
+    "mission_attempt",
+    "cohort"
+  ],
+  "counting": {
+    "subject_hash_algorithm": "sha256",
+    "subject_encoding": "canonical-json-array-v1",
+    "subject_identity_fields": [
+      "schema_version",
+      "variant",
+      "repository_node_id",
+      "pr_number",
+      "tested_oid",
+      "policy_digest",
+      "test_mode"
+    ],
+    "countable_buckets": [
+      "A_SHIPPED_PUBLIC",
+      "V_DELIVERED_PRIVATE",
+      "V_PUBLISHED_PUBLIC"
+    ],
+    "rules": {
+      "one_subject_counts_once_ever": true,
+      "retry_replay_redelivery_republication_increment": false,
+      "private_to_public_is_bucket_move": true,
+      "new_head_requires_fresh_authorization_or_policy": true,
+      "failed_run_record_counts": false,
+      "authored_requires_attestation_upstream_pr_verified_body_and_shipped": true,
+      "verification_goal_authorizations": [
+        "MAINTAINER_AUTHORIZED",
+        "ORGANIZATION_AUTHORIZED"
+      ],
+      "rehearsal_counts": false,
+      "public_reporting_per_type_with_denominators": true
+    }
+  },
+  "countable_states": {
+    "A_SHIPPED_PUBLIC": "Northset-authored contribution with attested receipt, verified stored PR body, upstream PR, and SHIPPED journal",
+    "V_DELIVERED_PRIVATE": "authorized verification delivered privately",
+    "V_PUBLISHED_PUBLIC": "authorized verification published with publication consent",
+    "R_REHEARSAL": "never countable",
+    "RUN_RECORD_FAILED": "never countable",
+    "SUPERSEDED_WITHOUT_NEW_HEAD": "never countable"
+  },
+  "failure_taxonomy": {
+    "STALE_BEFORE_PUBLICATION": "live evidence changed before any outbound action",
+    "LEDGER_GATE_FAILED": "prepared ledger checks failed; no upstream PR",
+    "SIGNING_PARTIAL": "some approved subjects remain unsigned and resumable",
+    "PAGES_NOT_READY": "receipt URL unavailable; no upstream PR",
+    "UPSTREAM_CREATE_FAILED": "one upstream PR creation failed without duplicating peers",
+    "ENVELOPE_PUBLICATION_FAILED": "upstream PR exists but final envelope remains recoverable non-final",
+    "MANIFEST_MUTATED": "approval invalidated before shipment",
+    "REVIEW_RECORD_MUTATED": "shipment invalidated before outbound action",
+    "PROVIDER_THROTTLED": "global pipeline pause pending founder review",
+    "RESOURCE_LIMIT": "task or exception resource breaker fired"
+  },
+  "sev_taxonomy": {
+    "SEV_1": "credential exposure, unauthorized publication, wrong-code receipt, counter inflation, or cross-job isolation breach; stop all publication",
+    "SEV_2": "maintainer-impacting process failure, duplicate outreach, wrong repository action, or missed stop request; stop affected repository and ramp",
+    "SEV_3": "recoverable internal control failure with no external impact; quarantine affected item"
+  },
+  "matured_cohort": {
+    "definition": "A cohort is mature only after its gate-specific minimum age and its meaningful interactions or terminal outcomes are observable.",
+    "meaningful_outcomes": [
+      "merge",
+      "approval",
+      "substantive_review",
+      "requested_changes",
+      "explicit_closure_reason",
+      "explicit_maintainer_comment",
+      "assignment_or_invitation"
+    ],
+    "excluded": [
+      "automated_ci",
+      "bot_comment",
+      "silence"
+    ]
+  },
+  "cost_allocation": {
+    "classes": [
+      "observed_usage",
+      "allocated_subscription_cost",
+      "allocated_internal_labor_cost",
+      "unavailable"
+    ],
+    "rate_card_is_observed_expense": false,
+    "unknown_is_zero": false
+  },
+  "open_outcome_censoring": {
+    "silence_is_acceptance": false,
+    "open_is_unsuccessful": false,
+    "state": "outcome_not_mature"
+  },
+  "resource_breakers": {
+    "max_model_minutes_per_attempt": 12,
+    "max_standard_attempts_per_task": 3,
+    "max_standard_lane_hours_per_task": 2,
+    "receipt_lane_hour_flag_above": 2,
+    "exception_task_share": 0.01,
+    "max_active_exceptions": 1,
+    "max_exception_lane_hours": 4,
+    "provider_throttle_requires_founder_review": true,
+    "auto_resume": false
+  },
+  "review_policy": {
+    "calibration_missions": 20,
+    "calibration_green": 10,
+    "calibration_amber": 10,
+    "amber_dual_review_percent": 100,
+    "green_audit_percent": 5,
+    "ship_disagreement_requires_founder_adjudication": true,
+    "trailing_window": 20,
+    "pause_above_disagreement_rate": 0.1
+  },
+  "social_gates": {
+    "15_to_30": {
+      "minimum_age_days": 7,
+      "minimum_meaningful_outcomes": 10,
+      "minimum_positive_constructive": 3,
+      "maximum_sev_1": 0,
+      "maximum_sev_2": 1
+    },
+    "30_to_60": {
+      "minimum_age_days": 10,
+      "minimum_meaningful_outcomes": 20,
+      "minimum_positive_constructive": 5,
+      "maximum_process_negative_rate": 0.05
+    },
+    "60_to_100": {
+      "minimum_age_days": 14,
+      "minimum_meaningful_outcomes": 40,
+      "minimum_positive_constructive": 15,
+      "maximum_sev_2_rate": 0.02,
+      "maximum_duplicate_process_rejection_rate": 0.05
+    },
+    "100_to_150": {
+      "minimum_age_days": 21,
+      "minimum_meaningful_outcomes": 75,
+      "minimum_positive_constructive": 25,
+      "support_response_reviewed": true,
+      "founder_risk_decision": true
+    }
+  },
+  "goal_mix": {
+    "external_unique_receipts_target": 1000,
+    "authored_public_floor": 750,
+    "maintainer_authorized_verification_floor": 25,
+    "scale_proportionally_to": 2000
+  },
+  "amendment_control": {
+    "prospective_only": true,
+    "versioned": true,
+    "decision_before_effective_time": true,
+    "no_regrading_prior_data": true,
+    "signed_amendment_required": true
+  },
+  "official_source_snapshot": [
+    {
+      "url": "https://docs.github.com/en/site-policy/github-terms/github-terms-of-service",
+      "fetched_at": "2026-07-17T00:00:00Z",
+      "scope": "account requirements"
+    },
+    {
+      "url": "https://docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies",
+      "fetched_at": "2026-07-17T00:00:00Z",
+      "scope": "spam, bulk activity, privacy, advertising"
+    },
+    {
+      "url": "https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api",
+      "fetched_at": "2026-07-17T00:00:00Z",
+      "scope": "primary and secondary rate-limit stop behavior"
+    }
+  ]
+}

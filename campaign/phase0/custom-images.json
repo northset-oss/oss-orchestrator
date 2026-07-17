@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "images": [
+    {
+      "name": "author",
+      "tag": "northset-oss-author:0.144.1",
+      "dockerfile": "author-image/Dockerfile",
+      "context": "author-image"
+    }
+  ]
+}

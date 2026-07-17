@@ -21,6 +21,7 @@ import {
   copyProfileDependencies,
   dependencyCacheKey,
   dependencyBootstrapDockerArgs,
+  AUTHOR_MODEL_ATTEMPT_MS,
   MAX_ELEVATED_EXISTING_TESTS,
   PREPARE_BUDGET_MS,
   parseOssArgs,
@@ -112,6 +113,11 @@ test('prepare has one shared sixty-minute budget', () => {
   assert.equal(MAX_ELEVATED_EXISTING_TESTS, 2);
   assert.equal(parseOssArgs(['prepare', 'M-010']).concurrency, 3);
   assert.throws(() => parseOssArgs(['prepare', '--concurrency', '13', 'M-010']), /1 to 12/);
+  assert.throws(() => parseOssArgs(['ship-batch', '--batch', '/tmp/board.json', '--approve', digest('a')]), /approval-record/i);
+  assert.equal(parseOssArgs(['ship-batch', '--batch', '/tmp/board.json', '--approve', digest('a'),
+    '--approval-record', '/tmp/approval.json']).approvalRecord, '/tmp/approval.json');
+  assert.throws(() => parseOssArgs(['ship-batch', '--batch', '/tmp/board.json', '--approve', digest('a'),
+    '--approval-record', '/tmp/approval.json', '--reviewer-roster', '/tmp/forged.json']), /unknown argument/i);
 });
 
 test('warm planning deduplicates executor images and retains immutable digests without deleting data', async (t) => {
@@ -404,6 +410,9 @@ test('schema-v2 missions bind stable economic task identity and attempt sequence
   assert.throws(() => validateSpec(unsafeSourceEvidence), /source evidence/i);
   assert.throws(() => validateSpec({...value, task_id: 'TASK-OSS-INVENTED'}), /task_id.*candidate/i);
   assert.throws(() => validateSpec({...value, attempt_sequence: 0}), /attempt_sequence/i);
+  assert.doesNotThrow(() => validateSpec({...value, calibration_ordinal: 1}));
+  assert.throws(() => validateSpec({...value, calibration_ordinal: 0}), /calibration_ordinal/i);
+  assert.throws(() => validateSpec({...value, calibration_ordinal: 21}), /calibration_ordinal/i);
   assert.throws(() => validateSpec({...value, work_category: 'revenue_generation'}), /work_category/i);
 });
 
@@ -599,6 +608,7 @@ test('only the smoke-tested node profile and approved reasoning values are accep
 });
 
 test('dependency bootstrap has no credential mount; author mount appears only in author phase', async () => {
+  assert.equal(AUTHOR_MODEL_ATTEMPT_MS, 12 * 60 * 1000);
   const value = spec();
   const bootstrap = dependencyBootstrapDockerArgs(value, '/runs/M-010/author', 'node@sha256:' + '9'.repeat(64));
   const author = authorDockerArgs(value, '/runs/M-010/author', 'node@sha256:' + '9'.repeat(64), '/secret/codex');
@@ -627,13 +637,15 @@ test('dependency bootstrap retries one infrastructure failure within the same au
   const base = await mkdtemp(path.join(os.tmpdir(), 'northset-dependency-bootstrap-retry-'));
   t.after(() => rm(base, {recursive: true, force: true}));
   let bootstrapRuns = 0;
-  const runImpl = async (command, args) => {
+  let authorTimeoutMs = null;
+  const runImpl = async (command, args, options = {}) => {
     assert.equal(command, 'docker');
     if (args.includes('northset-m-010-dependency-bootstrap') && args[0] === 'run') {
       bootstrapRuns += 1;
       if (bootstrapRuns === 1) return {code: 125, stdout: '', stderr: 'temporary Docker daemon failure', durationMs: 11};
       return {code: 0, stdout: '', stderr: '', durationMs: 13};
     }
+    if (args.includes('northset-m-010-author') && args[0] === 'run') authorTimeoutMs = options.timeoutMs;
     return {code: 0, stdout: '', stderr: '', durationMs: args[0] === 'run' ? 17 : 0};
   };
 
@@ -643,6 +655,7 @@ test('dependency bootstrap retries one infrastructure failure within the same au
   }, {runImpl, authorImage: 'sha256:' + '8'.repeat(64)});
 
   assert.equal(bootstrapRuns, 2);
+  assert.equal(authorTimeoutMs, AUTHOR_MODEL_ATTEMPT_MS);
   assert.deepEqual(result.usage, {
     bootstrap_duration_ms: 24,
     bootstrap_retry_count: 1,

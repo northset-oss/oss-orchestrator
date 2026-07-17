@@ -100,6 +100,7 @@ test('approval journal records the explicit human actor and exact approval time'
   assert.equal(approval.task_id, 'TASK-OSS-0123456789ABCDEF');
   assert.equal(approval.approved_manifest_digest, digest('a'));
   assert.equal(approval.approved_by, 'internal-user:aeziz');
+  assert.equal(approval.batch_approval_record_sha256, null);
   assert.equal(approval.operational_caps.prepare_wall_seconds, 3600);
   assert.equal(approval.operational_caps.ship_wall_seconds, 3600);
 });

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-07-17T00:00:00Z",
+  "reviewers": [
+    {
+      "operator": "Aysajan",
+      "expected_os_user": "aeziz-local",
+      "public_key_file": "aysajan.pem",
+      "reviewer_id": "reviewer:ed25519:fdc0515981b00c89f119610397835a2f03a0cecacae75ebaab454352171f6748",
+      "capabilities": ["review", "batch_approve", "handoff"],
+      "key_status": "provisioned",
+      "credential_isolation_status": "current_user_only"
+    },
+    {
+      "operator": "Shehide",
+      "expected_os_user": "shehide",
+      "public_key_file": "shehide.pem",
+      "reviewer_id": null,
+      "capabilities": ["review", "handoff"],
+      "key_status": "pending_operator_provisioning",
+      "credential_isolation_status": "pending_separate_os_account"
+    }
+  ]
+}

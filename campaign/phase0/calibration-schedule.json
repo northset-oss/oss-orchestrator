@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "status": "scheduled_not_started",
+  "rules": {
+    "blind_independent_review": true,
+    "compare_fields": ["ship_or_no_ship", "risk_tier", "scope_concerns", "missing_checks"],
+    "amber_dual_review_percent": 100,
+    "green_audit_percent": 5,
+    "ship_disagreement_requires_founder_adjudication": true,
+    "pause_above_trailing_20_disagreement_rate": 0.1
+  },
+  "missions": [
+    {"calibration_id":"CAL-001","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-002","risk_tier":"AMBER"},
+    {"calibration_id":"CAL-003","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-004","risk_tier":"AMBER"},
+    {"calibration_id":"CAL-005","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-006","risk_tier":"AMBER"},
+    {"calibration_id":"CAL-007","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-008","risk_tier":"AMBER"},
+    {"calibration_id":"CAL-009","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-010","risk_tier":"AMBER"},
+    {"calibration_id":"CAL-011","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-012","risk_tier":"AMBER"},
+    {"calibration_id":"CAL-013","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-014","risk_tier":"AMBER"},
+    {"calibration_id":"CAL-015","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-016","risk_tier":"AMBER"},
+    {"calibration_id":"CAL-017","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-018","risk_tier":"AMBER"},
+    {"calibration_id":"CAL-019","risk_tier":"GREEN"},
+    {"calibration_id":"CAL-020","risk_tier":"AMBER"}
+  ]
+}

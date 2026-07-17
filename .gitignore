@@ -1,5 +1,6 @@
 runs/
 cache/
+.phase0-artifacts/
 candidate_lake.sqlite
 candidate_lake.sqlite-shm
 candidate_lake.sqlite-wal

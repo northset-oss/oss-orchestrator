@@ -33,6 +33,15 @@ import {
   validateSpecs,
 } from './core.mjs';
 import {normalizedPrClaimText, reviewPatch} from './review-patch.mjs';
+import {
+  assertTaskResourcePolicy,
+  assertPhase0Spec,
+  isProviderThrottle,
+  loadResourceControl,
+  remainingTaskLaneMs,
+  resourceUsageForTask,
+  tripPersistentProviderThrottle,
+} from './campaign/phase0/resource-breakers.mjs';
 
 const OSS_FILE = fileURLToPath(import.meta.url);
 const HERE = path.dirname(OSS_FILE);
@@ -41,6 +50,7 @@ const RUN_MISSION = path.join(NORTHSET_OSS, 'bin', 'run-mission.mjs');
 const BUNDLE_CLI = path.join(NORTHSET_OSS, 'bin', 'bundle.mjs');
 const READY_TTL_HOURS = 8;
 export const PREPARE_BUDGET_MS = 60 * 60 * 1000;
+export const AUTHOR_MODEL_ATTEMPT_MS = 12 * 60 * 1000;
 export const MAX_ELEVATED_EXISTING_TESTS = 2;
 const AUTHOR_IMAGE = process.env.OSS_AUTHOR_IMAGE ?? 'northset-oss-author:0.144.1';
 const DEPENDENCY_CACHE_ROOT = process.env.OSS_DEPENDENCY_CACHE_DIR ?? path.join(HERE, 'cache', 'dependencies');
@@ -609,12 +619,12 @@ export async function runAuthorContainer(spec, dirs, {
     const dependencySnapshot = await snapshotProfileDependencies(spec.executor.profile,
       path.join(dirs.authorWorkspace, 'repo'), path.join(dirs.base, 'dependency-snapshot'));
     await log(`dependency bootstrap snapshot fixed before credentialed authoring: ${dependencySnapshot.digest}`);
-    let author = await runDocker(runImpl, plan.author, {timeoutMs: limits(spec).wallMs * 2, deadline});
+    let author = await runDocker(runImpl, plan.author, {timeoutMs: AUTHOR_MODEL_ATTEMPT_MS, deadline});
     await must(authoringMode === 'test_only_then_fix' ? 'test-only author container' : 'author container', author);
     let authorDurationMs = author.durationMs ?? 0;
     if (authoringMode === 'test_only_then_fix') {
       await verifyTestOnlyAuthorResult(spec, dirs.authorWorkspace, image, {deadline, runImpl, log, dependencySnapshot});
-      author = await runDocker(runImpl, plan.authorFix, {timeoutMs: limits(spec).wallMs * 2, deadline});
+      author = await runDocker(runImpl, plan.authorFix, {timeoutMs: AUTHOR_MODEL_ATTEMPT_MS, deadline});
       await must('fix-only author container', author);
       authorDurationMs += author.durationMs ?? 0;
     }
@@ -1243,6 +1253,7 @@ const TERMINAL_LINEAGE_JOURNAL_STATES = new Set([
 ]);
 
 async function writeAttempt(dirs, spec, state, detail, timings, startedAt) {
+  const updatedAt = new Date();
   await writeFile(path.join(dirs.base, 'attempt.json'), `${JSON.stringify({
     schema_version: spec.schema_version === 2 ? 2 : 1,
     ...(spec.schema_version === 2 ? {
@@ -1254,7 +1265,8 @@ async function writeAttempt(dirs, spec, state, detail, timings, startedAt) {
     } : {}),
     state,
     started_at: startedAt.toISOString(),
-    updated_at: new Date().toISOString(),
+    updated_at: updatedAt.toISOString(),
+    lane_hours: Math.max(0, updatedAt.getTime() - startedAt.getTime()) / 3_600_000,
     terminal_reason: detail ?? null,
     timings,
   }, null, 2)}\n`);
@@ -1328,7 +1340,7 @@ export async function validateActiveSpecs(specsDir) {
 
 async function prepareMission(spec, options) {
   const dirs = missionDirs(options.runsDir, spec.mission_id);
-  const deadline = createDeadline(PREPARE_BUDGET_MS);
+  const resourceControlFile = path.join(options.runsDir, 'phase0', 'resource-control.json');
   const startedAt = new Date();
   const timings = [];
   let activeStage = 'initialize';
@@ -1345,6 +1357,13 @@ async function prepareMission(spec, options) {
     }
     return {state, spec, detail, timings: previous.timings ?? []};
   }
+  const resourceControl = {
+    ...(await loadResourceControl(resourceControlFile)),
+    task_lane_hours_used: await resourceUsageForTask(options.runsDir, spec.task_id),
+  };
+  assertPhase0Spec(spec);
+  assertTaskResourcePolicy(spec, resourceControl);
+  const deadline = createDeadline(Math.min(PREPARE_BUDGET_MS, remainingTaskLaneMs(spec, resourceControl)));
   await rm(dirs.ready, {recursive: true, force: true});
   await mkdir(dirs.base, {recursive: true, mode: 0o700});
   const log = async (message) => {
@@ -1428,6 +1447,7 @@ async function prepareMission(spec, options) {
         task_id: spec.task_id,
         attempt_sequence: spec.attempt_sequence,
         work_category: spec.work_category,
+        calibration_ordinal: spec.calibration_ordinal ?? null,
         economic_sha256: sha256(await readFile(path.join(bundle.missionDir, 'bundle', 'economic.json'))),
       } : {}),
       prepared_at: preparedAt.toISOString(),
@@ -1473,6 +1493,11 @@ async function prepareMission(spec, options) {
     await writeAttempt(dirs, spec, 'READY', null, timings, startedAt);
     return {state: 'READY', spec, dirs, manifest, manifestDigest: digest, classes: result.classes};
   } catch (error) {
+    if (isProviderThrottle(error)) {
+      await tripPersistentProviderThrottle(resourceControlFile, {
+        provider: 'OpenAI', signal: 'provider rate-limit or throttle detected',
+      });
+    }
     const budget = deadline.expired() || /timed out|deadline exhausted/i.test(error.message);
     const state = budget ? 'FAILED_BUDGET'
       : activeStage === 'author' ? 'FAILED_AUTHOR'
@@ -1549,7 +1574,9 @@ async function printBoard(results, options) {
   console.log(`machine_board: ${board.jsonFile}`);
   console.log(`human_board: ${board.markdownFile}`);
   console.log(`batch_manifest_digest: ${board.machine.batch_digest}`);
-  console.log(`node oss.mjs ship-batch --batch ${board.jsonFile} --approve ${board.machine.batch_digest} --approved-by internal-user:aeziz`);
+  console.log(`node campaign/phase0/phase0-cli.mjs finalize-reviewed-board --board ${board.jsonFile} --runs ${options.runsDir} --out <reviewed-board.json>`);
+  console.log('node campaign/phase0/phase0-cli.mjs sign-batch-approval --private <operator-key.pem> --board <reviewed-board.json> --runs ' + `${options.runsDir} --record <signed-batch-approval.json>`);
+  console.log('node oss.mjs ship-batch --batch <reviewed-board.json> --approve <reviewed-batch-digest> --approval-record <signed-batch-approval.json>');
 }
 
 export function parseOssArgs(argv) {
@@ -1559,13 +1586,13 @@ export function parseOssArgs(argv) {
   if (!['warm', 'prepare', 'decline', 'ship', 'status'].includes(command)) {
     throw new Error('usage: oss <warm|prepare|prepare-batch|decline|ship|ship-batch|status> ...');
   }
-  const options = {...DEFAULTS, command, requestedCommand, ids: [], approve: null, approvedBy: null,
+  const options = {...DEFAULTS, command, requestedCommand, ids: [], approve: null, approvalRecord: null,
     push: true, retryInfraTerminal: false, batch: null, board: null, warmOutput: null,
     warmManifest: null, minimumFreeBytes: 5 * 1024 * 1024 * 1024};
   while (argv.length) {
     const value = argv.shift();
     if (value === '--approve') options.approve = argv.shift();
-    else if (value === '--approved-by') options.approvedBy = argv.shift();
+    else if (value === '--approval-record') options.approvalRecord = path.resolve(argv.shift());
     else if (value === '--retry-infra-terminal') options.retryInfraTerminal = true;
     else if (value === '--concurrency') options.concurrency = Number(argv.shift());
     else if (value === '--batch' || value === '--batch-manifest') options.batch = path.resolve(argv.shift());
@@ -1584,6 +1611,7 @@ export function parseOssArgs(argv) {
   if (!Number.isFinite(options.minimumFreeBytes) || options.minimumFreeBytes < 0) throw new Error('--minimum-free-gb must be non-negative');
   if (command !== 'status' && !options.ids.length && !options.batch) throw new Error(`${requestedCommand} requires mission ids or --batch <manifest>`);
   if (command === 'ship' && !options.approve) throw new Error('ship requires --approve <batch-digest>');
+  if (command === 'ship' && !options.approvalRecord) throw new Error('ship requires --approval-record <signed-batch-approval.json>');
   return options;
 }
 
@@ -1635,9 +1663,6 @@ async function main() {
     console.log(`warm_manifest: ${output}`);
     return;
   }
-  if (options.command === 'ship' && specs.some((spec) => spec.schema_version === 2) && !options.approvedBy) {
-    throw new Error('schema-v2 ship requires --approved-by <stable-operator-id>');
-  }
   if (options.command === 'decline') {
     for (const spec of specs) {
       const dirs = missionDirs(options.runsDir, spec.mission_id);
@@ -1659,9 +1684,15 @@ async function main() {
     return;
   }
   const {shipBatch} = await import('./ship.mjs');
+  const {loadReviewerRoster} = await import('./campaign/phase0/roster.mjs');
+  const [signedBatchApproval, roster] = await Promise.all([
+    readFile(options.approvalRecord, 'utf8').then(JSON.parse),
+    loadReviewerRoster(),
+  ]);
   const result = await shipBatch(specs.map((spec) => ({spec, missionDir: path.join(options.runsDir, spec.mission_id)})), {
     approvedDigest: options.approve,
-    approvedBy: options.approvedBy,
+    signedBatchApproval,
+    reviewerRoster: roster,
     retryInfraTerminal: options.retryInfraTerminal,
     concurrency: options.concurrency,
     log: async (id, message) => console.log(`  ${id}  ${message}`),

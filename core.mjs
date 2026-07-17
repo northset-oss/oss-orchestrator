@@ -525,6 +525,10 @@ export function validateSpec(spec) {
     if (!['defect_fix', 'compatibility_fix', 'developer_tooling_fix', 'documentation_fix', 'test_infrastructure_fix'].includes(spec.work_category)) {
       throw new Error('work_category must be a bounded factual OSS work category');
     }
+    if (spec.calibration_ordinal !== undefined &&
+        (!Number.isInteger(spec.calibration_ordinal) || spec.calibration_ordinal < 1 || spec.calibration_ordinal > 20)) {
+      throw new Error('calibration_ordinal must be an integer from 1 through 20');
+    }
   } else if (economicFields.some((field) => Object.hasOwn(spec, field))) {
     throw new Error('task_id, attempt_sequence, and work_category require schema_version 2');
   }
