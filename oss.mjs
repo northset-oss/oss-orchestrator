@@ -61,6 +61,11 @@ const DEFAULTS = {
   concurrency: 3,
 };
 
+export function remainingAuthorModelMs(elapsedMs) {
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) throw new Error('elapsed model time must be nonnegative');
+  return Math.max(0, Math.floor(AUTHOR_MODEL_ATTEMPT_MS - elapsedMs));
+}
+
 function missionGit(deadline, cwd, ...args) {
   return run('git', ['-C', cwd, ...args], {
     env: sanitizedGitEnv(), deadline, timeoutMs: 2 * 60 * 1000,
@@ -624,9 +629,14 @@ export async function runAuthorContainer(spec, dirs, {
     let authorDurationMs = author.durationMs ?? 0;
     if (authoringMode === 'test_only_then_fix') {
       await verifyTestOnlyAuthorResult(spec, dirs.authorWorkspace, image, {deadline, runImpl, log, dependencySnapshot});
-      author = await runDocker(runImpl, plan.authorFix, {timeoutMs: AUTHOR_MODEL_ATTEMPT_MS, deadline});
+      const fixTimeoutMs = remainingAuthorModelMs(authorDurationMs);
+      if (fixTimeoutMs <= 0) throw new Error('author attempt exhausted its shared 12-minute model budget before the fix-only phase');
+      author = await runDocker(runImpl, plan.authorFix, {timeoutMs: fixTimeoutMs, deadline});
       await must('fix-only author container', author);
       authorDurationMs += author.durationMs ?? 0;
+      if (authorDurationMs > AUTHOR_MODEL_ATTEMPT_MS) {
+        throw new Error('author attempt exceeded its shared 12-minute model budget');
+      }
     }
     return {
       repoDir: path.join(dirs.authorWorkspace, 'repo'),

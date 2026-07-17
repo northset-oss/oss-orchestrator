@@ -25,6 +25,7 @@ import {
   MAX_ELEVATED_EXISTING_TESTS,
   PREPARE_BUDGET_MS,
   parseOssArgs,
+  remainingAuthorModelMs,
   removeRunWorkspace,
   runAuthorContainer,
   snapshotProfileDependencies,
@@ -625,6 +626,14 @@ test('dependency bootstrap has no credential mount; author mount appears only in
   assert.match(dry.codex.join(' '), /Red\/green requirement/);
   assert.match(dry.codex.join(' '), /Do not edit repository pull-request templates/);
   assert.doesNotMatch(dry.codex.join(' '), /code_prompt/);
+});
+
+test('test-only and fix-only phases share one twelve-minute model budget', () => {
+  assert.equal(remainingAuthorModelMs(0), AUTHOR_MODEL_ATTEMPT_MS);
+  assert.equal(remainingAuthorModelMs(4 * 60 * 1000), 8 * 60 * 1000);
+  assert.equal(remainingAuthorModelMs(AUTHOR_MODEL_ATTEMPT_MS), 0);
+  assert.equal(remainingAuthorModelMs(AUTHOR_MODEL_ATTEMPT_MS + 1), 0);
+  assert.throws(() => remainingAuthorModelMs(-1), /elapsed model time/i);
 });
 
 test('spec validation rejects public-receipt limitations that omit exact baseline claims', () => {
