@@ -142,6 +142,22 @@ test('prepare has one shared sixty-minute budget', () => {
     '--approval-record', '/tmp/approval.json', '--reviewer-roster', '/tmp/forged.json']), /unknown argument/i);
 });
 
+test('status is read-only unless explicitly applied and no-push cannot mutate', () => {
+  const readOnly = parseOssArgs(['status']);
+  assert.equal(readOnly.applyStatus, false);
+  assert.equal(readOnly.push, false);
+
+  const explicitlyApplied = parseOssArgs(['status', '--apply']);
+  assert.equal(explicitlyApplied.applyStatus, true);
+  assert.equal(explicitlyApplied.push, true);
+
+  const noPush = parseOssArgs(['status', '--no-push']);
+  assert.equal(noPush.applyStatus, false);
+  assert.equal(noPush.push, false);
+  assert.throws(() => parseOssArgs(['status', '--apply', '--no-push']), /cannot be combined/);
+  assert.throws(() => parseOssArgs(['prepare', '--apply', 'M-010']), /valid only for status/);
+});
+
 test('prepare records a gateway throttle as terminal PROVIDER_THROTTLED and never retries it', async (t) => {
   const runsDir = await mkdtemp(path.join(os.tmpdir(), 'northset-prepare-github-throttle-'));
   t.after(() => rm(runsDir, {recursive: true, force: true}));

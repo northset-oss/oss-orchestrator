@@ -2078,29 +2078,48 @@ async function syncPublication(directory, {dryRun = false, deadline, now = new D
   return {mission: true, changed: true, attention};
 }
 
-export async function syncStatus({push = true} = {}) {
+export function statusSyncPolicy({apply = false, push = false} = {}) {
+  const mutating = apply === true && push === true;
+  return {dryRun: !mutating, publish: mutating};
+}
+
+export async function syncStatus({apply = false, push = false, adapter = {}} = {}) {
+  const statusPolicy = statusSyncPolicy({apply, push});
+  const {
+    ensureClean = ensureCleanPublicRepository,
+    readPolicy = async () => JSON.parse(await readFile(
+      path.join(NORTHSET_OSS, 'policies', 'pr_receipt_disclosure_policy.json'), 'utf8')),
+    listMissions = () => readdir(path.join(NORTHSET_OSS, 'missions'), {withFileTypes: true}),
+    syncOne = syncPublication,
+    rebuild = rebuildLedger,
+    publish = publishLedgerPullRequest,
+  } = adapter;
   const deadline = createDeadline(SHIP_BUDGET_MS);
-  await ensureCleanPublicRepository(deadline);
-  const policy = JSON.parse(await readFile(path.join(NORTHSET_OSS, 'policies', 'pr_receipt_disclosure_policy.json'), 'utf8'));
-  const entries = await readdir(path.join(NORTHSET_OSS, 'missions'), {withFileTypes: true});
+  await ensureClean(deadline);
+  const policy = await readPolicy();
+  const entries = await listMissions();
   let missions = 0;
   let changed = false;
   const attention = [];
   for (const entry of entries.filter((item) => item.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
-    const result = await syncPublication(path.join(NORTHSET_OSS, 'missions', entry.name), {deadline, policy});
+    const result = await syncOne(path.join(NORTHSET_OSS, 'missions', entry.name), {
+      deadline, policy, dryRun: statusPolicy.dryRun,
+    });
     if (result.mission) missions += 1;
     changed ||= result.changed;
     if (result.attention) attention.push(entry.name);
   }
-  if (!changed) return {changed: false, missions, attention};
-  await rebuildLedger(deadline);
+  if (!changed || statusPolicy.dryRun) {
+    return {changed, applied: false, missions, attention, ledger_pr_url: null};
+  }
+  await rebuild(deadline);
   let ledgerPrUrl = null;
-  if (push) {
-    const published = await publishLedgerPullRequest(
+  if (statusPolicy.publish) {
+    const published = await publish(
       ['missions', 'missions/index.json', 'site'], 'ledger: reconcile upstream PR status',
       'missions/index.json', {missionId: `status-${Date.now()}`, phase: 'reconcile'}, deadline,
     );
     ledgerPrUrl = published.prUrl;
   }
-  return {changed: true, missions, attention, ledger_pr_url: ledgerPrUrl};
+  return {changed: true, applied: true, missions, attention, ledger_pr_url: ledgerPrUrl};
 }

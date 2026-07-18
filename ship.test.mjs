@@ -553,6 +553,35 @@ test('ledger publication stages the whole generated site and never targets main 
   ]);
 });
 
+test('status defaults to a zero-mutation dry run and requires explicit apply to publish', async () => {
+  const ship = await import('./ship.mjs');
+  assert.deepEqual(ship.statusSyncPolicy(), {dryRun: true, publish: false});
+  assert.deepEqual(ship.statusSyncPolicy({apply: true, push: false}), {dryRun: true, publish: false});
+  assert.deepEqual(ship.statusSyncPolicy({apply: true, push: true}), {dryRun: false, publish: true});
+
+  const events = [];
+  const adapter = {
+    ensureClean: async () => events.push('clean'),
+    readPolicy: async () => ({historical_exempt_mission_ids: []}),
+    listMissions: async () => [{name: 'M-STATUS', isDirectory: () => true}],
+    syncOne: async (directory, options) => {
+      events.push(['sync', directory, options.dryRun]);
+      return {mission: true, changed: true, attention: false};
+    },
+    rebuild: async () => events.push('rebuild'),
+    publish: async () => {
+      events.push('publish');
+      return {prUrl: 'https://github.com/northset-oss/verification-pilot/pull/1'};
+    },
+  };
+  const result = await ship.syncStatus({adapter});
+  assert.equal(result.changed, true);
+  assert.equal(result.applied, false);
+  assert.equal(result.ledger_pr_url, null);
+  assert.equal(events.some((event) => event === 'rebuild' || event === 'publish'), false);
+  assert.equal(events.find((event) => Array.isArray(event) && event[0] === 'sync')[2], true);
+});
+
 test('batch approval is ordered, configurable to fifty, and preserves repository policy caps', async () => {
   const ship = await import('./ship.mjs');
   assert.equal(typeof ship.validateApprovedBatch, 'function');

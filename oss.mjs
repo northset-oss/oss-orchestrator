@@ -1867,7 +1867,7 @@ export function parseOssArgs(argv) {
     throw new Error('usage: oss <warm|prepare|prepare-batch|decline|ship|ship-batch|status> ...');
   }
   const options = {...DEFAULTS, command, requestedCommand, ids: [], approve: null, approvalRecord: null,
-    push: true, retryInfraTerminal: false, batch: null, board: null, warmOutput: null,
+    push: true, applyStatus: false, retryInfraTerminal: false, batch: null, board: null, warmOutput: null,
     warmManifest: null, phase1Runtime: null, minimumFreeBytes: 5 * 1024 * 1024 * 1024};
   while (argv.length) {
     const value = argv.shift();
@@ -1884,12 +1884,18 @@ export function parseOssArgs(argv) {
     else if (value === '--specs') options.specsDir = path.resolve(argv.shift());
     else if (value === '--runs') options.runsDir = path.resolve(argv.shift());
     else if (value === '--only') options.ids.push(argv.shift());
+    else if (value === '--apply') options.applyStatus = true;
     else if (value === '--no-push') options.push = false;
     else if (value.startsWith('--')) throw new Error(`unknown argument ${value}`);
     else options.ids.push(value);
   }
   if (!Number.isInteger(options.concurrency) || options.concurrency < 1 || options.concurrency > 12) throw new Error('--concurrency must be an integer from 1 to 12');
   if (!Number.isFinite(options.minimumFreeBytes) || options.minimumFreeBytes < 0) throw new Error('--minimum-free-gb must be non-negative');
+  if (options.applyStatus && command !== 'status') throw new Error('--apply is valid only for status');
+  if (command === 'status') {
+    if (options.applyStatus && !options.push) throw new Error('status --apply cannot be combined with --no-push');
+    if (!options.applyStatus) options.push = false;
+  }
   if (command !== 'status' && !options.ids.length && !options.batch) throw new Error(`${requestedCommand} requires mission ids or --batch <manifest>`);
   if (command === 'ship' && !options.approve) throw new Error('ship requires --approve <batch-digest>');
   if (command === 'ship' && !options.approvalRecord) throw new Error('ship requires --approval-record <signed-batch-approval.json>');
@@ -1928,8 +1934,9 @@ async function main() {
   const options = parseOssArgs(process.argv.slice(2));
   if (options.command === 'status') {
     const {syncStatus} = await import('./ship.mjs');
-    const result = await syncStatus({push: options.push});
-    console.log(`status: ${result.changed ? 'updated' : 'current'} (${result.missions} contribution records)`);
+    const result = await syncStatus({apply: options.applyStatus, push: options.push});
+    const status = result.applied ? 'updated' : result.changed ? 'changes detected' : 'current';
+    console.log(`status: ${status} (${result.missions} contribution records)`);
     for (const mission of result.attention) console.log(`ATTENTION ${mission}: open PR needs a human response or has head drift`);
     return;
   }
