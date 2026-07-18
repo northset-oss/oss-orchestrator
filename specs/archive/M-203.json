@@ -1,0 +1,179 @@
+{
+  "schema_version": 2,
+  "mission_id": "M-203",
+  "task_id": "TASK-OSS-87B942C7678DC08D",
+  "attempt_sequence": 2,
+  "work_category": "defect_fix",
+  "workspace_mode": "readonly",
+  "authoring_mode": "test_only_then_fix",
+  "allow_modified_existing_tests": false,
+  "candidate": "chainstacklabs/pumpfun-cli#3",
+  "target_repo": "https://github.com/chainstacklabs/pumpfun-cli",
+  "issue_url": "https://github.com/chainstacklabs/pumpfun-cli/issues/3",
+  "base_branch": "main",
+  "base_commit": "0feac766c7176d045b6d906e26f78583047c98e0",
+  "problem_statement": "`pumpfun wallet transfer` accepts zero or negative numeric SOL amounts and forwards them toward transaction submission, allowing a zero-lamport transaction that wastes fees.",
+  "acceptance_criteria": [
+    "Zero and negative numeric SOL transfer amounts exit non-zero with `Transfer amount must be greater than zero.`",
+    "Validation occurs before calling the core transfer function or RPC path.",
+    "Positive SOL amounts and the existing `all` form retain their current dispatch behavior."
+  ],
+  "non_goals": [
+    "No new command, flag, dependency, or public API.",
+    "No changes to core/protocol transaction construction, wallet encryption, or program constants.",
+    "No Surfpool or mainnet testing is required."
+  ],
+  "constraints": [
+    "No new command, flag, dependency, or public API.",
+    "No changes to core/protocol transaction construction, wallet encryption, or program constants.",
+    "No Surfpool or mainnet testing is required.",
+    "Do not add dependencies, change lockfiles or CI, update generated output, add binaries or symlinks, or rename files.",
+    "Keep the contribution limited to production source and an oracle-bound regression test."
+  ],
+  "implementation_hints": [],
+  "process_requirements": [
+    "Branch from `main`.",
+    "Run `uv run pytest tests/ -q && uv run ruff check src/ tests/` before submission.",
+    "Use a conventional-commit PR title.",
+    "Complete the PR template, including layers touched, transaction/signing impact, and test plan."
+  ],
+  "source_evidence": [
+    "src/pumpfun_cli/commands/wallet.py:209 — @app.command(\"transfer\")",
+    "src/pumpfun_cli/commands/wallet.py:251 — if amount.lower() == \"all\":",
+    "src/pumpfun_cli/commands/wallet.py:258 — rpc, path, password, recipient, float(amount), confirm=confirm, **overrides",
+    "src/pumpfun_cli/core/wallet.py:121 — lamports = int(sol_amount * LAMPORTS_PER_SOL)",
+    "src/pumpfun_cli/core/wallet.py:131 — sig = await client.send_tx(",
+    "tests/test_commands/test_wallet_cmd.py:190 — patch(\"pumpfun_cli.commands.wallet.transfer_all_sol\", return_value=mock_result) as mock_fn,",
+    "CONTRIBUTING.md:33 — uv run pytest tests/ -q              # all unit tests",
+    "README.md:195 — This repo is configured for AI coding agents via the `.claude/` directory:"
+  ],
+  "qualification": {
+    "finder_run_id": null,
+    "candidate_rank": null,
+    "finder_elapsed_ms": null,
+    "review_duration_ms": 147001,
+    "review_id": "sha256:cee9e51e5c0a389282638ec18232d2394f6484d7ed00e8025a947e6d7401f9b8",
+    "review_prompt_version": 4,
+    "reviewed_at": "2026-07-18T09:59:45.477Z",
+    "qualification_expires_at": "2026-07-18T11:59:45.477Z",
+    "evidence_sha256": "sha256:8d9fd224c606c73c43c605e47b3ccae962067e87aea0c5684516740216a15f89",
+    "issue_updated_at": "2026-03-17T10:38:32Z",
+    "requested_model": "gpt-5.6-sol",
+    "actual_model": null,
+    "reasoning_effort": "xhigh",
+    "service_tier": "fast",
+    "model_requests": null,
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_tokens": null,
+    "source_evidence": [
+      "src/pumpfun_cli/commands/wallet.py:209 — @app.command(\"transfer\")",
+      "src/pumpfun_cli/commands/wallet.py:251 — if amount.lower() == \"all\":",
+      "src/pumpfun_cli/commands/wallet.py:258 — rpc, path, password, recipient, float(amount), confirm=confirm, **overrides",
+      "src/pumpfun_cli/core/wallet.py:121 — lamports = int(sol_amount * LAMPORTS_PER_SOL)",
+      "src/pumpfun_cli/core/wallet.py:131 — sig = await client.send_tx(",
+      "tests/test_commands/test_wallet_cmd.py:190 — patch(\"pumpfun_cli.commands.wallet.transfer_all_sol\", return_value=mock_result) as mock_fn,",
+      "CONTRIBUTING.md:33 — uv run pytest tests/ -q              # all unit tests",
+      "README.md:195 — This repo is configured for AI coding agents via the `.claude/` directory:"
+    ],
+    "invitation_evidence": {
+      "type": "repository_policy",
+      "url": "https://github.com/chainstacklabs/pumpfun-cli/blob/0feac766c7176d045b6d906e26f78583047c98e0/CONTRIBUTING.md#L88-L90",
+      "observed_at": "2026-07-18T09:57:22.005Z",
+      "content_sha256": "sha256:817de26f8ca2fd427ab654921fb905dc49f37ae98b9dfe5095de8d78d2fd0989"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "`pumpfun wallet transfer` accepts zero or negative numeric SOL amounts and forwards them toward transaction submission, allowing a zero-lamport transaction that wastes fees.",
+      "expected_behavior": [
+        "Zero and negative numeric SOL transfer amounts exit non-zero with `Transfer amount must be greater than zero.`",
+        "Validation occurs before calling the core transfer function or RPC path.",
+        "Positive SOL amounts and the existing `all` form retain their current dispatch behavior."
+      ],
+      "non_goals": [
+        "No new command, flag, dependency, or public API.",
+        "No changes to core/protocol transaction construction, wallet encryption, or program constants.",
+        "No Surfpool or mainnet testing is required."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/chainstacklabs/pumpfun-cli/issues/3",
+          "author_association": "MEMBER",
+          "summary": "The member-authored issue states the defect, exact validation and error text, two files to change, and focused test command."
+        }
+      ]
+    },
+    "related_prs": [
+      {
+        "url": "https://github.com/chainstacklabs/pumpfun-cli/pull/9",
+        "state": "CLOSED",
+        "relationship": "not_related",
+        "disposition": "Reviewed as both an exact and possible semantic match. It changed sell validation in core/trade and unrelated tests, not the wallet-transfer command, and was closed by a member as spam; it neither implements nor resists this scoped fix.",
+        "reopened_by": null
+      }
+    ]
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "tests/test_commands/test_wallet_cmd.py"
+    ],
+    "command": "uv run pytest tests/test_commands/test_wallet_cmd.py -v",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "test_wallet_transfer_rejects_non_positive_sol_amount",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix: reject non-positive SOL wallet transfers",
+    "summary": "`pumpfun wallet transfer` accepts zero or negative numeric SOL amounts and forwards them toward transaction submission, allowing a zero-lamport transaction that wastes fees."
+  },
+  "executor": {
+    "profile": "python",
+    "profile_status": "pilot",
+    "image": "python:3.14.5-bookworm",
+    "toolchain_class": "python-pure",
+    "install_commands": [
+      "python -m pip install uv",
+      "uv sync --dev"
+    ],
+    "commands": [
+      "uv run pytest tests/test_commands/test_wallet_cmd.py -v",
+      "uv run pytest tests/ -q",
+      "uv run ruff check src/ tests/"
+    ],
+    "reasoning_effort": "xhigh",
+    "profile_production_proven": false
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "schema_version": 2,
+      "defaults": {
+        "max_open_prs": 1,
+        "daily_pr_cap": 1
+      },
+      "repositories": {
+        "prometheus/client_js": {
+          "max_open_prs": 0,
+          "daily_pr_cap": 0,
+          "cooldown_until": "manual-release",
+          "reason": "Maintainer bandwidth concern; a new contribution requires an explicit invitation."
+        }
+      },
+      "cooldowns": {
+        "prometheus/client_js": {
+          "reason": "Maintainer reported AI-generated PR bandwidth exhaustion on 2026-07-13; keep paused until the existing interaction is resolved or a maintainer explicitly invites new work.",
+          "evidence_url": "https://github.com/prometheus/client_js/pull/773#issuecomment-4953870322"
+        }
+      }
+    },
+    "checks_not_run": [],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

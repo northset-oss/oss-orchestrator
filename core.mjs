@@ -4,6 +4,7 @@ import {readFileSync} from 'node:fs';
 import {appendFile, lstat, mkdtemp, readFile, readdir, readlink, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import {classifyGhRequest, ghRequest, isGhGatewayTerminalError} from './gh-gateway.mjs';
 
 const DEFAULT_OUTPUT_LIMIT_BYTES = 2_000_000;
 export const LIVE_RECHECK_OUTPUT_LIMIT_BYTES = 10_000_000;
@@ -149,8 +150,30 @@ export function sanitizedGitEnv(extra = {}) {
 
 export const git = (cwd, ...args) => run('git', ['-C', cwd, ...args], {env: sanitizedGitEnv()});
 
+export function ghRequestClass(args) {
+  return classifyGhRequest(args);
+}
+
+export async function runGhCommand(args, options = {}) {
+  const {
+    deadline,
+    outputLimitBytes,
+    maxBuffer = outputLimitBytes,
+    requestClass = ghRequestClass(args),
+    label = `gh ${args.slice(0, 2).join(' ')}`,
+    ...gatewayOptions
+  } = options;
+  const timeoutMs = deadline
+    ? deadline.limit(gatewayOptions.timeoutMs ?? Infinity)
+    : gatewayOptions.timeoutMs;
+  if (timeoutMs !== undefined && timeoutMs <= 0) {
+    return {status: 124, code: 124, stdout: '', stderr: 'deadline exhausted before subprocess start', timedOut: true};
+  }
+  return ghRequest(args, {...gatewayOptions, requestClass, label, timeoutMs, maxBuffer});
+}
+
 export async function ghJson(args, options = {}) {
-  const result = await run('gh', args, options);
+  const result = await runGhCommand(args, {...options, label: options.label ?? `core:${args.slice(0, 2).join(' ')}`});
   if (result.code !== 0) throw new Error(`gh ${args.join(' ')} failed: ${result.stderr.trim() || result.stdout.trim()}`);
   return JSON.parse(result.stdout);
 }
@@ -233,11 +256,13 @@ export function batchApprovalDigest(manifests) {
   return sha256(Buffer.from(canonical(subject), 'utf8'));
 }
 
-export async function directoryDigest(root) {
+export async function directoryDigest(root, {ignoreNames = []} = {}) {
+  const ignored = new Set(ignoreNames);
   const entries = [];
   async function walk(directory, prefix = '') {
     const children = (await readdir(directory, {withFileTypes: true})).sort((a, b) => a.name.localeCompare(b.name));
     for (const child of children) {
+      if (ignored.has(child.name)) continue;
       const relative = prefix ? `${prefix}/${child.name}` : child.name;
       const absolute = path.join(directory, child.name);
       const stats = await lstat(absolute);
@@ -320,7 +345,7 @@ export function parseCandidate(value) {
 export const AUTHOR_EFFORTS = ['medium', 'high', 'xhigh', 'max'];
 export const PROFILE_REGISTRY = JSON.parse(readFileSync(new URL('./profiles.json', import.meta.url), 'utf8'));
 export const SUPPORTED_PROFILES = Object.freeze(Object.keys(PROFILE_REGISTRY.profiles));
-export const QUALIFICATION_REVIEW_PROMPT_VERSIONS = Object.freeze([2, 3]);
+export const QUALIFICATION_REVIEW_PROMPT_VERSIONS = Object.freeze([2, 3, 4]);
 
 export function normalizeLabel(value) {
   return String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -395,9 +420,34 @@ function oracleCommandTargets(command, testPaths) {
     && /^[^/]+$/.test(fileName)
     && testPaths.length === 1
     && treeSitterCommand;
+  const normalizedGoPackage = (value) => {
+    if (value === '.') return '';
+    if (!/^\.\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+$/.test(value ?? '')) return null;
+    return value.slice(2).replace(/\/$/, '');
+  };
+  const goIndex = tokens.indexOf('go');
+  const goTestCommand = goIndex >= 0 && tokens[goIndex + 1] === 'test'
+    && tokens.some((token, index) => token === '-run' ? Boolean(tokens[index + 1]) : token.startsWith('-run='));
+  const makeGoTestCommand = tokens[0] === 'make'
+    && tokens.some((token) => /^TEST=.+/.test(token));
+  const goPackageTargets = new Set();
+  if (goTestCommand) {
+    for (const token of tokens.slice(goIndex + 2)) {
+      const target = normalizedGoPackage(token);
+      if (target !== null) goPackageTargets.add(target);
+    }
+  }
+  if (makeGoTestCommand) {
+    for (const token of tokens) {
+      if (!token.startsWith('PKG=')) continue;
+      const target = normalizedGoPackage(token.slice(4));
+      if (target !== null) goPackageTargets.add(target);
+    }
+  }
   return testPaths.every((testPath) => {
     if (tokens.includes(testPath) || tokens.includes(`./${testPath}`)) return true;
     if (treeSitterFileNameTarget && testPath === `test/corpus/${fileName}`) return true;
+    if (/_test\.go$/.test(testPath) && goPackageTargets.has(path.posix.dirname(testPath) === '.' ? '' : path.posix.dirname(testPath))) return true;
     if (!workingDirectory || workingDirectory.includes('..') || !testPath.startsWith(`${workingDirectory}/`)) return false;
     const relative = testPath.slice(workingDirectory.length + 1);
     return tokens.includes(relative) || tokens.includes(`./${relative}`);
@@ -555,6 +605,19 @@ export function validateSpec(spec) {
       throw new Error('receipt.limitations must include exact baseline entries "Does not prove code quality" and "Does not prove security"');
     }
   }
+  const workspaceMode = spec.workspace_mode ?? 'readonly';
+  if (!['readonly', 'writable_copy'].includes(workspaceMode)) {
+    throw new Error('workspace_mode must be readonly or writable_copy');
+  }
+  const workspaceWriteAllowlist = spec.workspace_write_allowlist ?? [];
+  if (!Array.isArray(workspaceWriteAllowlist) || workspaceWriteAllowlist.length > 32 ||
+      !workspaceWriteAllowlist.every((item) => typeof item === 'string' && item.trim() &&
+        item === path.posix.normalize(item) && !path.posix.isAbsolute(item) && !item.startsWith('../'))) {
+    throw new Error('workspace_write_allowlist must contain at most 32 normalized relative paths');
+  }
+  if (workspaceMode === 'readonly' && workspaceWriteAllowlist.length) {
+    throw new Error('workspace_write_allowlist is only valid for writable_copy');
+  }
   const q = spec.qualification;
   if (!q || typeof q !== 'object') throw new Error('qualification is required');
   if (!/^sha256:[0-9a-f]{64}$/i.test(q.review_id ?? '')) throw new Error('qualification.review_id must be a sha256 digest');
@@ -692,6 +755,17 @@ export function validateSpec(spec) {
   if (!SUPPORTED_PROFILES.includes(spec.executor.profile)) {
     throw new Error(`executor.profile must be one of ${SUPPORTED_PROFILES.join(', ')}`);
   }
+  if (spec.executor.toolchain_class !== undefined) {
+    const toolchain = PROFILE_REGISTRY.toolchain_classes?.[spec.executor.toolchain_class];
+    if (!toolchain || toolchain.profile !== spec.executor.profile) {
+      throw new Error(`executor.toolchain_class must be registered for profile ${spec.executor.profile}`);
+    }
+  }
+  for (const command of [...spec.executor.install_commands, ...spec.executor.commands]) {
+    if (/\b(?:sudo\s+)?apt(?:-get)?\s+(?:[^;&|]+\s+)*install\b/i.test(command)) {
+      throw new Error('repository-controlled apt install is forbidden; use a pinned toolchain class');
+    }
+  }
   const registeredProfile = PROFILE_REGISTRY.profiles[spec.executor.profile];
   if (spec.executor.profile !== PROFILE_REGISTRY.default_profile) {
     if (spec.executor.image !== registeredProfile.image || spec.executor.profile_status !== registeredProfile.status) {
@@ -813,14 +887,15 @@ export async function recheck(spec, log, options = {}) {
   let repoData;
   try {
     repoData = await gh(['api', `repos/${owner}/${repo}`,
-      '--jq', '{default_branch,archived,fork,html_url}']);
+      '--jq', '{node_id,default_branch,archived,fork,html_url}']);
   } catch (error) {
+    if (isGhGatewayTerminalError(error)) throw error;
     await log(`recheck: repository REST metadata failed; retrying through GitHub GraphQL — ${error.message}`);
     repoData = await gh([
       'api', 'graphql',
-      '-f', 'query=query($owner:String!, $name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}} isArchived isFork url}}',
+      '-f', 'query=query($owner:String!, $name:String!){repository(owner:$owner,name:$name){id defaultBranchRef{name target{... on Commit{oid}}} isArchived isFork url}}',
       '-F', `owner=${owner}`, '-F', `name=${repo}`,
-      '--jq', '.data.repository | {default_branch:.defaultBranchRef.name,default_head:.defaultBranchRef.target.oid,archived:.isArchived,fork:.isFork,html_url:.url}',
+      '--jq', '.data.repository | {node_id:.id,default_branch:.defaultBranchRef.name,default_head:.defaultBranchRef.target.oid,archived:.isArchived,fork:.isFork,html_url:.url}',
     ]);
   }
   const issue = await gh(['api', `repos/${owner}/${repo}/issues/${num}`,
@@ -830,6 +905,7 @@ export async function recheck(spec, log, options = {}) {
     const commentPages = await gh(['api', `repos/${owner}/${repo}/issues/${num}/comments?per_page=100`, '--paginate', '--slurp']);
     comments = Array.isArray(commentPages) ? commentPages.flat() : [];
   } catch (error) {
+    if (isGhGatewayTerminalError(error)) throw error;
     await log(`recheck: issue comments REST check failed; retrying through GitHub GraphQL — ${error.message}`);
     const response = await gh([
       'api', 'graphql',
@@ -843,7 +919,7 @@ export async function recheck(spec, log, options = {}) {
   const defaultRef = mode === 'pre-pr' ? null
     : repoData.default_head ? null : await gh(['api', `repos/${owner}/${repo}/git/ref/heads/${repoData.default_branch}`]);
   const defaultHead = repoData.default_head ?? defaultRef?.object?.sha ?? null;
-  const allPrs = await gh(['pr', 'list', '--repo', `${owner}/${repo}`, '--state', 'all', '--limit', '500',
+  const allPrs = await gh(['pr', 'list', '--repo', `${owner}/${repo}`, '--state', 'all', '--limit', '100',
     '--json', 'number,title,body,url,state,headRefName,author,createdAt,updatedAt,closedAt,mergedAt']);
   const openPrs = allPrs.filter((pr) => pr.state === 'OPEN');
   const northsetOpen = openPrs.filter((pr) => pr.author?.login === 'AysajanE');
@@ -851,6 +927,7 @@ export async function recheck(spec, log, options = {}) {
   try {
     timeline = timelineCrossReferences(await gh(timelineApiArgs(owner, repo, num)));
   } catch (error) {
+    if (isGhGatewayTerminalError(error)) throw error;
     await log(`recheck: timeline REST check failed; retrying through GitHub GraphQL — ${error.message}`);
     try {
       const response = await gh([
@@ -862,12 +939,15 @@ export async function recheck(spec, log, options = {}) {
       if (response?.truncated || !Array.isArray(response?.timeline)) throw new Error('timeline GraphQL fallback was incomplete');
       timeline = response.timeline;
     } catch (fallbackError) {
+      if (isGhGatewayTerminalError(fallbackError)) throw fallbackError;
       await log(`recheck: timeline check FAILED — ${fallbackError.message} (fail-closed → FAILED)`);
       throw new Error(`timeline recheck failed (fail-closed): ${fallbackError.message}`);
     }
   }
   const reviewedAt = Date.parse(spec.qualification.reviewed_at);
-  const cleared = new Set(spec.qualification.related_prs.filter((item) => item.blocking === false).map((item) => item.url));
+  const cleared = new Set(spec.qualification.related_prs
+    .filter((item) => item.blocking === false || (item.relationship === 'not_related' && item.state === 'CLOSED'))
+    .map((item) => item.url));
   const competingPRs = timeline.filter((item) => item.is_pr && (String(item.state).toLowerCase() === 'open' ||
     !cleared.has(item.source) || (item.created_at && Date.parse(item.created_at) > reviewedAt)));
   const semanticPRs = possibleOverlappingPrs(allPrs, spec).filter((pr) => pr.author?.login !== 'AysajanE');
@@ -883,8 +963,10 @@ export async function recheck(spec, log, options = {}) {
     }
   }
   const blockingSemantic = semanticPRs.filter((pr) => {
-    if (pr.state === 'OPEN' || pr.state === 'MERGED') return true;
     const reviewed = related.get(pr.url);
+    if (reviewed?.relationship === 'not_related' &&
+        String(reviewed.state).toUpperCase() === String(pr.state).toUpperCase()) return false;
+    if (pr.state === 'OPEN' || pr.state === 'MERGED') return true;
     return !(reviewed?.state === 'CLOSED' && reviewed.relationship === 'overlap' && reviewed.blocking === false &&
       reviewed.reopened_by && ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(reviewed.reopened_by.author_association) &&
       reopeningChecks.get(reviewed.url) === true);

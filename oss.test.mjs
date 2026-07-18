@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile} from 'node:fs/promises';
+import {spawn} from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -20,20 +21,27 @@ import {
   copyNodeDependencies,
   copyProfileDependencies,
   dependencyCacheKey,
+  detectToolchainClass,
   dependencyBootstrapDockerArgs,
   AUTHOR_MODEL_ATTEMPT_MS,
   MAX_ELEVATED_EXISTING_TESTS,
   PREPARE_BUDGET_MS,
+  prepareMission,
   parseOssArgs,
+  githubProviderThrottleFailure,
   remainingAuthorModelMs,
   removeRunWorkspace,
   runAuthorContainer,
+  isNativeToolchainFailure,
   snapshotProfileDependencies,
   verifyTestOnlyAuthorResult,
   warmBatch,
+  writeAttempt,
 } from './oss.mjs';
+import {GitHubThrottleError} from './gh-gateway.mjs';
 import {
   OSS_IDENTITY,
+  PROFILE_REGISTRY,
   assertBindingChain,
   assertOssCommitIdentity,
   assertPatchCommitBinding,
@@ -58,6 +66,17 @@ import {
 
 const oid = (char) => char.repeat(40);
 const digest = (char) => `sha256:${char.repeat(64)}`;
+
+function command(program, args, env) {
+  return new Promise((resolve) => {
+    const child = spawn(program, args, {env, stdio: ['ignore', 'pipe', 'pipe']});
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => resolve({code, stdout, stderr}));
+  });
+}
 
 function spec(overrides = {}) {
   return {
@@ -121,6 +140,122 @@ test('prepare has one shared sixty-minute budget', () => {
     '--approval-record', '/tmp/approval.json', '--reviewer-roster', '/tmp/forged.json']), /unknown argument/i);
 });
 
+test('prepare records a gateway throttle as terminal PROVIDER_THROTTLED and never retries it', async (t) => {
+  const runsDir = await mkdtemp(path.join(os.tmpdir(), 'northset-prepare-github-throttle-'));
+  t.after(() => rm(runsDir, {recursive: true, force: true}));
+  const value = spec({
+    schema_version: 2,
+    task_id: taskIdForCandidate('owner/repo#123'),
+    attempt_sequence: 1,
+    work_category: 'defect_fix',
+  });
+  const throttle = new GitHubThrottleError('GitHub secondary rate limit', {
+    signal: 'GITHUB_SECONDARY_RATE_LIMIT',
+  });
+  assert.deepEqual(githubProviderThrottleFailure(throttle), {
+    failure_reason_code: 'PROVIDER_THROTTLED',
+    terminal_reason_class: 'PROVIDER_THROTTLED',
+    retryable: false,
+    error_code: 'GITHUB_PROVIDER_THROTTLED',
+    signal: 'GITHUB_SECONDARY_RATE_LIMIT',
+  });
+  let rechecks = 0;
+  const options = {
+    runsDir,
+    prepareAdapter: {
+      recheck: async () => {
+        rechecks += 1;
+        throw throttle;
+      },
+    },
+  };
+  const result = await prepareMission(value, options);
+  assert.equal(result.state, 'FAILED_INFRA_TERMINAL');
+  assert.equal(result.failure_reason_code, 'PROVIDER_THROTTLED');
+  assert.equal(result.terminal_reason_class, 'PROVIDER_THROTTLED');
+  assert.equal(result.retryable, false);
+  assert.equal(result.error_code, 'GITHUB_PROVIDER_THROTTLED');
+  assert.equal(result.signal, 'GITHUB_SECONDARY_RATE_LIMIT');
+
+  const record = JSON.parse(await readFile(path.join(runsDir, value.mission_id, 'attempt.json'), 'utf8'));
+  assert.equal(record.state, 'FAILED_INFRA_TERMINAL');
+  assert.equal(record.failure_reason_code, 'PROVIDER_THROTTLED');
+  assert.equal(record.terminal_reason_class, 'PROVIDER_THROTTLED');
+  assert.equal(record.retryable, false);
+  assert.equal(record.error_code, 'GITHUB_PROVIDER_THROTTLED');
+  assert.equal(record.signal, 'GITHUB_SECONDARY_RATE_LIMIT');
+  const resourceControl = JSON.parse(await readFile(path.join(runsDir, 'phase0', 'resource-control.json'), 'utf8'));
+  assert.equal(resourceControl.provider_pause.provider, 'GitHub');
+  assert.equal(resourceControl.provider_pause.signal, 'GITHUB_SECONDARY_RATE_LIMIT');
+
+  const replay = await prepareMission(value, options);
+  assert.equal(replay.state, 'FAILED_INFRA_TERMINAL');
+  assert.equal(replay.failure_reason_code, 'PROVIDER_THROTTLED');
+  assert.equal(replay.retryable, false);
+  assert.equal(rechecks, 1);
+  const lineage = await attemptLineageForSpec(runsDir, {
+    ...value,
+    mission_id: 'M-011',
+    attempt_sequence: 2,
+  });
+  assert.equal(lineage[0].terminal_reason_class, 'PROVIDER_THROTTLED');
+});
+
+test('prepare and ship command paths enforce activated Phase-1 schedule and incident holds', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-phase1-oss-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const specs = path.join(root, 'specs');
+  const runs = path.join(root, 'runs');
+  const runtimeFile = path.join(root, 'runtime.json');
+  const controlsFile = path.join(root, 'controls.json');
+  await mkdir(specs);
+  await writeFile(path.join(specs, 'M-010.json'), JSON.stringify(spec()));
+  const monotonicNow = () => Number(process.hrtime.bigint() / 1_000_000n);
+  const runtime = (overrides = {}) => ({
+    schema_version: 1,
+    active: true,
+    controls_state_file: controlsFile,
+    lanes: 8,
+    p75_attempt_start_interval_ms: 15 * 60 * 1000,
+    max_ntp_offset_ms: 1000,
+    ntp: {offset_ms: 0, observed_at: new Date().toISOString()},
+    board_monotonic_ms: monotonicNow() + 60 * 60 * 1000,
+    qualification: {predicted_prepare_start_monotonic_ms: monotonicNow() + 30 * 60 * 1000, qualified_ahead: 0},
+    ...overrides,
+  });
+  const controls = (incidents = []) => ({schema_version: 1, incidents, closures: [], hold_clearances: []});
+  const invoke = (commandArgs) => command(process.execPath, [path.join(import.meta.dirname, 'oss.mjs'), ...commandArgs], process.env);
+
+  await writeFile(controlsFile, JSON.stringify(controls()));
+  await writeFile(runtimeFile, JSON.stringify(runtime({board_monotonic_ms: monotonicNow() + 7 * 60 * 60 * 1000})));
+  let result = await invoke(['prepare', 'M-010', '--specs', specs, '--runs', runs, '--phase1-runtime', runtimeFile, '--no-push']);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Phase-1 runtime blocked prepare: OUTSIDE_BOARD_WINDOW/);
+
+  await writeFile(runtimeFile, JSON.stringify(runtime({ntp: {offset_ms: 1001, observed_at: new Date().toISOString()}})));
+  result = await invoke(['prepare', 'M-010', '--specs', specs, '--runs', runs, '--phase1-runtime', runtimeFile, '--no-push']);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Phase-1 runtime blocked prepare: NTP_HOLD/);
+
+  await writeFile(controlsFile, JSON.stringify(controls([{
+    incident_id: 'repo-stop', severity: 'SEV_1', scope: 'repository', repository: 'owner/repo',
+    event_class: 'stop_request', occurred_at: new Date().toISOString(),
+  }])));
+  await writeFile(runtimeFile, JSON.stringify(runtime()));
+  result = await invoke(['prepare', 'M-010', '--specs', specs, '--runs', runs, '--phase1-runtime', runtimeFile, '--no-push']);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Phase-1 runtime blocked prepare: REPOSITORY_HOLD owner\/repo/);
+
+  await writeFile(controlsFile, JSON.stringify(controls([{
+    incident_id: 'platform-stop', severity: 'SEV_1', scope: 'platform', repository: null,
+    event_class: 'platform_warning', occurred_at: new Date().toISOString(),
+  }])));
+  result = await invoke(['ship', 'M-010', '--specs', specs, '--runs', runs, '--phase1-runtime', runtimeFile,
+    '--approve', digest('a'), '--approval-record', path.join(root, 'missing-approval.json'), '--no-push']);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Phase-1 runtime blocked ship: GLOBAL_PUBLICATION_HOLD/);
+});
+
 test('warm planning deduplicates executor images and retains immutable digests without deleting data', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'warm-planning-'));
   t.after(() => rm(root, {recursive: true, force: true}));
@@ -171,6 +306,61 @@ test('writable dependency caches are isolated while schema-v2 retries reuse the 
   const retryAttempt = {...firstAttempt, mission_id: 'M-011', attempt_sequence: 2};
   assert.equal(await dependencyCacheKey(firstAttempt, root, image),
     await dependencyCacheKey(retryAttempt, root, image));
+
+  const identity = {architecture: 'arm64', repositoryNodeId: 'R_kgDOExample', trustDomain: 'authored'};
+  const authored = await dependencyCacheKey(first, root, image, identity);
+  assert.notEqual(authored, await dependencyCacheKey(first, root, image, {...identity, architecture: 'amd64'}));
+  assert.notEqual(authored, await dependencyCacheKey(first, root, image, {...identity, repositoryNodeId: 'R_kgDOOther'}));
+  assert.notEqual(authored, await dependencyCacheKey(first, root, image, {...identity, trustDomain: 'foreign'}));
+});
+
+test('Phase-1 toolchain classes are registered and repository-controlled apt installs are rejected', () => {
+  assert.equal(PROFILE_REGISTRY.profiles.go.image, 'golang:1.26.4-bookworm');
+  assert.deepEqual(Object.keys(PROFILE_REGISTRY.toolchain_classes).sort(), [
+    'node-native', 'node-pure', 'python-native', 'python-pure',
+  ]);
+  assert.throws(() => validateSpec(spec({
+    executor: {...spec().executor, install_commands: ['apt-get install -y build-essential', 'npm ci']},
+  })), /apt.*forbidden/i);
+  assert.doesNotThrow(() => validateSpec(spec({
+    executor: {...spec().executor, toolchain_class: 'node-pure'},
+    workspace_mode: 'writable_copy', workspace_write_allowlist: ['coverage'],
+  })));
+  assert.throws(() => validateSpec(spec({workspace_mode: 'writable_copy', workspace_write_allowlist: ['../escape']})), /allowlist/i);
+});
+
+test('toolchain classification detects native Node and Python metadata deterministically', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'toolchain-classification-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  await writeFile(path.join(root, 'package.json'), JSON.stringify({scripts: {install: 'node-gyp rebuild'}}));
+  assert.deepEqual(await detectToolchainClass('node', root), {
+    toolchain_class: 'node-native', signals: ['node-install-script'],
+  });
+  await rm(path.join(root, 'package.json'));
+  await writeFile(path.join(root, 'pyproject.toml'), '[build-system]\nrequires = ["maturin"]\n');
+  assert.deepEqual(await detectToolchainClass('python', root), {
+    toolchain_class: 'python-native', signals: ['python-extension-metadata'],
+  });
+  assert.equal(isNativeToolchainFailure({stdout: '', stderr: 'gyp ERR! build error'}), true);
+  assert.equal(isNativeToolchainFailure({stdout: '', stderr: 'npm ERR! ordinary test failure'}), false);
+});
+
+test('every durable attempt record carries complete Phase-1 measurement-class attribution', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'phase1-attribution-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const value = spec();
+  await writeAttempt({base: root}, value, 'FAILED_AUTHOR', 'bounded failure', [
+    {stage: 'author', duration_ms: 1250},
+  ], new Date(Date.now() - 5000));
+  const record = JSON.parse(await readFile(path.join(root, 'attempt.json'), 'utf8'));
+  assert.equal(record.profile, value.executor.profile);
+  assert.equal(record.workspace_mode, 'readonly');
+  assert.ok(record.prepare_duration_ms >= 5000);
+  assert.equal(record.attribution_complete, true);
+  assert.equal(record.attribution.components.model.measurement_class, 'observed_usage');
+  assert.equal(record.attribution.components.compute.measurement_class, 'observed_usage');
+  assert.equal(record.attribution.components.subscription.measurement_class, 'unavailable');
+  assert.equal(record.attribution.components.operator_labor.measurement_class, 'unavailable');
 });
 
 test('profile cache copying excludes host virtual environments', async () => {
@@ -194,7 +384,7 @@ test('profile cache copying excludes host virtual environments', async () => {
     executor: {
       ...spec().executor,
       profile: 'python',
-      image: 'python:3.12.11-bookworm',
+      image: 'python:3.14.5-bookworm',
       install_commands: ['python -m pip install -e .'],
       commands: ['python -m pytest test_parser.py -q'],
     },
@@ -202,10 +392,35 @@ test('profile cache copying excludes host virtual environments', async () => {
   const bootstrap = dependencyBootstrapDockerArgs(pythonSpec, '/runs/M-010/author-workspace',
     pythonSpec.executor.image, '/cache/python');
   assert.ok(bootstrap.includes('PIP_TARGET=/workspace/.northset/bootstrap-home/python-site'));
+  assert.ok(bootstrap.includes('PATH=/workspace/.northset/bootstrap-home/python-site/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'));
   assert.match(bootstrap.at(-1), /python-site/);
   const check = checkDockerArgs(pythonSpec, '/runs/M-010/oracle', 'python@' + digest('a'),
     pythonSpec.executor.commands[0]);
   assert.ok(check.includes('PYTHONPATH=/workspace/.northset/bootstrap-home/python-site'));
+  assert.ok(check.includes('PATH=/workspace/.northset/bootstrap-home/python-site/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'));
+  const author = authorDockerArgs(pythonSpec, '/runs/M-010/author-workspace', 'northset-author@' + digest('b'),
+    '/runs/M-010/codex-home');
+  assert.ok(author.includes('PYTHONPATH=/workspace/.northset/bootstrap-home/python-site'));
+  assert.ok(author.includes('PATH=/workspace/.northset/bootstrap-home/python-site/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'));
+});
+
+test('Go dependency cache export is writable and idempotent across a bootstrap retry', () => {
+  const goSpec = spec({
+    executor: {
+      ...spec().executor,
+      profile: 'go',
+      image: 'golang:1.26.4-bookworm',
+      install_commands: ['go mod download'],
+      commands: ['go test ./minio -run TestFocused'],
+    },
+  });
+  const bootstrap = dependencyBootstrapDockerArgs(goSpec, '/runs/M-010/author-workspace',
+    goSpec.executor.image, '/cache/go');
+  const command = bootstrap.at(-1);
+  assert.match(command, /chmod -R u\+w \/workspace\/\.northset\/bootstrap-home\/go\/pkg\/mod/);
+  assert.match(command, /rm -rf \/workspace\/\.northset\/bootstrap-home\/go\/pkg\/mod/);
+  assert.match(command, /tar -C \/northset-cache\/go-mod -cf - \. \| tar -C \/workspace\/\.northset\/bootstrap-home\/go\/pkg\/mod --no-same-owner --no-same-permissions -xf -/);
+  assert.match(command, /chmod -R u\+rwX \/workspace\/\.northset\/bootstrap-home\/go\/pkg\/mod/);
 });
 
 test('base-red dependency bytes come from a hash-verified pre-author snapshot', async (t) => {
@@ -329,6 +544,21 @@ test('validates the lean semantic mission contract and rejects legacy prompts', 
     oracle: {...spec().oracle, test_paths: ['packages/parser/test/postlude-regression.test.ts'], command: npmPrefixOracle},
     executor: {...spec().executor, commands: [npmPrefixOracle]},
   })]));
+  const goPackageOracle = "env -u SECOND_MINIO_ENDPOINT TF_ACC=1 go test ./minio -run '^TestReplicationGuard$' -count=1";
+  assert.doesNotThrow(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['minio/resource_replication_test.go'], command: goPackageOracle},
+    executor: {...spec().executor, commands: [goPackageOracle]},
+  })]));
+  const goMakePackageOracle = "make test-single PKG=./protocol TEST='^TestMessengerReplySuite$' TESTIFY_M='^TestInvalidResponseTo$'";
+  assert.doesNotThrow(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['protocol/messenger_reply_test.go'], command: goMakePackageOracle},
+    executor: {...spec().executor, commands: [goMakePackageOracle]},
+  })]));
+  const broadGoOracle = 'go test ./...';
+  assert.throws(() => validateSpecs([spec({
+    oracle: {...spec().oracle, test_paths: ['protocol/messenger_reply_test.go'], command: broadGoOracle},
+    executor: {...spec().executor, commands: [broadGoOracle]},
+  })]), /oracle\.command.*test_paths/i);
   const conflictingDirectoryOracle = 'npm --prefix packages/other test -- --dir packages/parser test/regression.test.ts';
   assert.throws(() => validateSpecs([spec({
     oracle: {...spec().oracle, test_paths: ['packages/parser/test/regression.test.ts'], command: conflictingDirectoryOracle},
@@ -681,6 +911,35 @@ test('dependency bootstrap retries one infrastructure failure within the same au
   });
 });
 
+test('a classified native bootstrap failure escalates once to the partitioned native toolchain', async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'northset-native-escalation-'));
+  t.after(() => rm(base, {recursive: true, force: true}));
+  const images = [];
+  const runImpl = async (command, args) => {
+    assert.equal(command, 'docker');
+    if (args[0] === 'run' && args.includes('northset-m-010-dependency-bootstrap')) {
+      images.push(args.find((value) => String(value).startsWith('node@')));
+      if (images.length === 1) return {code: 1, stdout: '', stderr: 'gyp ERR! build error', durationMs: 5};
+    }
+    return {code: 0, stdout: '', stderr: '', durationMs: args[0] === 'run' ? 7 : 0};
+  };
+  const result = await runAuthorContainer(spec(), {
+    base, authorWorkspace: path.join(base, 'author-workspace'),
+  }, {
+    runImpl, authorImage: 'sha256:' + '8'.repeat(64), image: 'node@' + digest('1'),
+    architecture: 'arm64', toolchainClass: 'node-pure', cacheKey: 'pure-key',
+    nativeFallback: async () => ({
+      image: 'node@' + digest('2'), architecture: 'arm64', cacheKey: 'native-key',
+      cacheDir: path.join(base, 'native-cache'), toolchainClass: 'node-native',
+    }),
+  });
+  assert.deepEqual(result.toolchainEscalation, {
+    from: 'node-pure', to: 'node-native', reason: 'classified_native_toolchain_error',
+  });
+  assert.equal(result.image, 'node@' + digest('2'));
+  assert.equal(result.cacheKey, 'native-key');
+});
+
 test('author plan uses the prebuilt image and performs no per-mission Codex install', async () => {
   const dry = await runAuthorContainer(spec(), {
     base: '/runs/M-010', authorWorkspace: '/runs/M-010/author-workspace',
@@ -807,6 +1066,30 @@ test('prepared-directory digest binds outer mission files as well as bundle file
   const before = await directoryDigest(root);
   await writeFile(path.join(root, 'mission.json'), '{"changed":true}\n');
   assert.notEqual(await directoryDigest(root), before);
+});
+
+test('dependency snapshot digest can ignore Finder metadata', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-dependency-digest-'));
+  await writeFile(path.join(root, 'module.txt'), 'module cache bytes\n');
+  const before = await directoryDigest(root, {ignoreNames: ['.DS_Store']});
+  await writeFile(path.join(root, '.DS_Store'), 'host metadata\n');
+  assert.equal(await directoryDigest(root, {ignoreNames: ['.DS_Store']}), before);
+});
+
+test('public receipt omits an internal campaign control policy snapshot', async () => {
+  const module = await import('./oss.mjs');
+  assert.equal(typeof module.publicRepoPolicySnapshot, 'function');
+  assert.equal(module.publicRepoPolicySnapshot({
+    schema_version: 2,
+    defaults: {max_open_prs: 1, daily_pr_cap: 1},
+    repositories: {},
+  }), null);
+  const receiptPolicy = {
+    url: 'https://github.com/owner/repo/blob/main/CONTRIBUTING.md',
+    checked_at: '2026-07-17T21:25:13Z',
+    ai_policy_summary: 'Contributions are accepted under the repository policy.',
+  };
+  assert.deepEqual(module.publicRepoPolicySnapshot(receiptPolicy), receiptPolicy);
 });
 
 test('patch bytes applied to the base index must reproduce the committed tree', async () => {
@@ -999,6 +1282,19 @@ test('live recheck fails closed on invitation drift, issue drift, overlap, and N
   state.updatedAt = value.qualification.issue_updated_at;
   state.prs = [{state: 'OPEN', title: 'Parser bounded input fix', body: 'Fixes #123', url: 'https://github.com/owner/repo/pull/4', author: {login: 'someone'}}];
   assert.match((await recheck(value, async () => {}, options)).reasons.join(' '), /related PR/);
+  const reviewedNotRelated = structuredClone(value);
+  reviewedNotRelated.qualification.related_prs = [{
+    url: 'https://github.com/owner/repo/pull/4', state: 'CLOSED', relationship: 'not_related',
+    disposition: 'Reviewed during qualification and found to address different behavior.', reopened_by: null,
+  }];
+  state.prs = [{state: 'CLOSED', title: 'Parser bounded input fix', body: 'Fixes #123',
+    url: 'https://github.com/owner/repo/pull/4', author: {login: 'someone'}, closedAt: '2026-07-12T12:00:00Z'}];
+  state.timeline = [[{event: 'cross-referenced', created_at: '2026-07-12T11:00:00Z', source: {issue: {
+    html_url: 'https://github.com/owner/repo/pull/4', state: 'closed', title: 'Parser bounded input fix',
+    pull_request: {url: 'https://api.github.com/repos/owner/repo/pulls/4'},
+  }}}]];
+  assert.equal((await recheck(reviewedNotRelated, async () => {}, options)).clean, true);
+  state.timeline = [[]];
   state.prs = [{state: 'OPEN', title: 'Other', body: '', url: 'https://github.com/owner/repo/pull/5', author: {login: 'AysajanE'}}];
   assert.match((await recheck(value, async () => {}, options)).reasons.join(' '), /already has an open PR/);
 

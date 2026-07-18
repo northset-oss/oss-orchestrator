@@ -90,17 +90,102 @@ export async function resourceUsageForTask(runsDir, taskId) {
 }
 
 export function isProviderThrottle(error) {
-  return /(?:^|\b)(?:429|rate[ -]?limit(?:ed)?|throttl(?:e|ed|ing))\b/i.test(String(error?.message ?? error ?? ''));
+  const statusValues = typeof error === 'object' && error !== null
+    ? [error.status, error.statusCode, error.code, error.response?.status]
+    : [];
+  if (statusValues.some((value) => Number(value) === 429)) return true;
+  const text = typeof error === 'string'
+    ? error
+    : [error?.code, error?.message, error?.stdout, error?.stderr,
+      error?.body, error?.headers, error?.response?.status, error?.response?.body,
+      error?.response?.data, error?.response?.headers]
+      .filter((value) => value !== undefined && value !== null)
+      .map((value) => {
+        if (typeof value === 'string') return value;
+        try { return JSON.stringify(value); }
+        catch { return String(value); }
+      })
+      .join('\n');
+  if (/\bhttp(?:\/\d(?:\.\d)?)?\s*429\b|\b429\s+too many requests\b|\bstatus(?:\s+code)?\s*[:=]?\s*429\b/i.test(text) ||
+      /\bretry-after\b/i.test(text)) return true;
+  if (/\bsecondary[_ -]+rate[_ -]+limit(?:ed|s)?\b/i.test(text) || /\babuse[ -]+detection\b/i.test(text)) return true;
+  if (/\bthrottl(?:e|ed|ing)\b/i.test(text)) return true;
+  if (/(?:^|\n)\s*403(?:\s+forbidden)?\b[^\n]*\b(?:rate[_ -]*limit(?:ed|s)?|abuse)\b/i.test(text)) return true;
+  const forbidden = statusValues.some((value) => Number(value) === 403) ||
+    /\bhttp(?:\/\d(?:\.\d)?)?\s*403\b|\bstatus(?:\s+code)?\s*[:=]?\s*403\b/i.test(text);
+  return forbidden && /\b(?:rate[_ -]*limit(?:ed|s)?|abuse)\b/i.test(text);
 }
 
-export async function tripPersistentProviderThrottle(file, {provider, signal, at = new Date().toISOString()} = {}) {
-  const value = await loadResourceControl(file);
-  if (!value.provider_pause) {
-    value.provider_pause = {kind: 'PROVIDER_THROTTLED', provider, signal, tripped_at: at, auto_resume: false};
+async function withGatewayLock({gatewayLockHeld = false, gatewayStateDir, gatewayLockOptions} = {}, callback) {
+  if (gatewayLockHeld) return callback();
+  const {withGhGatewayLock} = await import('../../gh-gateway.mjs');
+  return withGhGatewayLock({stateDir: gatewayStateDir, ...(gatewayLockOptions ?? {})}, callback);
+}
+
+function sameRecord(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+export async function tripPersistentProviderThrottle(file, {
+  provider,
+  signal,
+  at = new Date().toISOString(),
+  gatewayLockHeld = false,
+  gatewayStateDir,
+  gatewayLockOptions,
+} = {}) {
+  return withGatewayLock({gatewayLockHeld, gatewayStateDir, gatewayLockOptions}, async () => {
+    const value = await loadResourceControl(file);
+    if (!value.provider_pause) {
+      value.provider_pause = {kind: 'PROVIDER_THROTTLED', provider, signal, tripped_at: at, auto_resume: false};
+      await mkdir(path.dirname(file), {recursive: true, mode: 0o700});
+      await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, {mode: 0o600});
+    }
+    return value.provider_pause;
+  });
+}
+
+export async function clearPersistentProviderThrottle(file, {
+  founderDecisionId,
+  at = new Date().toISOString(),
+  expectedProviderPause,
+  gatewayLockHeld = false,
+  gatewayStateDir,
+  gatewayLockOptions,
+} = {}) {
+  if (typeof founderDecisionId !== 'string' || !founderDecisionId.trim()) {
+    throw new Error('provider throttle clearance requires a founder decision ID');
+  }
+  return withGatewayLock({gatewayLockHeld, gatewayStateDir, gatewayLockOptions}, async () => {
+    const value = await loadResourceControl(file);
+    if (!value.provider_pause) {
+      if (expectedProviderPause !== undefined) {
+        throw new Error('persistent provider throttle changed before clearance');
+      }
+      return null;
+    }
+    if (expectedProviderPause !== undefined && !sameRecord(value.provider_pause, expectedProviderPause)) {
+      throw new Error('persistent provider throttle changed before clearance');
+    }
+    const decisionId = founderDecisionId.trim();
+    if ((value.provider_pause_clearances ?? []).some((item) => item.founder_decision_id === decisionId)) {
+      throw new Error(`founder decision ID ${decisionId} was already used for a persistent provider throttle clearance`);
+    }
+    const clearance = {
+      founder_decision_id: decisionId,
+      cleared_at: at,
+      provider_pause: value.provider_pause,
+      cleared_pause: {
+        signal: value.provider_pause.signal,
+        tripped_at: value.provider_pause.tripped_at,
+      },
+    };
+    value.provider_pause = null;
+    value.provider_pause_clearances = [...(value.provider_pause_clearances ?? []), clearance];
     await mkdir(path.dirname(file), {recursive: true, mode: 0o700});
     await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, {mode: 0o600});
-  }
-  return value.provider_pause;
+    return clearance;
+  });
 }
 
 export class ResourceBreakers {

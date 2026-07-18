@@ -18,6 +18,7 @@ import {
   parseCandidate,
   recheck,
   run,
+  runGhCommand,
   sanitizedGitEnv,
   sha256,
 } from './core.mjs';
@@ -34,6 +35,12 @@ import {
   reviewRequirement,
 } from './campaign/phase0/review-policy.mjs';
 import {assertPhase0Spec, resourceUsageForTask} from './campaign/phase0/resource-breakers.mjs';
+import {
+  assertGhNetworkAllowed,
+  isGhGatewayTerminalError,
+  ledgerEvent,
+  withGhGatewayLock,
+} from './gh-gateway.mjs';
 
 const NORTHSET_OSS = process.env.NORTHSET_OSS_DIR ?? '/Users/aeziz-local/northset-oss';
 const VERIFICATION_REPO = 'northset-oss/verification-pilot';
@@ -60,11 +67,44 @@ const TERMINAL_SHIP_STATES = new Set([
 ]);
 
 function shipRun(deadline, command, args, options = {}) {
-  return run(command, args, {timeoutMs: 2 * 60 * 1000, ...options, deadline});
+  const runOptions = {timeoutMs: 2 * 60 * 1000, ...options, deadline};
+  return command === 'gh'
+    ? runGhCommand(args, {...runOptions, label: `ship:${args.slice(0, 2).join(' ')}`})
+    : run(command, args, runOptions);
 }
 
 function shipGit(deadline, cwd, ...args) {
   return shipRun(deadline, 'git', ['-C', cwd, ...args], {env: sanitizedGitEnv()});
+}
+
+export async function guardedGitPush(deadline, cwd, repoTarget, args, {
+  assertNetworkAllowed = assertGhNetworkAllowed,
+  recordLedgerEvent = ledgerEvent,
+  runCommand = shipRun,
+  withGatewayLock = withGhGatewayLock,
+  gatewayOptions = {},
+} = {}) {
+  if (typeof repoTarget !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoTarget)) {
+    throw new Error('guarded git push requires an owner/repository target');
+  }
+  if (!Array.isArray(args) || !args.length || !args.every((argument) => typeof argument === 'string')) {
+    throw new Error('guarded git push requires push arguments');
+  }
+  return withGatewayLock(gatewayOptions, async () => {
+    await assertNetworkAllowed({...gatewayOptions, gatewayLockHeld: true});
+    try {
+      return await runCommand(deadline, 'git', ['-C', cwd, 'push', ...args], {env: sanitizedGitEnv()});
+    } finally {
+      await recordLedgerEvent({class: 'git_push', repo_target: repoTarget}, {
+        ...gatewayOptions,
+        gatewayLockHeld: true,
+      });
+    }
+  });
+}
+
+function shipGitPush(deadline, cwd, repoTarget, ...args) {
+  return guardedGitPush(deadline, cwd, repoTarget, args);
 }
 
 export function isTerminalShipState(state) { return TERMINAL_SHIP_STATES.has(state); }
@@ -216,6 +256,7 @@ export async function runShipStateMachine(subject, journal, actions) {
   const execute = async (name, operation) => {
     try { return await operation(); }
     catch (error) {
+      if (isGhGatewayTerminalError(error)) throw error;
       if (journal.retry_count < 1 && !actions.deadline?.expired()) {
         journal.retry_count += 1;
         journal.last_error = `${name}: ${error.message}`;
@@ -276,6 +317,7 @@ export async function runShipStateMachine(subject, journal, actions) {
     if (journal.state === 'FINAL_ENVELOPE_PUBLISHED') await transitionJournal(journal, 'SHIPPED', actions);
     return {...journal, mission_id: subject.manifest.mission_id};
   } catch (error) {
+    if (isGhGatewayTerminalError(error)) throw error;
     const state = actions.deadline?.expired() || /timed out|deadline/i.test(error.message)
       ? 'ABORTED_BUDGET' : 'FAILED_INFRA_TERMINAL';
     await transitionJournal(journal, state, actions, error.message);
@@ -308,6 +350,7 @@ export async function runIndependentBatch(items, worker, {concurrency = 1, key =
       const item = items[index];
       try { results[index] = await runWithKey(item, index); }
       catch (error) {
+        if (isGhGatewayTerminalError(error)) throw error;
         results[index] = {mission_id: item.manifest?.mission_id ?? item.id, state: 'FAILED_INFRA_TERMINAL', terminal_reason: error.message};
       }
     }
@@ -598,13 +641,12 @@ export function decodeSnappyBlock(input, {maxOutputBytes = 10_000_000} = {}) {
 
 async function downloadPublicAttestationBundle(asset, root, deadline) {
   const digest = sha256(await readFile(asset));
-  const responseFile = path.join(root, 'attestations.json');
-  await must('download public attestation bundle', await shipRun(deadline, 'curl', [
-    '--fail', '--location', '--silent', '--show-error',
-    '--header', 'Accept: application/vnd.github+json',
-    '--output', responseFile, publicAttestationApiUrl(digest),
+  const endpoint = new URL(publicAttestationApiUrl(digest));
+  const downloaded = await must('download public attestation bundle', await shipRun(deadline, 'gh', [
+    'api', `${endpoint.pathname.slice(1)}${endpoint.search}`,
+    '-H', 'Accept: application/vnd.github+json',
   ]));
-  const response = JSON.parse(await readFile(responseFile, 'utf8'));
+  const response = JSON.parse(downloaded.stdout);
   const bundles = [];
   const attestations = Array.isArray(response?.attestations) ? response.attestations : [];
   for (let index = 0; index < attestations.length; index += 1) {
@@ -917,13 +959,13 @@ async function publishLedgerPullRequest(paths, message, marker, {missionId, phas
     await must('create ledger publication branch', await shipGit(deadline, NORTHSET_OSS, 'switch', '-C', branch));
     await must('stage ledger publication', await shipGit(deadline, NORTHSET_OSS, 'add', ...paths));
     await must('commit ledger publication', await shipGit(deadline, NORTHSET_OSS, 'commit', '-m', message));
-    await must('push ledger publication branch', await shipGit(deadline, NORTHSET_OSS, 'push', '-u', 'origin',
+    await must('push ledger publication branch', await shipGitPush(deadline, NORTHSET_OSS, VERIFICATION_REPO, '-u', 'origin',
       `HEAD:refs/heads/${branch}`));
   }
   const currentBranch = (await must('read current ledger branch', await shipGit(deadline, NORTHSET_OSS,
     'branch', '--show-current'))).stdout.trim();
   if (!changed && currentBranch === branch) {
-    await must('recover ledger publication branch push', await shipGit(deadline, NORTHSET_OSS, 'push', '-u', 'origin',
+    await must('recover ledger publication branch push', await shipGitPush(deadline, NORTHSET_OSS, VERIFICATION_REPO, '-u', 'origin',
       `HEAD:refs/heads/${branch}`));
   }
   const listed = JSON.parse((await must('find ledger publication pull request', await shipRun(deadline, 'gh', [
@@ -1189,7 +1231,7 @@ async function ensureForkAndPush(subject, journal, journalFile, log) {
   if (!journal.fork?.oid) {
     const current = await shipGit(deadline, subject.files.authorRepo, 'remote', 'get-url', 'fork');
     if (current.code !== 0) await must('add fork remote', await shipGit(deadline, subject.files.authorRepo, 'remote', 'add', 'fork', `https://github.com/${FORK_OWNER}/${repo}.git`));
-    await must('push reviewed commit', await shipGit(deadline, subject.files.authorRepo, 'push', 'fork',
+    await must('push reviewed commit', await shipGitPush(deadline, subject.files.authorRepo, `${FORK_OWNER}/${repo}`, 'fork',
       `${subject.manifest.commit_oid}:refs/heads/${branch}`));
     journal.fork = {repo: `${FORK_OWNER}/${repo}`, branch, oid: subject.manifest.commit_oid};
     await saveJournal(journalFile, journal);
@@ -1368,6 +1410,7 @@ async function publishNotSubmittedEnvelope(subject, journal, journalFile, log, c
 async function retryOnce(operation, deadline) {
   try { return await operation(); }
   catch (first) {
+    if (isGhGatewayTerminalError(first)) throw first;
     if (deadline?.expired()) throw first;
     await delay(Math.min(500, deadline?.remainingMs?.() ?? 500));
     return operation();
@@ -1524,6 +1567,7 @@ async function verifyAttestationBatch(subjects, log, concurrency) {
       await transitionJournal(subject.journal, 'ATTESTED', {save: (journal) => saveJournal(subject.journalFile, journal)});
       return {subject, ok: true};
     } catch (error) {
+      if (isGhGatewayTerminalError(error)) throw error;
       await transitionJournal(subject.journal, 'FAILED_INFRA_TERMINAL',
         {save: (journal) => saveJournal(subject.journalFile, journal)}, error.message);
       return {subject, ok: false, error: error.message};
@@ -1600,6 +1644,7 @@ async function processUpstreamMission(subject, log) {
       counted_receipt: contributorReceiptCounted(subject.manifest, subject.journal),
       pr_url: subject.journal.pr?.url ?? null, attestation_uri: subject.journal.ledger?.attestation_uri ?? null};
   } catch (error) {
+    if (isGhGatewayTerminalError(error)) throw error;
     const state = subject.deadline?.expired() ? 'ABORTED_BUDGET' : 'FAILED_INFRA_TERMINAL';
     await transitionJournal(subject.journal, state, {save: (journal) => saveJournal(subject.journalFile, journal)}, error.message);
     return {mission_id: id, state, counted_receipt: contributorReceiptCounted(subject.manifest, subject.journal), terminal_reason: error.message,
@@ -1693,6 +1738,7 @@ async function prePublicPushForBatch(subject, log) {
     }
     return {subject, ok: subject.journal.state === 'PUSHED'};
   } catch (error) {
+    if (isGhGatewayTerminalError(error)) throw error;
     const state = subject.deadline?.expired() ? 'ABORTED_BUDGET' : 'FAILED_INFRA_TERMINAL';
     await transitionJournal(subject.journal, state, {save: (journal) => saveJournal(subject.journalFile, journal)}, error.message);
     return {subject, ok: false, error: error.message};
@@ -1839,6 +1885,7 @@ export async function shipBatch(items, {
   if (publishable.length) {
     try { await adapter.publishPreparedLedgerBatch(publishable, approvedDigest, log, adapter); }
     catch (error) {
+      if (isGhGatewayTerminalError(error)) throw error;
       for (const subject of publishable) {
         await transitionJournal(subject.journal, 'FAILED_INFRA_TERMINAL',
           {save: (journal) => adapter.saveJournal(subject.journalFile, journal)}, `prepared ledger batch: ${error.message}`);
@@ -1857,6 +1904,7 @@ export async function shipBatch(items, {
   });
   try { await adapter.publishFinalEnvelopeBatch(subjects, approvedDigest, log, adapter); }
   catch (error) {
+    if (isGhGatewayTerminalError(error)) throw error;
     for (const subject of subjects.filter((item) =>
       ['DISCLOSURE_SYNCED', 'FINAL_ENVELOPE_PENDING_RECOVERY'].includes(item.journal.state))) {
       await transitionJournal(subject.journal, 'FINAL_ENVELOPE_PENDING_RECOVERY',
@@ -1926,9 +1974,11 @@ async function findMissionPr(mission) {
   const repo = mission.target_repo.replace(/^https:\/\/github\.com\//, '');
   const issueNumber = /\/issues\/([1-9][0-9]*)$/.exec(mission.issue_or_task)?.[1];
   const issueReference = issueNumber ? new RegExp(`(?:^|[^0-9])#${issueNumber}(?:[^0-9]|$)|issues/${issueNumber}(?:[^0-9]|$)`, 'i') : null;
-  const listed = await must('list mission PRs', await run('gh', ['pr', 'list', '--repo', repo, '--author', FORK_OWNER,
-    '--state', 'all', '--limit', '100', '--json',
-    'number,url,state,title,body,headRefOid,baseRefName,createdAt,closedAt,mergedAt,updatedAt,reviewDecision,mergeCommit,statusCheckRollup']));
+  const listed = await must('list mission PRs', await runGhCommand(
+    ['pr', 'list', '--repo', repo, '--author', FORK_OWNER, '--state', 'all', '--limit', '100', '--json',
+      'number,url,state,title,body,headRefOid,baseRefName,createdAt,closedAt,mergedAt,updatedAt,reviewDecision,mergeCommit,statusCheckRollup'],
+    {label: 'ship:list mission PRs'},
+  ));
   const prs = JSON.parse(listed.stdout);
   return prs.find((pr) => pr.headRefOid === mission.patch_commit)
     ?? prs.find((pr) => pr.body?.includes(mission.mission_id) || issueReference?.test(`${pr.title ?? ''}\n${pr.body ?? ''}`))

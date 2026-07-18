@@ -52,7 +52,7 @@ test('spec finalization binds mission sequence, policy bytes and registry image 
   const first = finalizeSpec(draft, {missionId: 'M-100', attemptSequence: 2, repoPolicySnapshot: policy});
   const second = finalizeSpec(draft, {missionId: 'M-100', attemptSequence: 2, repoPolicySnapshot: policy});
   assert.deepEqual(first, second);
-  assert.equal(first.executor.image, 'python:3.12.11-bookworm');
+  assert.equal(first.executor.image, 'python:3.14.5-bookworm');
   assert.equal(first.executor.profile_status, 'pilot');
   assert.equal(first.executor.profile_production_proven, false);
   assert.deepEqual(first.receipt.repo_policy_snapshot, policy);
@@ -69,7 +69,7 @@ test('current reviewer drafts finalize while retained prompt-version 2 qualifica
   const current = finalizeSpec(buildSpecDraft(acceptedReview(), options), {
     missionId: 'M-101', attemptSequence: 1, repoPolicySnapshot: policy,
   });
-  assert.equal(current.qualification.review_prompt_version, 3);
+  assert.equal(current.qualification.review_prompt_version, 4);
 
   const retainedReview = {...acceptedReview(), review_prompt_version: 2};
   const retained = finalizeSpec(buildSpecDraft(retainedReview, options), {
@@ -78,6 +78,6 @@ test('current reviewer drafts finalize while retained prompt-version 2 qualifica
   assert.equal(retained.qualification.review_prompt_version, 2);
   assert.throws(() => validateSpec({
     ...current,
-    qualification: {...current.qualification, review_prompt_version: 4},
+    qualification: {...current.qualification, review_prompt_version: 5},
   }), /prompt version/i);
 });

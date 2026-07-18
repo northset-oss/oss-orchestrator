@@ -7,7 +7,8 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
-export const CANDIDATE_LAKE_SCHEMA_VERSION = 1;
+export const CANDIDATE_LAKE_SCHEMA_VERSION = 2;
+const SNAPSHOT_FRESHNESS_MS = 48 * 60 * 60 * 1000;
 
 function canonical(value) {
   if (value === null) return 'null';
@@ -67,7 +68,7 @@ CREATE TABLE IF NOT EXISTS lake_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-INSERT INTO lake_meta(key, value) VALUES ('schema_version', '${CANDIDATE_LAKE_SCHEMA_VERSION}')
+INSERT INTO lake_meta(key, value) VALUES ('schema_version', '1')
   ON CONFLICT(key) DO NOTHING;
 CREATE TABLE IF NOT EXISTS repositories (
   repo_key TEXT PRIMARY KEY,
@@ -164,6 +165,48 @@ CREATE TABLE IF NOT EXISTS imports (
   FOREIGN KEY(candidate_key, evidence_key) REFERENCES reviews(candidate_key, evidence_key)
 );
 CREATE VIEW IF NOT EXISTS repos AS SELECT * FROM repositories;
+`;
+
+const MIGRATE_V1_TO_V2 = `
+ALTER TABLE repositories ADD COLUMN repository_node_id TEXT;
+ALTER TABLE repositories ADD COLUMN owner_node_id TEXT;
+ALTER TABLE repositories ADD COLUMN owner_login TEXT;
+ALTER TABLE repositories ADD COLUMN open_northset_prs INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE repositories ADD COLUMN northset_prs_opened_today INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE repositories ADD COLUMN slot_observed_at TEXT;
+ALTER TABLE repositories ADD COLUMN slot_expires_at TEXT;
+ALTER TABLE issues ADD COLUMN issue_node_id TEXT;
+ALTER TABLE issues ADD COLUMN snapshot_expires_at TEXT;
+CREATE UNIQUE INDEX repositories_node_id_idx ON repositories(repository_node_id) WHERE repository_node_id IS NOT NULL;
+CREATE UNIQUE INDEX issues_node_id_idx ON issues(issue_node_id) WHERE issue_node_id IS NOT NULL;
+CREATE TABLE repository_aliases (
+  alias_key TEXT PRIMARY KEY,
+  repo_key TEXT NOT NULL,
+  repository_node_id TEXT,
+  observed_at TEXT NOT NULL,
+  FOREIGN KEY(repo_key) REFERENCES repositories(repo_key)
+);
+CREATE TABLE candidate_state_events (
+  event_key TEXT PRIMARY KEY,
+  candidate_key TEXT NOT NULL,
+  candidate_display TEXT NOT NULL,
+  evidence_key TEXT,
+  state TEXT NOT NULL,
+  state_class TEXT NOT NULL CHECK(state_class IN ('terminal','retryable')),
+  reason TEXT,
+  observed_at TEXT NOT NULL,
+  raw_json TEXT NOT NULL
+);
+CREATE INDEX candidate_state_class_idx ON candidate_state_events(state_class, observed_at);
+CREATE TABLE quarantine (
+  quarantine_key TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  identity TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  raw_json TEXT NOT NULL
+);
+UPDATE lake_meta SET value='2' WHERE key='schema_version';
 `;
 
 export function canonicalCandidate(value) {
@@ -270,22 +313,64 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
 
   const query = (source) => sqlite(database, `PRAGMA foreign_keys=ON;\n${source}`, {json: true, sqliteBin});
   const execute = (source) => sqlite(database, `PRAGMA foreign_keys=ON;\n${source}`, {sqliteBin});
-  const versions = await query("SELECT value FROM lake_meta WHERE key='schema_version' LIMIT 1;");
+  let versions = await query("SELECT value FROM lake_meta WHERE key='schema_version' LIMIT 1;");
+  if (String(versions[0]?.value ?? '') === '1') {
+    await execute(`BEGIN IMMEDIATE;\n${MIGRATE_V1_TO_V2}\nCOMMIT;`);
+    versions = await query("SELECT value FROM lake_meta WHERE key='schema_version' LIMIT 1;");
+  }
   if (String(versions[0]?.value ?? '') !== String(CANDIDATE_LAKE_SCHEMA_VERSION)) {
     throw new Error(`candidate lake schema version ${versions[0]?.value ?? 'missing'} is unsupported; expected ${CANDIDATE_LAKE_SCHEMA_VERSION}`);
+  }
+
+  const observedAndExpiry = (record = {}) => {
+    const observed = record.slot_observed_at ?? record.last_hydrated_at ?? record.observed_at ?? record.updated_at ?? new Date().toISOString();
+    const observedMs = Date.parse(observed);
+    if (!Number.isFinite(observedMs)) throw new Error('observed_at must be an ISO timestamp');
+    const expires = record.slot_expires_at ?? record.snapshot_expires_at ?? record.expires_at
+      ?? new Date(observedMs + SNAPSHOT_FRESHNESS_MS).toISOString();
+    if (!Number.isFinite(Date.parse(expires))) throw new Error('snapshot expiry must be an ISO timestamp');
+    return {observed: new Date(observedMs).toISOString(), expires: new Date(expires).toISOString()};
+  };
+
+  async function quarantineConflict(kind, identity, detail, record) {
+    const observedAt = new Date().toISOString();
+    const key = sha256(Buffer.from(`northset-candidate-quarantine-v1\0${kind}\0${identity}\0${canonical(record)}`, 'utf8'));
+    await execute(`INSERT INTO quarantine(quarantine_key,kind,identity,detail,observed_at,raw_json)
+      VALUES (${sql(key)},${sql(kind)},${sql(identity)},${sql(detail)},${sql(observedAt)},${sql(jsonText(record, {}))})
+      ON CONFLICT(quarantine_key) DO NOTHING;`);
+    throw new Error(`candidate lake record quarantined: ${detail}`);
   }
 
   async function upsertRepository(record) {
     const display = String(record.repo_display ?? record.repo ?? record.name_with_owner ?? record.nameWithOwner ?? '').replace(/\.git$/i, '');
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(display)) throw new Error('repository must be owner/repo');
-    const key = display.toLowerCase();
-    const now = record.observed_at ?? record.updated_at ?? new Date().toISOString();
+    const requestedKey = display.toLowerCase();
+    const repositoryNodeId = record.repository_node_id ?? record.node_id ?? record.id ?? null;
+    const ownerNodeId = record.owner_node_id ?? record.owner?.node_id ?? record.owner?.id ?? null;
+    const ownerLogin = record.owner_login ?? record.owner?.login ?? display.split('/')[0];
+    const byKey = await query(`SELECT repo_key,repository_node_id FROM repositories WHERE repo_key=${sql(requestedKey)} LIMIT 1;`);
+    const byAlias = await query(`SELECT a.repo_key,r.repository_node_id FROM repository_aliases a
+      JOIN repositories r ON r.repo_key=a.repo_key WHERE a.alias_key=${sql(requestedKey)} LIMIT 1;`);
+    if (byKey[0]?.repository_node_id && repositoryNodeId && byKey[0].repository_node_id !== repositoryNodeId) {
+      await quarantineConflict('repository_identity_conflict', requestedKey,
+        `repository name ${display} is already bound to another node ID`, record);
+    }
+    if (byAlias[0]?.repository_node_id && repositoryNodeId && byAlias[0].repository_node_id !== repositoryNodeId) {
+      await quarantineConflict('repository_alias_conflict', requestedKey,
+        `repository alias ${display} is already bound to another node ID`, record);
+    }
+    const byNode = repositoryNodeId
+      ? await query(`SELECT repo_key,repo_display FROM repositories WHERE repository_node_id=${sql(repositoryNodeId)} LIMIT 1;`)
+      : [];
+    const key = byNode[0]?.repo_key ?? requestedKey;
+    const {observed: now, expires} = observedAndExpiry(record);
     await execute(`INSERT INTO repositories(
       repo_key, repo_display, stars, default_branch, default_head, primary_language, license, pushed_at,
       archived, fork, ai_policy_status, ai_policy_url, ai_policy_sha256, dco_required, cla_required,
       pr_template_kind, test_profile, install_command, focused_test_patterns_json, full_check_commands_json,
       invitation_label_map_json, last_policy_audit_at, cooldown_until, max_open_prs, daily_pr_cap,
-      raw_json, provenance_json, updated_at
+      raw_json, provenance_json, updated_at, repository_node_id, owner_node_id, owner_login,
+      open_northset_prs, northset_prs_opened_today, slot_observed_at, slot_expires_at
     ) VALUES (
       ${sql(key)}, ${sql(display)}, ${sql(record.stars)}, ${sql(record.default_branch)}, ${sql(record.default_head)},
       ${sql(record.primary_language)}, ${sql(record.license)}, ${sql(record.pushed_at)}, ${sql(record.archived)}, ${sql(record.fork)},
@@ -294,7 +379,8 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
       ${sql(record.install_command)}, ${sql(jsonText(record.focused_test_patterns, []))}, ${sql(jsonText(record.full_check_commands, []))},
       ${sql(jsonText(record.invitation_label_map, {}))}, ${sql(record.last_policy_audit_at)}, ${sql(record.cooldown_until)},
       ${sql(record.max_open_prs ?? 1)}, ${sql(record.daily_pr_cap ?? 1)}, ${sql(jsonText(record.raw ?? record, {}))},
-      ${sql(jsonText(record.provenance, {}))}, ${sql(now)}
+      ${sql(jsonText(record.provenance, {}))}, ${sql(now)}, ${sql(repositoryNodeId)}, ${sql(ownerNodeId)}, ${sql(ownerLogin)},
+      ${sql(record.open_northset_prs ?? 0)}, ${sql(record.northset_prs_opened_today ?? 0)}, ${sql(now)}, ${sql(expires)}
     ) ON CONFLICT(repo_key) DO UPDATE SET
       repo_display=excluded.repo_display,
       stars=COALESCE(excluded.stars,repositories.stars),
@@ -319,19 +405,44 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
       cooldown_until=COALESCE(excluded.cooldown_until,repositories.cooldown_until),
       max_open_prs=${record.max_open_prs === undefined ? 'repositories.max_open_prs' : 'excluded.max_open_prs'},
       daily_pr_cap=${record.daily_pr_cap === undefined ? 'repositories.daily_pr_cap' : 'excluded.daily_pr_cap'},
-      raw_json=excluded.raw_json, provenance_json=excluded.provenance_json, updated_at=excluded.updated_at;`);
-    return {repo_key: key, repo_display: display};
+      raw_json=excluded.raw_json, provenance_json=excluded.provenance_json, updated_at=excluded.updated_at,
+      repository_node_id=COALESCE(excluded.repository_node_id,repositories.repository_node_id),
+      owner_node_id=COALESCE(excluded.owner_node_id,repositories.owner_node_id),
+      owner_login=COALESCE(excluded.owner_login,repositories.owner_login),
+      open_northset_prs=${record.open_northset_prs === undefined ? 'repositories.open_northset_prs' : 'excluded.open_northset_prs'},
+      northset_prs_opened_today=${record.northset_prs_opened_today === undefined ? 'repositories.northset_prs_opened_today' : 'excluded.northset_prs_opened_today'},
+      slot_observed_at=excluded.slot_observed_at,slot_expires_at=excluded.slot_expires_at;`);
+    await execute(`INSERT INTO repository_aliases(alias_key,repo_key,repository_node_id,observed_at)
+      VALUES (${sql(requestedKey)},${sql(key)},${sql(repositoryNodeId)},${sql(now)})
+      ON CONFLICT(alias_key) DO UPDATE SET repo_key=excluded.repo_key,
+        repository_node_id=COALESCE(excluded.repository_node_id,repository_aliases.repository_node_id),observed_at=excluded.observed_at;`);
+    return {repo_key: key, repo_display: display, repository_node_id: repositoryNodeId};
   }
 
   async function upsertIssue(record) {
     const parts = candidateParts(record.candidate);
-    await upsertRepository({
+    const repositoryRow = await upsertRepository({
       repo: record.repository?.name_with_owner ?? record.repository?.nameWithOwner ?? record.repository ?? parts.repoDisplay,
       ...(record.repository && typeof record.repository === 'object' ? record.repository : {}),
       profile: record.profile,
       provenance: record.provenance,
+      observed_at: record.observed_at ?? record.last_hydrated_at,
     });
     const issue = record.issue && typeof record.issue === 'object' ? record.issue : record;
+    const issueNodeId = record.issue_node_id ?? issue.node_id ?? issue.id ?? null;
+    const byKey = await query(`SELECT candidate_key,issue_node_id FROM issues WHERE candidate_key=${sql(parts.key)} LIMIT 1;`);
+    if (byKey[0]?.issue_node_id && issueNodeId && byKey[0].issue_node_id !== issueNodeId) {
+      await quarantineConflict('issue_identity_conflict', parts.key,
+        `candidate ${parts.display} is already bound to another issue node ID`, record);
+    }
+    const byNode = issueNodeId
+      ? await query(`SELECT candidate_key,issue_number FROM issues WHERE issue_node_id=${sql(issueNodeId)} LIMIT 1;`)
+      : [];
+    if (byNode[0] && Number(byNode[0].issue_number) !== parts.number) {
+      await quarantineConflict('issue_number_conflict', issueNodeId,
+        `issue node ID ${issueNodeId} changed issue number`, record);
+    }
+    const candidateKey = byNode[0]?.candidate_key ?? parts.key;
     const labels = issue.labels ?? record.labels ?? [];
     const assignees = issue.assignees ?? record.assignees ?? [];
     const evidenceKey = record.evidence_key ?? (record.base_commit || record.repository?.default_head
@@ -346,14 +457,14 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
         repo_policy_sha256: record.repo_policy_sha256,
         profile: record.profile ?? record.repository?.test_profile,
       }) : null);
-    const hydrated = record.last_hydrated_at ?? record.observed_at ?? new Date().toISOString();
+    const {observed: hydrated, expires} = observedAndExpiry(record);
     await execute(`INSERT INTO issues(
       candidate_key, candidate_display, repo_key, issue_number, title, body_excerpt, labels_json, state,
       assignees_json, comments_count, updated_at, issue_updated_at, author_association, invitation_kind,
       profile, base_commit, evidence_key, mechanical_score, mechanical_reasons_json, last_hydrated_at,
-      raw_json, provenance_json
+      raw_json, provenance_json, issue_node_id, snapshot_expires_at
     ) VALUES (
-      ${sql(parts.key)}, ${sql(parts.display)}, ${sql(parts.repoKey)}, ${sql(parts.number)}, ${sql(issue.title ?? record.title)},
+      ${sql(candidateKey)}, ${sql(parts.display)}, ${sql(repositoryRow.repo_key)}, ${sql(parts.number)}, ${sql(issue.title ?? record.title)},
       ${sql(String(record.body_excerpt ?? record.discovery?.body_excerpt ?? issue.body_excerpt ?? '').slice(0, 8000))},
       ${sql(jsonText(labels, []))}, ${sql(issue.state ?? record.state)}, ${sql(jsonText(assignees, []))},
       ${sql(issue.comments_total ?? issue.comments_count ?? record.comments_count)}, ${sql(hydrated)},
@@ -362,7 +473,7 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
       ${sql(record.base_commit ?? record.repository?.default_head)}, ${sql(evidenceKey)},
       ${sql(record.mechanical_score ?? record.decision?.score?.total)},
       ${sql(jsonText(record.mechanical_reasons ?? record.decision?.reasons, []))}, ${sql(hydrated)},
-      ${sql(jsonText(record.raw ?? record, {}))}, ${sql(jsonText(record.provenance, {}))}
+      ${sql(jsonText(record.raw ?? record, {}))}, ${sql(jsonText(record.provenance, {}))}, ${sql(issueNodeId)}, ${sql(expires)}
     ) ON CONFLICT(candidate_key) DO UPDATE SET
       candidate_display=excluded.candidate_display, repo_key=excluded.repo_key, issue_number=excluded.issue_number,
       title=excluded.title, body_excerpt=excluded.body_excerpt, labels_json=excluded.labels_json,
@@ -373,8 +484,19 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
       evidence_key=${record.clear_evidence === true ? 'NULL' : 'COALESCE(excluded.evidence_key,issues.evidence_key)'},
       mechanical_score=COALESCE(excluded.mechanical_score,issues.mechanical_score),
       mechanical_reasons_json=excluded.mechanical_reasons_json, last_hydrated_at=excluded.last_hydrated_at,
-      raw_json=excluded.raw_json, provenance_json=excluded.provenance_json;`);
-    return {candidate: parts.display, candidate_key: parts.key, evidence_key: evidenceKey};
+      raw_json=excluded.raw_json, provenance_json=excluded.provenance_json,
+      issue_node_id=COALESCE(excluded.issue_node_id,issues.issue_node_id),snapshot_expires_at=excluded.snapshot_expires_at;`);
+    return {candidate: parts.display, candidate_key: candidateKey, evidence_key: evidenceKey};
+  }
+
+  async function resolvedCandidateKey(candidate) {
+    const parts = candidateParts(candidate);
+    const exact = await query(`SELECT candidate_key FROM issues WHERE candidate_key=${sql(parts.key)} LIMIT 1;`);
+    if (exact[0]) return exact[0].candidate_key;
+    const alias = await query(`SELECT repo_key FROM repository_aliases WHERE alias_key=${sql(parts.repoKey)} LIMIT 1;`);
+    if (!alias[0]) return parts.key;
+    const rows = await query(`SELECT candidate_key FROM issues WHERE repo_key=${sql(alias[0].repo_key)} AND issue_number=${sql(parts.number)} LIMIT 1;`);
+    return rows[0]?.candidate_key ?? parts.key;
   }
 
   async function putReview(record) {
@@ -385,7 +507,8 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
     if (!Number.isFinite(Date.parse(record.expires_at ?? ''))) throw new Error('expires_at must be an ISO timestamp');
     const reviewedAt = new Date(record.reviewed_at).toISOString();
     const expiresAt = new Date(record.expires_at).toISOString();
-    const existingIssue = await query(`SELECT candidate_key FROM issues WHERE candidate_key=${sql(parts.key)} LIMIT 1;`);
+    const candidateKey = await resolvedCandidateKey(parts.display);
+    const existingIssue = await query(`SELECT candidate_key FROM issues WHERE candidate_key=${sql(candidateKey)} LIMIT 1;`);
     if (!existingIssue.length) {
       await upsertIssue({candidate: parts.display, evidence_key: record.evidence_key, profile: record.executor_profile,
         base_commit: record.result?.base_commit, issue_updated_at: record.result?.issue_updated_at,
@@ -396,7 +519,7 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
       candidate_key, candidate_display, evidence_key, verdict, tier, executor_profile, review_id,
       result_json, provenance_json, reviewed_at, expires_at, imported_record_sha256
     ) VALUES (
-      ${sql(parts.key)}, ${sql(parts.display)}, ${sql(record.evidence_key)}, ${sql(record.verdict)}, ${sql(record.tier)},
+      ${sql(candidateKey)}, ${sql(parts.display)}, ${sql(record.evidence_key)}, ${sql(record.verdict)}, ${sql(record.tier)},
       ${sql(record.executor_profile)}, ${sql(record.review_id)}, ${sql(jsonText(record.result, {}))},
       ${sql(jsonText(record.provenance, {}))}, ${sql(reviewedAt)}, ${sql(expiresAt)}, ${sql(recordDigest)}
     ) ON CONFLICT(candidate_key,evidence_key) DO UPDATE SET
@@ -405,16 +528,18 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
       result_json=excluded.result_json, provenance_json=excluded.provenance_json,
       reviewed_at=excluded.reviewed_at, expires_at=excluded.expires_at,
       imported_record_sha256=excluded.imported_record_sha256;`);
-    return getReview(parts.key, record.evidence_key);
+    return getReview(parts.display, record.evidence_key);
   }
 
   async function getReview(candidate, evidenceKey) {
-    const rows = await query(`SELECT * FROM reviews WHERE candidate_key=${sql(canonicalCandidate(candidate))} AND evidence_key=${sql(evidenceKey)} LIMIT 1;`);
+    const candidateKey = await resolvedCandidateKey(candidate);
+    const rows = await query(`SELECT * FROM reviews WHERE candidate_key=${sql(candidateKey)} AND evidence_key=${sql(evidenceKey)} LIMIT 1;`);
     return rowReview(rows[0]);
   }
 
   async function getCachedReview(candidate, evidenceKey, now = new Date(), {profile = null} = {}) {
-    const rows = await query(`SELECT * FROM reviews WHERE candidate_key=${sql(canonicalCandidate(candidate))}
+    const candidateKey = await resolvedCandidateKey(candidate);
+    const rows = await query(`SELECT * FROM reviews WHERE candidate_key=${sql(candidateKey)}
       AND evidence_key=${sql(evidenceKey)} AND expires_at>${sql(now.toISOString())}
       ${profile ? `AND executor_profile=${sql(profile)}` : ''}
       AND verdict IN ('ACCEPT','REJECT') LIMIT 1;`);
@@ -422,7 +547,8 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
   }
 
   async function getIssue(candidate) {
-    const rows = await query(`SELECT * FROM issues WHERE candidate_key=${sql(canonicalCandidate(candidate))} LIMIT 1;`);
+    const candidateKey = await resolvedCandidateKey(candidate);
+    const rows = await query(`SELECT * FROM issues WHERE candidate_key=${sql(candidateKey)} LIMIT 1;`);
     if (!rows[0]) return null;
     const row = rows[0];
     return {
@@ -430,10 +556,33 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
       candidate_key: row.candidate_key,
       issue_updated_at: row.issue_updated_at,
       evidence_key: row.evidence_key,
+      issue_node_id: row.issue_node_id,
       profile: row.profile,
       raw: JSON.parse(row.raw_json),
       provenance: JSON.parse(row.provenance_json),
     };
+  }
+
+  async function recordCandidateState(record, {candidate, evidenceKey, state, stateClass, source}) {
+    const parts = candidateParts(candidate);
+    const eventKey = sha256(Buffer.from(`northset-candidate-state-v1\0${stateClass}\0${canonical(record)}`, 'utf8'));
+    await execute(`INSERT INTO candidate_state_events(
+      event_key,candidate_key,candidate_display,evidence_key,state,state_class,reason,observed_at,raw_json
+    ) VALUES (${sql(eventKey)},${sql(parts.key)},${sql(parts.display)},${sql(evidenceKey)},${sql(state)},${sql(stateClass)},
+      ${sql(record.reason ?? record.error ?? null)},${sql(record.reviewed_at ?? record.observed_at ?? new Date().toISOString())},
+      ${sql(jsonText({source, record}, {}))}) ON CONFLICT(event_key) DO NOTHING;`);
+  }
+
+  async function candidateStates({candidate = null, stateClass = null} = {}) {
+    const clauses = [];
+    if (candidate) clauses.push(`candidate_key=${sql(canonicalCandidate(candidate))}`);
+    if (stateClass) clauses.push(`state_class=${sql(stateClass)}`);
+    return query(`SELECT event_key,candidate_display AS candidate,evidence_key,state,state_class,reason,observed_at
+      FROM candidate_state_events ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY observed_at,event_key;`);
+  }
+
+  async function quarantine() {
+    return query('SELECT quarantine_key,kind,identity,detail,observed_at FROM quarantine ORDER BY observed_at,quarantine_key;');
   }
 
   async function importQualifications(records, {source = 'qualification-import'} = {}) {
@@ -452,7 +601,14 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
         REJECTED_DETERMINISTIC: 'REJECT',
       };
       const verdict = review.verdict ?? terminalVerdicts[record.terminal_state] ?? null;
-      if (!candidate || !validDigest(evidenceKey) || !['ACCEPT', 'REJECT'].includes(verdict)) continue;
+      if (!candidate || !validDigest(evidenceKey)) continue;
+      if (!['ACCEPT', 'REJECT'].includes(verdict)) {
+        const retryableState = record.terminal_state ?? record.state;
+        if (typeof retryableState === 'string' && /(?:REVIEW_TOOL_ERROR|REVIEW_TIMEOUT|REVIEW_OUTPUT_LIMIT|INVALID_REVIEW_OUTPUT)/.test(retryableState)) {
+          await recordCandidateState(record, {candidate, evidenceKey, state: retryableState, stateClass: 'retryable', source});
+        }
+        continue;
+      }
       const reviewedAt = record.reviewed_at ?? review.reviewed_at ?? new Date(0).toISOString();
       const expiresAt = record.qualification_expires_at ?? review.qualification_expires_at
         ?? new Date(Date.parse(reviewedAt) + 2 * 60 * 60 * 1000).toISOString();
@@ -464,8 +620,10 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
         unchanged += 1;
         continue;
       }
+      const resolvedCandidate = await resolvedCandidateKey(candidate);
+      const storageCandidate = resolvedCandidate === canonicalCandidate(candidate) ? candidate : resolvedCandidate;
       await upsertIssue({
-        candidate,
+        candidate: storageCandidate,
         repository: record.repository ?? review.repository,
         issue: record.issue ?? review.issue,
         profile: review.executor_profile,
@@ -476,13 +634,16 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
         provenance,
       });
       await putReview({
-        candidate, evidence_key: evidenceKey, verdict, tier: review.tier,
+        candidate: storageCandidate, evidence_key: evidenceKey, verdict, tier: review.tier,
         executor_profile: review.executor_profile, review_id: record.review_id ?? review.review_id,
         result: record, provenance, reviewed_at: reviewedAt, expires_at: expiresAt,
         imported_record_sha256: sha256(Buffer.from(canonical(record), 'utf8')),
       });
+      await recordCandidateState(record, {candidate: storageCandidate, evidenceKey, state: record.terminal_state ?? verdict,
+        stateClass: 'terminal', source});
+      const resolvedImportCandidateKey = await resolvedCandidateKey(storageCandidate);
       await execute(`INSERT INTO imports(import_key,candidate_key,evidence_key,source,imported_at)
-        VALUES (${sql(importKey)},${sql(canonicalCandidate(candidate))},${sql(evidenceKey)},${sql(source)},${sql(new Date().toISOString())});`);
+        VALUES (${sql(importKey)},${sql(resolvedImportCandidateKey)},${sql(evidenceKey)},${sql(source)},${sql(new Date().toISOString())});`);
       imported += 1;
     }
     return {imported, unchanged};
@@ -500,8 +661,11 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
     return {imported, unchanged, files: files.length};
   }
 
-  async function rank({profile = 'node', count = 100} = {}) {
+  async function rank({profile = 'node', count = 100, now = new Date()} = {}) {
     if (!Number.isInteger(count) || count < 1 || count > 10_000) throw new Error('rank count must be 1..10000');
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error('rank now must be a valid Date');
+    const nowIso = now.toISOString();
+    const freshAfter = new Date(now.getTime() - SNAPSHOT_FRESHNESS_MS).toISOString();
     const rows = await query(`SELECT i.*, r.repo_display, r.test_profile, r.install_command,
       r.full_check_commands_json, r.invitation_label_map_json
       FROM issues i JOIN repositories r ON r.repo_key=i.repo_key
@@ -509,6 +673,8 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
         AND (i.profile=${sql(profile)} OR r.test_profile=${sql(profile)} OR (i.profile IS NULL AND r.test_profile IS NULL))
         AND i.evidence_key IS NOT NULL
         AND i.mechanical_reasons_json='[]'
+        AND i.last_hydrated_at>=${sql(freshAfter)}
+        AND i.snapshot_expires_at>${sql(nowIso)}
       ORDER BY COALESCE(i.mechanical_score,-999999) DESC, COALESCE(i.issue_updated_at,'') DESC, i.candidate_key ASC
       LIMIT ${count};`);
     return rows.map((row, index) => {
@@ -537,13 +703,82 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
     });
   }
 
+  async function slotSummary({now = new Date(), dailyRate = 0, p75Days = 30,
+    maxOpenPrsPerOwner = 5, maxNewPrsPerOwnerPerDay = 2} = {}) {
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error('slot summary now must be a valid Date');
+    if (!Number.isFinite(dailyRate) || dailyRate < 0 || !Number.isFinite(p75Days) || p75Days <= 0) {
+      throw new Error('slot summary rate and p75 lifetime must be nonnegative');
+    }
+    const nowIso = now.toISOString();
+    const freshAfter = new Date(now.getTime() - SNAPSHOT_FRESHNESS_MS).toISOString();
+    const rows = await query(`SELECT r.repo_key,r.repo_display,r.repository_node_id,
+      COALESCE(r.owner_node_id,lower(r.owner_login),substr(r.repo_key,1,instr(r.repo_key,'/')-1)) AS owner_key,
+      COALESCE(r.owner_login,substr(r.repo_display,1,instr(r.repo_display,'/')-1)) AS owner_login,
+      r.max_open_prs,r.daily_pr_cap,r.open_northset_prs,r.northset_prs_opened_today,r.cooldown_until,
+      count(i.candidate_key) AS fresh_eligible_issues
+      FROM repositories r JOIN issues i ON i.repo_key=r.repo_key
+      WHERE r.repository_node_id IS NOT NULL AND i.issue_node_id IS NOT NULL
+        AND r.slot_observed_at>=${sql(freshAfter)} AND r.slot_expires_at>${sql(nowIso)}
+        AND i.last_hydrated_at>=${sql(freshAfter)} AND i.snapshot_expires_at>${sql(nowIso)}
+        AND COALESCE(i.state,'OPEN') IN ('OPEN','open','REVIEWED')
+        AND i.evidence_key IS NOT NULL AND i.mechanical_reasons_json='[]'
+      GROUP BY r.repo_key ORDER BY r.repo_key;`);
+    const cooldownActive = (value) => {
+      if (!value) return false;
+      const parsed = Date.parse(value);
+      return !Number.isFinite(parsed) || parsed > now.getTime();
+    };
+    const owners = new Map();
+    let occupiedSlots = 0;
+    let cooldownBlocked = 0;
+    for (const row of rows) {
+      const open = Math.max(0, Number(row.open_northset_prs ?? 0));
+      const openedToday = Math.max(0, Number(row.northset_prs_opened_today ?? 0));
+      occupiedSlots += open;
+      const blocked = cooldownActive(row.cooldown_until);
+      if (blocked) cooldownBlocked += 1;
+      const repositorySlots = blocked ? 0 : Math.max(0, Math.min(
+        Number(row.fresh_eligible_issues), Number(row.max_open_prs) - open, Number(row.daily_pr_cap) - openedToday,
+      ));
+      const ownerKey = String(row.owner_key ?? row.owner_login).toLowerCase();
+      const owner = owners.get(ownerKey) ?? {owner: row.owner_login, open_prs: 0, opened_today: 0, repository_slots: 0, repositories: 0};
+      owner.open_prs += open;
+      owner.opened_today += openedToday;
+      owner.repository_slots += repositorySlots;
+      owner.repositories += 1;
+      owners.set(ownerKey, owner);
+    }
+    let availableSlots = 0;
+    const ownerConcentration = [];
+    for (const [ownerKey, owner] of [...owners].sort(([left], [right]) => left.localeCompare(right))) {
+      const available = Math.max(0, Math.min(owner.repository_slots,
+        maxOpenPrsPerOwner - owner.open_prs, maxNewPrsPerOwnerPerDay - owner.opened_today));
+      availableSlots += available;
+      ownerConcentration.push({owner_key: ownerKey, owner: owner.owner, repositories: owner.repositories,
+        open_prs: owner.open_prs, opened_today: owner.opened_today, available_slots: available});
+    }
+    return {
+      observed_at: nowIso,
+      freshness_hours: 48,
+      fresh_issues: rows.reduce((sum, row) => sum + Number(row.fresh_eligible_issues), 0),
+      fresh_repositories: rows.length,
+      occupied_slots: occupiedSlots,
+      available_slots: availableSlots,
+      cooldown_blocked_repositories: cooldownBlocked,
+      required_slots: Math.max(300, Math.ceil(dailyRate * p75Days)),
+      p75_lifetime_days: p75Days,
+      owner_concentration: ownerConcentration,
+    };
+  }
+
   async function recordAttempt(record) {
     const parts = candidateParts(record.candidate);
-    const existingIssue = await query(`SELECT candidate_key FROM issues WHERE candidate_key=${sql(parts.key)} LIMIT 1;`);
+    const candidateKey = await resolvedCandidateKey(parts.display);
+    const existingIssue = await query(`SELECT candidate_key FROM issues WHERE candidate_key=${sql(candidateKey)} LIMIT 1;`);
     if (!existingIssue.length) await upsertIssue({candidate: parts.display, raw: {candidate: parts.display}});
     const created = record.created_at ?? new Date().toISOString();
     await execute(`INSERT INTO attempts(mission_id,candidate_key,candidate_display,task_id,attempt_sequence,state,terminal_reason,created_at,updated_at,raw_json)
-      VALUES (${sql(record.mission_id)},${sql(parts.key)},${sql(parts.display)},${sql(record.task_id)},${sql(record.attempt_sequence)},
+      VALUES (${sql(record.mission_id)},${sql(candidateKey)},${sql(parts.display)},${sql(record.task_id)},${sql(record.attempt_sequence)},
         ${sql(record.state)},${sql(record.terminal_reason)},${sql(created)},${sql(record.updated_at ?? created)},${sql(jsonText(record, {}))})
       ON CONFLICT(mission_id) DO UPDATE SET state=excluded.state,terminal_reason=excluded.terminal_reason,
         updated_at=excluded.updated_at,raw_json=excluded.raw_json;`);
@@ -554,7 +789,9 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
       (SELECT count(*) FROM repositories) AS repositories,
       (SELECT count(*) FROM issues) AS issues,
       (SELECT count(*) FROM reviews) AS reviews,
-      (SELECT count(*) FROM attempts) AS attempts;`);
+      (SELECT count(*) FROM attempts) AS attempts,
+      (SELECT count(*) FROM candidate_state_events WHERE state_class='retryable') AS retryable_states,
+      (SELECT count(*) FROM quarantine) AS quarantined;`);
     return rows[0];
   }
 
@@ -566,9 +803,13 @@ export async function openCandidateLake(databasePath, {sqliteBin = 'sqlite3'} = 
     getReview,
     getCachedReview,
     getIssue,
+    recordCandidateState,
+    candidateStates,
+    quarantine,
     importQualifications,
     importFiles,
     rank,
+    slotSummary,
     recordAttempt,
     stats,
   };

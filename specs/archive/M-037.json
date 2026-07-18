@@ -1,0 +1,164 @@
+{
+  "schema_version": 2,
+  "mission_id": "M-037",
+  "task_id": "TASK-OSS-22B30740B3545155",
+  "attempt_sequence": 1,
+  "work_category": "defect_fix",
+  "authoring_mode": "test_only_then_fix",
+  "allow_modified_existing_tests": false,
+  "candidate": "SkyPierIO/skypier-vpn#103",
+  "target_repo": "https://github.com/SkyPierIO/skypier-vpn",
+  "issue_url": "https://github.com/SkyPierIO/skypier-vpn/issues/103",
+  "base_branch": "main",
+  "base_commit": "66573edf1fd86db4f8ce772bc39d7e7a24d5d5c4",
+  "problem_statement": "SetNodeUp chooses its QUIC UDP listen port with the TCP availability helper, and both availability helpers probe by dialing rather than binding; UDP dialing does not determine whether the local UDP port can be bound.",
+  "acceptance_criteria": [
+    "GetFirstAvailableTCPPort tests local TCP availability by binding and closes the listener before returning.",
+    "GetFirstAvailableUDPPort tests local UDP availability by binding, skips occupied UDP ports, and closes the packet listener before returning.",
+    "SetNodeUp obtains the QUIC port from GetFirstAvailableUDPPort while retaining GetFirstAvailableTCPPort for TCP."
+  ],
+  "non_goals": [
+    "No new configuration option, flag, dependency, or public API is required.",
+    "No redesign of libp2p startup or remote reachability behavior is required.",
+    "The change does not promise to reserve a selected port between closing the probe listener and StartNode binding it."
+  ],
+  "constraints": [
+    "No new configuration option, flag, dependency, or public API is required.",
+    "No redesign of libp2p startup or remote reachability behavior is required.",
+    "The change does not promise to reserve a selected port between closing the probe listener and StartNode binding it.",
+    "Do not add dependencies, change lockfiles or CI, update generated output, add binaries or symlinks, or rename files.",
+    "Keep the contribution limited to production source and an oracle-bound regression test."
+  ],
+  "implementation_hints": [],
+  "process_requirements": [
+    "Recheck the issue, assignees, claimant comments, labels, and related PR state on the mission day.",
+    "Treat the Go executor as a pilot profile; do not describe it as production-proven.",
+    "The checked-out repository contains no CONTRIBUTING.md despite README.md referencing it; obey any live host-side CLA, DCO, disclosure, or contribution instructions discovered during the same-day recheck."
+  ],
+  "source_evidence": [
+    "pkg/vpn/p2p.go:275 — tcpPort := utils.GetFirstAvailableTCPPort(4002, 4999)",
+    "pkg/vpn/p2p.go:276 — udpPort := utils.GetFirstAvailableTCPPort(4002, 4999)",
+    "pkg/utils/port.go:29 — conn, err := net.DialTimeout(\"tcp\", net.JoinHostPort(host, p), timeout)",
+    "pkg/utils/port.go:30 — if err != nil {",
+    "pkg/utils/port.go:45 — conn, err := net.DialTimeout(\"udp\", net.JoinHostPort(host, p), timeout)",
+    "pkg/utils/port.go:46 — if err != nil {",
+    ".github/workflows/ci.yml:67 — run: go test ./...",
+    "README.md:118 — We welcome contributions! Please see our CONTRIBUTING.md for guidelines."
+  ],
+  "qualification": {
+    "finder_run_id": null,
+    "candidate_rank": null,
+    "finder_elapsed_ms": null,
+    "review_duration_ms": 156954,
+    "review_id": "sha256:f639c8900e6bdcd8be514ec24d1ed35dcc244a09b7a9c31b62a6492175233692",
+    "review_prompt_version": 3,
+    "reviewed_at": "2026-07-17T21:04:28.101Z",
+    "qualification_expires_at": "2026-07-17T23:04:28.101Z",
+    "evidence_sha256": "sha256:1874764a1f9c75c43f45c643a41fc5a6dd6f8c9b2536a068ada43663fa64e616",
+    "issue_updated_at": "2026-07-16T05:32:48Z",
+    "requested_model": "gpt-5.6-sol",
+    "actual_model": null,
+    "reasoning_effort": "xhigh",
+    "service_tier": "fast",
+    "model_requests": null,
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_tokens": null,
+    "source_evidence": [
+      "pkg/vpn/p2p.go:275 — tcpPort := utils.GetFirstAvailableTCPPort(4002, 4999)",
+      "pkg/vpn/p2p.go:276 — udpPort := utils.GetFirstAvailableTCPPort(4002, 4999)",
+      "pkg/utils/port.go:29 — conn, err := net.DialTimeout(\"tcp\", net.JoinHostPort(host, p), timeout)",
+      "pkg/utils/port.go:30 — if err != nil {",
+      "pkg/utils/port.go:45 — conn, err := net.DialTimeout(\"udp\", net.JoinHostPort(host, p), timeout)",
+      "pkg/utils/port.go:46 — if err != nil {",
+      ".github/workflows/ci.yml:67 — run: go test ./...",
+      "README.md:118 — We welcome contributions! Please see our CONTRIBUTING.md for guidelines."
+    ],
+    "invitation_evidence": {
+      "type": "label",
+      "url": "https://github.com/SkyPierIO/skypier-vpn/issues/103",
+      "observed_at": "2026-07-17T21:01:54.949Z"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "SetNodeUp chooses its QUIC UDP listen port with the TCP availability helper, and both availability helpers probe by dialing rather than binding; UDP dialing does not determine whether the local UDP port can be bound.",
+      "expected_behavior": [
+        "GetFirstAvailableTCPPort tests local TCP availability by binding and closes the listener before returning.",
+        "GetFirstAvailableUDPPort tests local UDP availability by binding, skips occupied UDP ports, and closes the packet listener before returning.",
+        "SetNodeUp obtains the QUIC port from GetFirstAvailableUDPPort while retaining GetFirstAvailableTCPPort for TCP."
+      ],
+      "non_goals": [
+        "No new configuration option, flag, dependency, or public API is required.",
+        "No redesign of libp2p startup or remote reachability behavior is required.",
+        "The change does not promise to reserve a selected port between closing the probe listener and StartNode binding it."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/SkyPierIO/skypier-vpn/issues/103",
+          "author_association": "COLLABORATOR",
+          "summary": "The collaborator-authored issue identifies both defects and explicitly settles the implementation direction: bind with net.Listen/net.ListenPacket, close the listener, and use the UDP helper for QUIC."
+        }
+      ]
+    },
+    "related_prs": []
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "pkg/utils/port_test.go"
+    ],
+    "command": "go test ./pkg/utils -run '^TestGetFirstAvailableUDPPortIgnoresTCPOccupancy$' -count=1",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "expected UDP port",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix: Tier A Go-pilot candidate: a collaborator-filed, bounded, reprodu",
+    "summary": "SetNodeUp chooses its QUIC UDP listen port with the TCP availability helper, and both availability helpers probe by dialing rather than binding; UDP dialing does not determine whether the local UDP port can be bound."
+  },
+  "executor": {
+    "profile": "go",
+    "profile_status": "pilot",
+    "image": "golang:1.26.4-bookworm",
+    "install_commands": [
+      "go mod download"
+    ],
+    "commands": [
+      "go test ./pkg/utils -run '^TestGetFirstAvailableUDPPortIgnoresTCPOccupancy$' -count=1"
+    ],
+    "reasoning_effort": "xhigh",
+    "profile_production_proven": false
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "schema_version": 2,
+      "defaults": {
+        "max_open_prs": 1,
+        "daily_pr_cap": 1
+      },
+      "repositories": {
+        "prometheus/client_js": {
+          "max_open_prs": 0,
+          "daily_pr_cap": 0,
+          "cooldown_until": "manual-release",
+          "reason": "Maintainer bandwidth concern; a new contribution requires an explicit invitation."
+        }
+      },
+      "cooldowns": {
+        "prometheus/client_js": {
+          "reason": "Maintainer reported AI-generated PR bandwidth exhaustion on 2026-07-13; keep paused until the existing interaction is resolved or a maintainer explicitly invites new work.",
+          "evidence_url": "https://github.com/prometheus/client_js/pull/773#issuecomment-4953870322"
+        }
+      }
+    },
+    "checks_not_run": [],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

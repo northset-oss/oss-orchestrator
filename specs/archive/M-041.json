@@ -1,0 +1,162 @@
+{
+  "schema_version": 2,
+  "mission_id": "M-041",
+  "task_id": "TASK-OSS-03D6C6CC98159D63",
+  "attempt_sequence": 2,
+  "work_category": "defect_fix",
+  "authoring_mode": "test_only_then_fix",
+  "allow_modified_existing_tests": true,
+  "candidate": "ICTU/quality-time#12817",
+  "target_repo": "https://github.com/ICTU/quality-time",
+  "issue_url": "https://github.com/ICTU/quality-time/issues/12817",
+  "base_branch": "master",
+  "base_commit": "45dea1ddb2706d8810f0403062eb5d5c2decba95",
+  "problem_statement": "Quality-time still exposes and implements the deprecated Cobertura Jenkins plugin source.",
+  "acceptance_criteria": [
+    "Remove `cobertura_jenkins_plugin` from the shared source registry and supported metric source lists.",
+    "Stop registering the Cobertura Jenkins plugin collector implementations.",
+    "Add a focused regression asserting that the plugin is absent from the shared data model."
+  ],
+  "non_goals": [
+    "Do not remove support for standalone Cobertura XML reports.",
+    "Do not remove other Jenkins plugin sources."
+  ],
+  "constraints": [
+    "Do not remove support for standalone Cobertura XML reports.",
+    "Do not remove other Jenkins plugin sources.",
+    "Do not add dependencies, change lockfiles or CI, update generated output, add binaries or symlinks, or rename files.",
+    "Keep the contribution limited to production source and an oracle-bound regression test.",
+    "Keep the patch to exactly these five existing files: components/collector/src/source_collectors/__init__.py, components/shared_code/src/shared_data_model/metrics.py, components/shared_code/src/shared_data_model/sources/__init__.py, components/shared_code/src/shared_data_model/sources/quality_time.py, and components/shared_code/tests/shared_data_model/meta/test_data_model.py. Leave the Cobertura Jenkins plugin logo and every other file unchanged."
+  ],
+  "implementation_hints": [],
+  "process_requirements": [
+    "Recheck issue state, assignments, comments, timeline, and related PRs on the same day before acting.",
+    "Comment on the issue to notify maintainers of interest before beginning work.",
+    "Use a short imperative commit subject and include `Fixes #12817.` or `Closes #12817.` in the commit body."
+  ],
+  "source_evidence": [
+    "components/shared_code/src/shared_data_model/sources/cobertura.py:26 — COBERTURA_JENKINS_PLUGIN = Source(",
+    "components/shared_code/src/shared_data_model/sources/__init__.py:59 — \"cobertura_jenkins_plugin\": COBERTURA_JENKINS_PLUGIN,",
+    "components/shared_code/src/shared_data_model/metrics.py:521 — \"cobertura_jenkins_plugin\",",
+    "components/collector/src/source_collectors/__init__.py:37 — from .cobertura_jenkins_plugin.source_up_to_dateness import CoberturaJenkinsPluginSourceUpToDateness",
+    "components/shared_code/src/shared_data_model/sources/quality_time.py:80 — \"Cobertura\": \"cobertura\",",
+    "docs/src/development.md:367 — Be sure to run the unit tests of the shared data model component after adding a source to the data model, to check the integrity of the data model. If you forget to do step 2 above, one of the tests will fail.",
+    "tools/just/test.just:17 — {{ start_progress(folder) }} {{ if cov == \"no\" { python } else { coverage + \" run\" } }} -m unittest --quiet {{ tests }}{{ if cov != \"no\" { \" && \" + coverage + \" report --fail-under=0 && \" + coverage + \" html --quiet --fail-under=0 && \" + coverage + \" xml --quiet\" } else { \"\" } }} {{ end_progress(\"py-unit-test\") }}",
+    "CONTRIBUTING.md:12 — 2. Note the maintainers of your interest by commenting on the issue or feature request."
+  ],
+  "qualification": {
+    "finder_run_id": null,
+    "candidate_rank": null,
+    "finder_elapsed_ms": null,
+    "review_duration_ms": 206844,
+    "review_id": "sha256:4b0102b33ad88c10b6de1dc60a07c5bd4ec3a43141e4efd37564b0e5d81d8d65",
+    "review_prompt_version": 3,
+    "reviewed_at": "2026-07-17T22:09:08.792Z",
+    "qualification_expires_at": "2026-07-18T00:09:08.792Z",
+    "evidence_sha256": "sha256:9bf020d865c72c9acb195d5f44b964d9007617647288959957f00e68d4f9748d",
+    "issue_updated_at": "2026-07-09T09:03:36Z",
+    "requested_model": "gpt-5.6-sol",
+    "actual_model": null,
+    "reasoning_effort": "xhigh",
+    "service_tier": "fast",
+    "model_requests": null,
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_tokens": null,
+    "source_evidence": [
+      "components/shared_code/src/shared_data_model/sources/cobertura.py:26 — COBERTURA_JENKINS_PLUGIN = Source(",
+      "components/shared_code/src/shared_data_model/sources/__init__.py:59 — \"cobertura_jenkins_plugin\": COBERTURA_JENKINS_PLUGIN,",
+      "components/shared_code/src/shared_data_model/metrics.py:521 — \"cobertura_jenkins_plugin\",",
+      "components/collector/src/source_collectors/__init__.py:37 — from .cobertura_jenkins_plugin.source_up_to_dateness import CoberturaJenkinsPluginSourceUpToDateness",
+      "components/shared_code/src/shared_data_model/sources/quality_time.py:80 — \"Cobertura\": \"cobertura\",",
+      "docs/src/development.md:367 — Be sure to run the unit tests of the shared data model component after adding a source to the data model, to check the integrity of the data model. If you forget to do step 2 above, one of the tests will fail.",
+      "tools/just/test.just:17 — {{ start_progress(folder) }} {{ if cov == \"no\" { python } else { coverage + \" run\" } }} -m unittest --quiet {{ tests }}{{ if cov != \"no\" { \" && \" + coverage + \" report --fail-under=0 && \" + coverage + \" html --quiet --fail-under=0 && \" + coverage + \" xml --quiet\" } else { \"\" } }} {{ end_progress(\"py-unit-test\") }}",
+      "CONTRIBUTING.md:12 — 2. Note the maintainers of your interest by commenting on the issue or feature request."
+    ],
+    "invitation_evidence": {
+      "type": "label",
+      "url": "https://github.com/ICTU/quality-time/issues/12817",
+      "observed_at": "2026-07-17T22:05:50.544Z"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "Quality-time still exposes and implements the deprecated Cobertura Jenkins plugin source.",
+      "expected_behavior": [
+        "Remove `cobertura_jenkins_plugin` from the shared source registry and supported metric source lists.",
+        "Stop registering the Cobertura Jenkins plugin collector implementations.",
+        "Add a focused regression asserting that the plugin is absent from the shared data model."
+      ],
+      "non_goals": [
+        "Do not remove support for standalone Cobertura XML reports.",
+        "Do not remove other Jenkins plugin sources."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/ICTU/quality-time/issues/12817",
+          "author_association": "MEMBER",
+          "summary": "A repository member requests removal of Cobertura Jenkins plugin support because the upstream plugin is deprecated and Quality-time support was previously deprecated."
+        }
+      ]
+    },
+    "related_prs": []
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "components/shared_code/tests/shared_data_model/meta/test_data_model.py"
+    ],
+    "command": "env PYTHONPATH=components/shared_code/src:/workspace/.northset/bootstrap-home/python-site python -m unittest --quiet components/shared_code/tests/shared_data_model/meta/test_data_model.py",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "cobertura_jenkins_plugin",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix: Tier A Python-pilot candidate. The maintainer-requested removal i",
+    "summary": "Quality-time still exposes and implements the deprecated Cobertura Jenkins plugin source."
+  },
+  "executor": {
+    "profile": "python",
+    "profile_status": "pilot",
+    "image": "python:3.14.5-bookworm",
+    "install_commands": [
+      "python -m pip install -e components/shared_code"
+    ],
+    "commands": [
+      "env PYTHONPATH=components/shared_code/src:/workspace/.northset/bootstrap-home/python-site python -m unittest --quiet components/shared_code/tests/shared_data_model/meta/test_data_model.py"
+    ],
+    "reasoning_effort": "xhigh",
+    "profile_production_proven": false
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "schema_version": 2,
+      "defaults": {
+        "max_open_prs": 1,
+        "daily_pr_cap": 1
+      },
+      "repositories": {
+        "prometheus/client_js": {
+          "max_open_prs": 0,
+          "daily_pr_cap": 0,
+          "cooldown_until": "manual-release",
+          "reason": "Maintainer bandwidth concern; a new contribution requires an explicit invitation."
+        }
+      },
+      "cooldowns": {
+        "prometheus/client_js": {
+          "reason": "Maintainer reported AI-generated PR bandwidth exhaustion on 2026-07-13; keep paused until the existing interaction is resolved or a maintainer explicitly invites new work.",
+          "evidence_url": "https://github.com/prometheus/client_js/pull/773#issuecomment-4953870322"
+        }
+      }
+    },
+    "checks_not_run": [],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

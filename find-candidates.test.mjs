@@ -18,8 +18,10 @@ import {
   discoverRepositoryInvitationLabels,
   extractIssueKeys,
   filterDiscovered,
+  GitHubSubprocessTerminalError,
   isInvitationLabel,
   isFatalReviewerInfrastructureError,
+  isTerminalGitHubSubprocessError,
   loadSeen,
   lowValueReason,
   mechanicalDecision,
@@ -41,6 +43,23 @@ import {candidateEvidenceKey, openCandidateLake} from './candidate-lake.mjs';
 
 const oid = (char) => char.repeat(40);
 const digest = (char) => `sha256:${char.repeat(64)}`;
+
+function gatewayTestEnv(root) {
+  return {
+    OSS_GH_GATEWAY_TEST_MODE: '1',
+    OSS_GH_GATEWAY_TEST_MIN_SPACING_MS: '0',
+    OSS_GH_GATEWAY_TEST_SEARCH_SPACING_MS: '0',
+    OSS_GH_GATEWAY_TEST_MUTATION_SPACING_MS: '0',
+    OSS_GH_GATEWAY_TEST_JITTER_MAX_MS: '0',
+    OSS_GH_GATEWAY_TEST_LOCK_POLL_MS: '1',
+    OSS_GH_GATEWAY_STATE_DIR: path.join(root, 'gh-gateway-state'),
+    OSS_GH_REQUEST_LEDGER: path.join(root, 'gh-request-ledger.jsonl'),
+    OSS_RESOURCE_CONTROL_FILE: path.join(root, 'resource-control.json'),
+    OSS_CAMPAIGN_CONTROL_STATE: path.join(root, 'control-state.json'),
+    OSS_GATEWAY_WAVE_ID: 'finder-offline-wave',
+    OSS_GATEWAY_WAVE_BUDGET: '1000',
+  };
+}
 
 function config(overrides = {}) {
   return {
@@ -140,6 +159,16 @@ test('parses a bounded default configuration and rejects conflicting or unsafe v
   const includeOnly = parseArgs(['5', '--include-file', 'first.txt', '--include-only']);
   assert.equal(includeOnly.includeOnly, true);
   assert.throws(() => parseArgs(['5', '--include-only']), /requires at least one --include-file/);
+  const archived = parseArgs(['5', '--discovery-file', 'archive-discovery.json']);
+  assert.equal(archived.discoveryFile, path.resolve('archive-discovery.json'));
+  assert.deepEqual(buildSearchPlan(archived), []);
+  const waved = parseArgs(['5'], {
+    OSS_GATEWAY_WAVE_ID: 'finder-wave-17',
+    OSS_GATEWAY_WAVE_BUDGET: '91',
+  });
+  assert.equal(waved.gatewayWaveId, 'finder-wave-17');
+  assert.equal(waved.gatewayWaveBudget, 91);
+  assert.throws(() => parseArgs(['5'], {OSS_GATEWAY_WAVE_BUDGET: '-1'}), /OSS_GATEWAY_WAVE_BUDGET/);
 });
 
 test('builds a deterministic, bounded invitation-label search plan', () => {
@@ -200,17 +229,19 @@ test('include-only mode uses the supplied corpus without wide GitHub discovery s
   assert.deepEqual(buildSearchPlan(config({includeOnly: true})), []);
 });
 
-test('include-only live hydration preserves issue body signals for scoring', () => {
+test('live hydration replaces stale discovery fields with the current issue snapshot', () => {
   const candidate = {
-    key: 'owner/repo#12', title: '', body: '', labels: [], updated_at: null,
-    comments_count: 0, discovery_queries: ['include-file'],
+    key: 'owner/repo#12', title: 'Stale archive title', body: 'Stale archive body',
+    labels: ['bug'], updated_at: '2026-07-17T00:00:00Z', comments_count: 1,
+    discovery_queries: ['discovery-file'],
   };
   const repository = {
     nameWithOwner: 'owner/repo',
     issue: {
       number: 12, title: 'Fix parser regression', bodyText: 'Expected and actual behavior with a focused test.',
+      updatedAt: '2026-07-18T00:10:00Z',
       assignees: {nodes: []}, labels: {nodes: [{name: 'good first issue'}]},
-      comments: {totalCount: 0, nodes: []}, timelineItems: {pageInfo: {hasNextPage: false}, nodes: []},
+      comments: {totalCount: 3, nodes: []}, timelineItems: {pageInfo: {hasNextPage: false}, nodes: []},
     },
   };
 
@@ -219,6 +250,8 @@ test('include-only live hydration preserves issue body signals for scoring', () 
   assert.equal(hydrated.discovery.title, 'Fix parser regression');
   assert.equal(hydrated.discovery.body_excerpt, 'Expected and actual behavior with a focused test.');
   assert.deepEqual(hydrated.discovery.labels, ['good first issue']);
+  assert.equal(hydrated.discovery.updated_at, '2026-07-18T00:10:00Z');
+  assert.equal(hydrated.discovery.comments_count, 3);
 });
 
 test('builds auditable REST search qualifiers and normalizes REST issue records', () => {
@@ -278,6 +311,60 @@ test('preflight scoring favors a bounded active Node issue and hard gates collis
   const blocked = structuredClone(value);
   blocked.issue.labels.push('security');
   assert.match(mechanicalDecision(blocked, config()).reasons.join(' '), /excluded label/);
+});
+
+test('top review queue favors evidenced maintainer defects over observed low-yield classes', () => {
+  const candidate = (key, title, bodyExcerpt = '') => {
+    const value = structuredClone(preflight());
+    value.candidate = key;
+    value.issue.title = title;
+    value.issue.url = `https://github.com/owner/repo/issues/${key.split('#')[1]}`;
+    value.discovery.title = title;
+    value.discovery.body_excerpt = bodyExcerpt;
+    value.decision = mechanicalDecision(value, config());
+    return value;
+  };
+
+  const bounded = candidate('owner/repo#101', 'Fix parser regression for bounded input',
+    'Expected: reject the token. Actual: it crashes. Repro steps and a focused test are included.');
+  const neutral = candidate('owner/repo#102', 'Handle an additional parser input',
+    'The parser behavior should be adjusted.');
+  assert.equal(bounded.decision.eligible, true);
+  assert.equal(neutral.decision.eligible, true);
+  assert.ok(bounded.decision.score.total > neutral.decision.score.total);
+  assert.ok(bounded.decision.score.factors.some((factor) => factor.name === 'maintainer-authored evidenced defect'));
+
+  const excluded = [
+    candidate('owner/repo#201', 'Update parser documentation'),
+    candidate('owner/repo#202', 'Translate parser messages'),
+    candidate('owner/repo#203', 'Improve test coverage for the parser'),
+    candidate('owner/repo#204', 'RFC: parser redesign proposal'),
+    candidate('owner/repo#205', 'Feature request: add color themes'),
+    candidate('owner/repo#206', 'Add a new API endpoint for parser state'),
+    candidate('owner/repo#207', 'Introduce a CLI flag for parser output'),
+    candidate('owner/repo#208', 'Add a hardware integration test'),
+    candidate('owner/repo#209', 'Add Kubernetes E2E coverage'),
+    candidate('owner/repo#210', 'Expand the end-to-end test suite'),
+    candidate('owner/repo#211', 'Umbrella issue for parser improvements'),
+  ];
+  const unsettled = candidate('owner/repo#212', 'Fix parser regression');
+  unsettled.issue.recent_comments = [{
+    author: 'maintainer', created_at: new Date().toISOString(), body: 'The design is not settled; hold off.',
+  }];
+  unsettled.decision = mechanicalDecision(unsettled, config());
+  excluded.push(unsettled);
+  const claimed = candidate('owner/repo#213', 'Fix parser regression');
+  claimed.issue.recent_comments = [{
+    author: 'contributor', created_at: new Date().toISOString(), body: 'I am working on this now.',
+  }];
+  claimed.decision = mechanicalDecision(claimed, config());
+  excluded.push(claimed);
+
+  for (const record of excluded) {
+    assert.equal(record.decision.eligible, false, `${record.candidate}: ${record.issue.title}`);
+  }
+  assert.deepEqual(buildReviewQueue([neutral, ...excluded, bounded], 2).map((record) => record.candidate),
+    ['owner/repo#101', 'owner/repo#102']);
 });
 
 test('comment count is a risk signal while claims and unresolved design remain blocking', () => {
@@ -343,6 +430,34 @@ test('legacy numeric review carries the explicitly requested executor profile', 
   }
 });
 
+test('qualify hard-stops on a terminal reviewer gateway marker without recording a retryable state', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'finder-qualify-gateway-stop-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const lake = await openCandidateLake(path.join(root, 'candidate_lake.sqlite'));
+  const value = preflight();
+  const evidenceKey = candidateEvidenceKey({
+    candidate: value.candidate, base_commit: value.repository.default_head,
+    issue_updated_at: value.issue.updated_at, labels: value.issue.labels, assignees: [],
+    comments_tail_sha256: digest('1'), timeline_prs_sha256: digest('2'), repo_policy_sha256: digest('3'),
+  });
+  await lake.upsertIssue({...value, evidence_key: evidenceKey, profile: 'node', raw: value});
+  const queue = [{candidate: value.candidate, evidence_key: evidenceKey, preflight: value,
+    repository_profile: {known_test_command: true}}];
+  let calls = 0;
+  await assert.rejects(() => qualifyQueueRecords(queue, {
+    lake,
+    profile: 'node',
+    concurrency: 1,
+    reviewRunner: async () => {
+      calls += 1;
+      return {code: 1, stdout: '', stderr: 'review error [GITHUB_PROVIDER_THROTTLED]: automatic retry is forbidden'};
+    },
+  }), (error) => error instanceof GitHubSubprocessTerminalError);
+  assert.equal(calls, 1);
+  assert.equal(isTerminalGitHubSubprocessError('review error [GITHUB_GATEWAY_REFUSED]: hold active'), true);
+  assert.deepEqual(await lake.candidateStates({candidate: value.candidate}), []);
+});
+
 test('qualify reuses only an unexpired exact-evidence review and refuses a stale queue', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'finder-qualify-cache-'));
   t.after(() => rm(root, {recursive: true, force: true}));
@@ -405,6 +520,10 @@ test('qualify never stores a reviewer decision under stale queued evidence bytes
   assert.equal(result.state, 'REVIEW_TOOL_ERROR');
   assert.match(result.error, /evidence/i);
   assert.equal(await lake.getReview(value.candidate, evidenceKey), null);
+  assert.deepEqual((await lake.candidateStates({candidate: value.candidate})).map((event) => ({
+    state: event.state,
+    state_class: event.state_class,
+  })), [{state: 'REVIEW_TOOL_ERROR', state_class: 'retryable'}]);
 });
 
 test('injects exact include keys and exempts only those keys from repository concentration', () => {
@@ -517,6 +636,53 @@ test('discovery filtering enforces history, cooldown, open-PR, and concentration
   assert.equal(result.rejected.length, 4);
 });
 
+test('preflight requests and normalizes canonical repository and issue node identities', () => {
+  const query = buildPreflightQuery([{owner: 'Owner', repo: 'Repo', number: 7}]);
+  assert.match(query, /repository\([^)]*\)\s*{\s*id\s+owner\s*{\s*id\s+login/s);
+  assert.match(query, /issue\(number:\s*7\)\s*{\s*id/s);
+  const normalized = normalizePreflight({key: 'Owner/Repo#7'}, {
+    id: 'R_node', nameWithOwner: 'Owner/Repo', owner: {id: 'O_node', login: 'Owner'},
+    issue: {id: 'I_node', number: 7, title: 'Fix', state: 'OPEN', assignees: {nodes: []}, labels: {nodes: []}, comments: {nodes: []}},
+  });
+  assert.equal(normalized.repository.node_id, 'R_node');
+  assert.deepEqual(normalized.repository.owner, {node_id: 'O_node', login: 'Owner'});
+  assert.equal(normalized.issue.node_id, 'I_node');
+});
+
+test('qualify command enforces the activated Phase-1 JIT window before review starts', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-phase1-qualify-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const monotonicNow = Number(process.hrtime.bigint() / 1_000_000n);
+  const runtime = path.join(root, 'runtime.json');
+  const controls = path.join(root, 'controls.json');
+  const queue = path.join(root, 'queue.json');
+  await writeFile(runtime, JSON.stringify({
+    schema_version: 1,
+    active: true,
+    controls_state_file: controls,
+    lanes: 8,
+    p75_attempt_start_interval_ms: 15 * 60 * 1000,
+    max_ntp_offset_ms: 1000,
+    ntp: {offset_ms: 0, observed_at: new Date().toISOString()},
+    board_monotonic_ms: monotonicNow + 60 * 60 * 1000,
+    qualification: {
+      predicted_prepare_start_monotonic_ms: monotonicNow + 2 * 60 * 60 * 1000,
+      qualified_ahead: 0,
+    },
+  }));
+  await writeFile(queue, JSON.stringify({queue: [{candidate: 'owner/repo#1'}]}));
+
+  const result = await command(process.execPath, [
+    path.join(import.meta.dirname, 'find-candidates.mjs'), 'qualify',
+    '--queue', queue,
+    '--lake', path.join(root, 'lake.sqlite'),
+    '--out', path.join(root, 'qualifications.json'),
+    '--phase1-runtime', runtime,
+  ], process.env);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Phase-1 runtime blocked qualify: OUTSIDE_JIT_WINDOW/);
+});
+
 test('bounded runner enforces output and wall-clock limits', async () => {
   const output = await runBounded(process.execPath, ['-e', 'process.stdout.write("x".repeat(100000))'], {timeoutMs: 5_000, maxOutputBytes: 1000});
   assert.equal(output.outputLimitExceeded, true);
@@ -558,11 +724,44 @@ console.error('unexpected gh args', args); process.exit(1);
     '--history', path.join(root, 'history.jsonl'), '--output', path.join(root, 'batch.json'),
     '--audit', path.join(root, 'audit.jsonl'), '--review-script', reviewer,
     '--repo-policy', path.join(root, 'missing-policy.json')], {
-    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+    ...process.env, ...gatewayTestEnv(root), PATH: `${bin}${path.delimiter}${process.env.PATH}`,
   });
   assert.equal(result.code, 1);
   assert.match(result.stderr, /remained incomplete/);
   await assert.rejects(() => readFile(marker), /ENOENT/);
+});
+
+test('finder never retries a GitHub secondary-rate-limit response and trips the durable breaker', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-finder-throttle-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const bin = path.join(root, 'bin');
+  await mkdir(bin);
+  const calls = path.join(root, 'gh-calls.jsonl');
+  const gh = path.join(bin, 'gh');
+  await writeFile(gh, `#!/usr/bin/env node
+import {appendFileSync} from 'node:fs';
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + '\\n');
+console.error(JSON.stringify({message:'You have exceeded a secondary rate limit. Please wait a few minutes before you try again.',documentation_url:'https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api#about-secondary-rate-limits'}));
+process.exit(1);
+`);
+  await chmod(gh, 0o755);
+
+  const result = await command(process.execPath, [path.join(import.meta.dirname, 'find-candidates.mjs'), '1',
+    '--budget-seconds', '10', '--review-timeout-seconds', '2',
+    '--history', path.join(root, 'history.jsonl'), '--output', path.join(root, 'batch.json'),
+    '--audit', path.join(root, 'audit.jsonl'), '--repo-policy', path.join(root, 'missing-policy.json')], {
+    ...process.env,
+    ...gatewayTestEnv(root),
+    PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /secondary rate limit/i);
+  assert.equal((await readFile(calls, 'utf8')).trim().split('\n').length, 1);
+  const control = JSON.parse(await readFile(path.join(root, 'resource-control.json'), 'utf8'));
+  assert.equal(control.provider_pause.kind, 'PROVIDER_THROTTLED');
+  assert.equal(control.provider_pause.provider, 'GitHub');
+  assert.equal(control.provider_pause.auto_resume, false);
 });
 
 test('fatal reviewer quota failure stops the batch and leaves candidates retryable', async (t) => {
@@ -614,7 +813,7 @@ process.exit(1);
     '--concurrency', '1', '--max-reviews', '3', '--preflight-limit', '10', '--search-limit', '10',
     '--history', history, '--output', path.join(root, 'batch.json'), '--audit', audit,
     '--review-script', reviewer, '--repo-policy', path.join(root, 'missing-policy.json')], {
-    ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, OSS_FIND_EXCLUDE_FILES: '',
+    ...process.env, ...gatewayTestEnv(root), PATH: `${bin}${path.delimiter}${process.env.PATH}`, OSS_FIND_EXCLUDE_FILES: '',
   });
 
   assert.equal(result.code, 1, result.stderr);
@@ -699,6 +898,7 @@ console.log(JSON.stringify(review)); process.exit(accept ? 0 : 2);
     '--preflight-limit', '10', '--search-limit', '10', '--history', history, '--output', output, '--audit', audit,
     '--review-script', reviewer, '--repo-policy', path.join(root, 'missing-policy.json')], {
     ...process.env,
+    ...gatewayTestEnv(root),
     PATH: `${bin}${path.delimiter}${process.env.PATH}`,
     OSS_FIND_EXCLUDE_FILES: '',
   });
@@ -728,6 +928,13 @@ console.log(JSON.stringify(review)); process.exit(accept ? 0 : 2);
   const starts = historyLines.filter((line) => line.event === 'review_started');
   assert.equal(starts.length, reviewed.length);
   assert.equal(new Set(starts.map((line) => line.candidate)).size, starts.length);
+  const gatewayLedger = (await readFile(path.join(root, 'gh-request-ledger.jsonl'), 'utf8'))
+    .trim().split('\n').map(JSON.parse);
+  assert.ok(gatewayLedger.length > 0);
+  assert.ok(gatewayLedger.every((entry) => entry.wave_id === 'finder-offline-wave'));
+  const gatewayState = JSON.parse(await readFile(path.join(root, 'gh-gateway-state', 'state.json'), 'utf8'));
+  assert.equal(gatewayState.waves['finder-offline-wave'].declared_budget, 1000);
+  assert.equal(gatewayState.waves['finder-offline-wave'].used, gatewayLedger.length);
 });
 
 function command(program, args, env) {

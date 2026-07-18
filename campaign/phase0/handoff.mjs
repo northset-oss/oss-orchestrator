@@ -23,7 +23,6 @@ export function confirmHandoff(handoff, incomingPrivateKey, confirmedAt) {
   const confirmation = signRecord({
     kind: 'shift_handoff_confirmation', handoff_sha256: signedRecordDigest(handoff.outgoing), confirmed_at: confirmedAt,
   }, incomingPrivateKey);
-  if (confirmation.reviewer_id === handoff.outgoing.reviewer_id) throw new Error('handoff requires distinct outgoing and incoming operators');
   return {...handoff, incoming_confirmation: confirmation};
 }
 
@@ -32,9 +31,6 @@ export function verifyHandoff(handoff, roster) {
   const outgoingKey = roster.get(handoff.outgoing.reviewer_id);
   const incomingKey = roster.get(handoff?.incoming_confirmation?.reviewer_id);
   if (!outgoingKey || !incomingKey) throw new Error('handoff signer is not in the reviewer roster');
-  if (handoff.outgoing.reviewer_id === handoff.incoming_confirmation.reviewer_id) {
-    throw new Error('handoff requires distinct outgoing and incoming operators');
-  }
   verifySignedRecord(handoff.outgoing, outgoingKey);
   verifySignedRecord(handoff.incoming_confirmation, incomingKey);
   if (handoff.incoming_confirmation.handoff_sha256 !== signedRecordDigest(handoff.outgoing)) {

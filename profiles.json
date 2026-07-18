@@ -1,6 +1,28 @@
 {
   "schema_version": 1,
   "default_profile": "node",
+  "toolchain_classes": {
+    "node-pure": {
+      "profile": "node",
+      "image": "node:24.16.0-bookworm-slim",
+      "native": false
+    },
+    "node-native": {
+      "profile": "node",
+      "image": "node:24.16.0-bookworm",
+      "native": true
+    },
+    "python-pure": {
+      "profile": "python",
+      "image": "python:3.14.5-slim-bookworm",
+      "native": false
+    },
+    "python-native": {
+      "profile": "python",
+      "image": "python:3.14.5-bookworm",
+      "native": true
+    }
+  },
   "profiles": {
     "node": {
       "status": "existing",
@@ -21,7 +43,7 @@
       "status": "pilot",
       "production_proven": false,
       "languages": ["Python"],
-      "image": "python:3.12.11-bookworm",
+      "image": "python:3.14.5-bookworm",
       "smoke_command": "python --version",
       "install_conventions": ["python -m pip install -e .", "python -m pip install -r requirements.txt"],
       "test_conventions": ["python -m pytest <test_path> -q"],
@@ -36,7 +58,7 @@
       "status": "pilot",
       "production_proven": false,
       "languages": ["Go"],
-      "image": "golang:1.24.5-bookworm",
+      "image": "golang:1.26.4-bookworm",
       "smoke_command": "go version",
       "install_conventions": ["go mod download"],
       "test_conventions": ["go test ./...", "go test <package>"],

@@ -42,6 +42,9 @@ import {
   resourceUsageForTask,
   tripPersistentProviderThrottle,
 } from './campaign/phase0/resource-breakers.mjs';
+import {buildAttemptAttribution, validateAttemptAttribution} from './campaign/phase1/attribution.mjs';
+import {assertPhase1Runtime} from './campaign/phase1/runtime-guard.mjs';
+import {isGhGatewayTerminalError} from './gh-gateway.mjs';
 
 const OSS_FILE = fileURLToPath(import.meta.url);
 const HERE = path.dirname(OSS_FILE);
@@ -60,6 +63,7 @@ const DEFAULTS = {
   runsDir: path.join(HERE, 'runs'),
   concurrency: 3,
 };
+export const WRITABLE_COPY_LIMITATION = 'Declared checks ran in an ephemeral writable copy. The tracked tree matched the approved tree after execution; this detects final-state mutation but does not prove that no transient mutation occurred during the run.';
 
 export function remainingAuthorModelMs(elapsedMs) {
   if (!Number.isFinite(elapsedMs) || elapsedMs < 0) throw new Error('elapsed model time must be nonnegative');
@@ -180,9 +184,11 @@ export function dependencyBootstrapDockerArgs(spec, workspace, image, cacheDir =
       'if [ -d /northset-cache/pip ]; then cp -a /northset-cache/pip/. /workspace/.northset/bootstrap-home/.cache/pip/; fi',
     ],
     go: [
+      'if [ -d /workspace/.northset/bootstrap-home/go/pkg/mod ]; then chmod -R u+w /workspace/.northset/bootstrap-home/go/pkg/mod && rm -rf /workspace/.northset/bootstrap-home/go/pkg/mod; fi',
+      'if [ -d /workspace/.northset/bootstrap-home/.cache/go-build ]; then chmod -R u+w /workspace/.northset/bootstrap-home/.cache/go-build && rm -rf /workspace/.northset/bootstrap-home/.cache/go-build; fi',
       'mkdir -p /workspace/.northset/bootstrap-home/go/pkg/mod /workspace/.northset/bootstrap-home/.cache/go-build',
-      'if [ -d /northset-cache/go-mod ]; then cp -a /northset-cache/go-mod/. /workspace/.northset/bootstrap-home/go/pkg/mod/; fi',
-      'if [ -d /northset-cache/go-build ]; then cp -a /northset-cache/go-build/. /workspace/.northset/bootstrap-home/.cache/go-build/; fi',
+      'if [ -d /northset-cache/go-mod ]; then tar -C /northset-cache/go-mod -cf - . | tar -C /workspace/.northset/bootstrap-home/go/pkg/mod --no-same-owner --no-same-permissions -xf -; chmod -R u+rwX /workspace/.northset/bootstrap-home/go/pkg/mod; fi',
+      'if [ -d /northset-cache/go-build ]; then tar -C /northset-cache/go-build -cf - . | tar -C /workspace/.northset/bootstrap-home/.cache/go-build --no-same-owner --no-same-permissions -xf -; chmod -R u+rwX /workspace/.northset/bootstrap-home/.cache/go-build; fi',
     ],
     rust: [
       'mkdir -p /workspace/.northset/bootstrap-home/.cargo/registry /workspace/.northset/bootstrap-home/.cargo/git',
@@ -201,7 +207,8 @@ export function dependencyBootstrapDockerArgs(spec, workspace, image, cacheDir =
   if (cacheDir) {
     const cacheEnvironment = {
       node: ['npm_config_cache=/northset-cache/npm', 'PNPM_STORE_DIR=/northset-cache/pnpm', 'YARN_CACHE_FOLDER=/northset-cache/yarn'],
-      python: ['PIP_CACHE_DIR=/northset-cache/pip', 'PIP_TARGET=/workspace/.northset/bootstrap-home/python-site'],
+      python: ['PIP_CACHE_DIR=/northset-cache/pip', 'PIP_TARGET=/workspace/.northset/bootstrap-home/python-site',
+        'PATH=/workspace/.northset/bootstrap-home/python-site/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'],
       go: ['GOMODCACHE=/northset-cache/go-mod', 'GOCACHE=/northset-cache/go-build'],
       rust: ['CARGO_HOME=/northset-cache/cargo', 'CARGO_TARGET_DIR=/northset-cache/target'],
     }[spec.executor.profile] ?? [];
@@ -249,6 +256,9 @@ export function authorDockerArgs(spec, workspace, image, codexHome, phase = 'dir
     '--mount', `type=bind,src=${codexHome},dst=/codex-home`,
     '--mount', `type=bind,src=${path.join(codexHome, 'auth.json')},dst=/codex-home/auth.json,readonly`,
     '--env', 'CODEX_HOME=/codex-home');
+  if (spec.executor.profile === 'python') args.splice(args.length - 1, 0,
+    '--env', 'PYTHONPATH=/workspace/.northset/bootstrap-home/python-site',
+    '--env', 'PATH=/workspace/.northset/bootstrap-home/python-site/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin');
   return [...args, 'sh', '-c', shell(command)];
 }
 
@@ -259,7 +269,8 @@ export function checkDockerArgs(spec, workspace, image, command) {
   const profileEnvironment = {
     node: ['COREPACK_HOME=/workspace/.northset/bootstrap-home/.cache/node/corepack'],
     python: ['PIP_CACHE_DIR=/workspace/.northset/bootstrap-home/.cache/pip',
-      'PYTHONPATH=/workspace/.northset/bootstrap-home/python-site', 'PYTHONDONTWRITEBYTECODE=1'],
+      'PYTHONPATH=/workspace/.northset/bootstrap-home/python-site', 'PYTHONDONTWRITEBYTECODE=1',
+      'PATH=/workspace/.northset/bootstrap-home/python-site/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'],
     go: ['GOMODCACHE=/workspace/.northset/bootstrap-home/go/pkg/mod', 'GOCACHE=/tmp/go-build'],
     rust: ['CARGO_HOME=/workspace/.northset/bootstrap-home/.cargo', 'CARGO_TARGET_DIR=/tmp/cargo-target', 'CARGO_NET_OFFLINE=true'],
   }[spec.executor.profile] ?? [];
@@ -296,7 +307,10 @@ async function resolveAuthorImage(runImpl = run, deadline = null) {
   return inspected.stdout.trim();
 }
 
-export async function dependencyCacheKey(spec, repo, image) {
+export async function dependencyCacheKey(spec, repo, image, {
+  architecture = 'unknown', repositoryNodeId = null, trustDomain = 'authored',
+} = {}) {
+  if (!['authored', 'foreign'].includes(trustDomain)) throw new Error('cache trust domain must be authored or foreign');
   const names = {
     node: ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock'],
     python: ['pyproject.toml', 'requirements.txt', 'requirements-dev.txt', 'poetry.lock', 'uv.lock'],
@@ -309,17 +323,70 @@ export async function dependencyCacheKey(spec, repo, image) {
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   const candidate = parseCandidate(spec.candidate);
+  const lockfileDigest = sha256(Buffer.from(canonical(lockfiles)));
+  const installCommandDigest = sha256(Buffer.from(canonical(spec.executor.install_commands)));
   return sha256(Buffer.from(canonical({
     repository: `${candidate.owner}/${candidate.repo}`.toLowerCase(),
+    repository_node_id: repositoryNodeId ?? `legacy:${candidate.owner}/${candidate.repo}`.toLowerCase(),
     candidate: spec.candidate.toLowerCase(),
     mission_id: spec.task_id ?? spec.mission_id,
     base_commit: spec.base_commit.toLowerCase(),
     profile: spec.executor.profile,
-    image,
-    install_commands: spec.executor.install_commands,
-    lockfiles,
+    image_digest: image,
+    architecture,
+    install_command_digest: installCommandDigest,
+    lockfile_digest: lockfileDigest,
+    trust_domain: trustDomain,
   })))
     .slice('sha256:'.length);
+}
+
+const NODE_NATIVE_DEPENDENCIES = new Set([
+  'better-sqlite3', 'bcrypt', 'canvas', 'fsevents', 'node-gyp', 'sharp', 'sqlite3',
+]);
+
+export async function detectToolchainClass(profile, repo) {
+  if (!['node', 'python'].includes(profile)) return {toolchain_class: null, signals: []};
+  const signals = new Set();
+  if (profile === 'node') {
+    const packageFile = path.join(repo, 'package.json');
+    const packageBytes = await readFile(packageFile, 'utf8').catch((error) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (packageBytes !== null) {
+      let packageJson;
+      try { packageJson = JSON.parse(packageBytes); } catch { packageJson = {}; }
+      if (packageJson.gypfile === true) signals.add('node-gypfile');
+      const installScript = ['preinstall', 'install', 'postinstall']
+        .map((name) => packageJson.scripts?.[name]).filter(Boolean).join('\n');
+      if (/\b(?:node-gyp|prebuild|cmake-js|cargo-cp-artifact)\b/i.test(installScript)) signals.add('node-install-script');
+      const dependencies = {...packageJson.dependencies, ...packageJson.optionalDependencies, ...packageJson.devDependencies};
+      if (Object.keys(dependencies).some((name) => NODE_NATIVE_DEPENDENCIES.has(name))) signals.add('node-native-dependency');
+    }
+    if (await lstat(path.join(repo, 'binding.gyp')).then((value) => value.isFile()).catch(() => false)) {
+      signals.add('node-binding-gyp');
+    }
+  } else {
+    const metadata = [];
+    for (const name of ['pyproject.toml', 'setup.py', 'setup.cfg']) {
+      const content = await readFile(path.join(repo, name), 'utf8').catch((error) => {
+        if (error.code === 'ENOENT') return '';
+        throw error;
+      });
+      metadata.push(content);
+    }
+    if (/\b(?:maturin|setuptools-rust|rust_extension|cython|ext_modules|Extension\s*\()\b/i.test(metadata.join('\n'))) {
+      signals.add('python-extension-metadata');
+    }
+  }
+  const native = signals.size > 0;
+  return {toolchain_class: `${profile}-${native ? 'native' : 'pure'}`, signals: [...signals].sort()};
+}
+
+export function isNativeToolchainFailure(result) {
+  const output = `${result?.stdout ?? ''}\n${result?.stderr ?? ''}`;
+  return /(?:node-gyp|gyp ERR|Python\.h|maturin|Rust compiler|cargo[^\n]*not found|(?:gcc|g\+\+|clang|make)[^\n]*not found|unable to execute[^\n]*(?:gcc|clang))/i.test(output);
 }
 
 async function runDocker(runImpl, args, options = {}) {
@@ -368,6 +435,15 @@ async function resolveBatchImage(spec, options, log, deadline) {
     })());
   }
   return options.imagePromises.get(spec.executor.image);
+}
+
+async function resolveImageArchitecture(image, deadline) {
+  const inspected = await must('inspect executor image architecture', await run('docker', [
+    'image', 'inspect', image, '--format', '{{.Architecture}}',
+  ], {deadline, timeoutMs: 30_000}));
+  const architecture = inspected.stdout.trim();
+  if (!/^[a-z0-9][a-z0-9._-]*$/i.test(architecture)) throw new Error('docker returned an invalid image architecture');
+  return architecture;
 }
 
 export function buildWarmPlan(specs) {
@@ -593,7 +669,8 @@ export async function verifyTestOnlyAuthorResult(spec, workspace, image, {
 
 export async function runAuthorContainer(spec, dirs, {
   dryRun = false, log = async () => {}, image = spec.executor.image, authorImage = null,
-  cacheDir = null, deadline = null, runImpl = run,
+  cacheDir = null, cacheKey = null, architecture = 'unknown', toolchainClass = null,
+  nativeFallback = null, deadline = null, runImpl = run,
 } = {}) {
   const codexHome = dryRun ? '/tmp/northset-codex-home' : await prepareCodexHome(dirs.base);
   const resolvedAuthorImage = authorImage ?? (dryRun ? AUTHOR_IMAGE : await resolveAuthorImage(runImpl, deadline));
@@ -612,11 +689,29 @@ export async function runAuthorContainer(spec, dirs, {
   try {
     await log('dependency bootstrap: network on, no Codex executable or credential mounted…');
     let bootstrapRetryCount = 0;
+    let effectiveImage = image;
+    let effectiveCacheKey = cacheKey;
+    let effectiveArchitecture = architecture;
+    let effectiveToolchainClass = toolchainClass;
+    let toolchainEscalation = null;
     let bootstrap = await runDocker(runImpl, plan.bootstrap, {timeoutMs: limits(spec).wallMs, deadline});
     let bootstrapDurationMs = bootstrap.durationMs ?? 0;
     if (bootstrap.code !== 0 && !bootstrap.timedOut && (!deadline || deadline.remainingMs() > 0)) {
-      await log('dependency bootstrap infrastructure failed; retrying once within the original deadline…');
       bootstrapRetryCount = 1;
+      if (toolchainClass?.endsWith('-pure') && isNativeToolchainFailure(bootstrap) && nativeFallback) {
+        const fallback = await nativeFallback();
+        effectiveImage = fallback.image;
+        effectiveCacheKey = fallback.cacheKey;
+        effectiveArchitecture = fallback.architecture;
+        effectiveToolchainClass = fallback.toolchainClass;
+        toolchainEscalation = {
+          from: toolchainClass, to: fallback.toolchainClass, reason: 'classified_native_toolchain_error',
+        };
+        await log(`dependency bootstrap: escalating ${toolchainClass} to ${fallback.toolchainClass} after a classified native build error…`);
+        plan.bootstrap = dependencyBootstrapDockerArgs(spec, dirs.authorWorkspace, fallback.image, fallback.cacheDir);
+      } else {
+        await log('dependency bootstrap infrastructure failed; retrying once within the original deadline…');
+      }
       bootstrap = await runDocker(runImpl, plan.bootstrap, {timeoutMs: limits(spec).wallMs, deadline});
       bootstrapDurationMs += bootstrap.durationMs ?? 0;
     }
@@ -628,7 +723,7 @@ export async function runAuthorContainer(spec, dirs, {
     await must(authoringMode === 'test_only_then_fix' ? 'test-only author container' : 'author container', author);
     let authorDurationMs = author.durationMs ?? 0;
     if (authoringMode === 'test_only_then_fix') {
-      await verifyTestOnlyAuthorResult(spec, dirs.authorWorkspace, image, {deadline, runImpl, log, dependencySnapshot});
+      await verifyTestOnlyAuthorResult(spec, dirs.authorWorkspace, effectiveImage, {deadline, runImpl, log, dependencySnapshot});
       const fixTimeoutMs = remainingAuthorModelMs(authorDurationMs);
       if (fixTimeoutMs <= 0) throw new Error('author attempt exhausted its shared 12-minute model budget before the fix-only phase');
       author = await runDocker(runImpl, plan.authorFix, {timeoutMs: fixTimeoutMs, deadline});
@@ -640,7 +735,11 @@ export async function runAuthorContainer(spec, dirs, {
     }
     return {
       repoDir: path.join(dirs.authorWorkspace, 'repo'),
-      image,
+      image: effectiveImage,
+      architecture: effectiveArchitecture,
+      cacheKey: effectiveCacheKey,
+      toolchainClass: effectiveToolchainClass,
+      toolchainEscalation,
       authorImage: resolvedAuthorImage,
       dependencySnapshot,
       usage: {
@@ -866,7 +965,8 @@ export async function snapshotProfileDependencies(profile, fromRepo, snapshotRoo
     await mkdir(repo, {recursive: true, mode: 0o700});
     await copyProfileDependencies(profile, fromRepo, repo);
     await assertContainedDependencySymlinks(root);
-    return {schema_version: 1, profile, root, repo, digest: await directoryDigest(root)};
+    return {schema_version: 1, profile, root, repo,
+      digest: await directoryDigest(root, {ignoreNames: ['.DS_Store']})};
   } catch (error) {
     await rm(root, {recursive: true, force: true});
     throw error;
@@ -878,12 +978,12 @@ export async function copyDependencySnapshot(profile, snapshot, toRepo) {
       !/^sha256:[0-9a-f]{64}$/i.test(snapshot.digest ?? '')) {
     throw new Error(`invalid pre-author dependency snapshot for ${profile}`);
   }
-  const before = await directoryDigest(snapshot.root);
+  const before = await directoryDigest(snapshot.root, {ignoreNames: ['.DS_Store']});
   if (before !== snapshot.digest) {
     throw new Error(`pre-author dependency snapshot changed: ${before} != ${snapshot.digest}`);
   }
   await copyProfileDependencies(profile, snapshot.repo, toRepo);
-  const after = await directoryDigest(snapshot.root);
+  const after = await directoryDigest(snapshot.root, {ignoreNames: ['.DS_Store']});
   if (after !== snapshot.digest) {
     throw new Error(`pre-author dependency snapshot changed during copy: ${after} != ${snapshot.digest}`);
   }
@@ -1146,11 +1246,30 @@ export function canonicalIssueUrlFromSnapshot(specIssueUrl, issueSnapshotBytes) 
   return canonicalUrl;
 }
 
+export function publicRepoPolicySnapshot(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const fields = ['ai_policy_summary', 'checked_at', 'url'];
+  if (Object.keys(value).sort().join('\0') !== fields.join('\0')) return null;
+  if (!fields.every((field) => typeof value[field] === 'string' && value[field].trim())) return null;
+  return value;
+}
+
 function publicMissionInput(spec, repoDir, patchFile, issueSnapshotFile, image, result, economicContext = null) {
   const {owner} = parseCandidate(spec.candidate);
   const issueOrTask = economicContext?.issueSnapshotBytes
     ? canonicalIssueUrlFromSnapshot(spec.issue_url, economicContext.issueSnapshotBytes)
     : spec.issue_url;
+  const workspaceMode = spec.workspace_mode ?? 'readonly';
+  const defaultLimitations = [
+    'Does not prove code quality',
+    'Does not prove security',
+    "Contributor self-run record of Northset's own contribution; not the maintainer's verification.",
+    `The declared network-off checks run after a disclosed online dependency install in ${image}.`,
+  ];
+  if (workspaceMode === 'writable_copy') defaultLimitations.push(WRITABLE_COPY_LIMITATION);
+  const declaredLimitations = spec.receipt?.limitations ?? defaultLimitations;
+  const limitations = workspaceMode === 'writable_copy' && !declaredLimitations.includes(WRITABLE_COPY_LIMITATION)
+    ? [...declaredLimitations, WRITABLE_COPY_LIMITATION] : declaredLimitations;
   const mission = {
       mission_id: spec.mission_id,
       variant: 'author_contribution',
@@ -1163,9 +1282,10 @@ function publicMissionInput(spec, repoDir, patchFile, issueSnapshotFile, image, 
       target_repo: spec.target_repo,
       issue_or_task: issueOrTask,
       consent_artifact: null,
-      repo_policy_snapshot: spec.receipt?.repo_policy_snapshot ?? null,
+      repo_policy_snapshot: publicRepoPolicySnapshot(spec.receipt?.repo_policy_snapshot),
       worker_identity: {runtime: 'northset-oss executor v1', human_operator: 'aeziz'},
       base_commit: spec.base_commit,
+      workspace_mode: workspaceMode,
       patch_commit: result.commit,
       patch_diff_hash: result.patchSha,
       commands_declared: spec.executor.commands,
@@ -1174,12 +1294,7 @@ function publicMissionInput(spec, repoDir, patchFile, issueSnapshotFile, image, 
       attestation_uri: null,
       maintainer_outcome: {status: 'pending', link: null, decided_at: null},
       payment: {maintainer_payment: 'none', merge_contingent: false},
-      limitations: spec.receipt?.limitations ?? [
-        'Does not prove code quality',
-        'Does not prove security',
-        "Contributor self-run record of Northset's own contribution; not the maintainer's verification.",
-        `The declared network-off checks run after a disclosed online dependency install in ${image}.`,
-      ],
+      limitations,
     };
   const input = {
     mission,
@@ -1193,6 +1308,8 @@ function publicMissionInput(spec, repoDir, patchFile, issueSnapshotFile, image, 
       image,
       install_commands: spec.executor.install_commands,
       commands: spec.executor.commands,
+      workspace_mode: workspaceMode,
+      workspace_write_allowlist: spec.workspace_write_allowlist ?? [],
       limits: {
         cpus: 2, memory_mb: 4096, pids: 512,
         wall_clock_seconds_per_command: 1800, output_bytes_per_stream: 2_000_000,
@@ -1253,6 +1370,21 @@ function terminalReasonClass(state) {
   return null;
 }
 
+export function githubProviderThrottleFailure(error) {
+  if (!isGhGatewayTerminalError(error) && error?.code !== 'GITHUB_PROVIDER_THROTTLED') return null;
+  const errorCode = typeof error?.code === 'string' && error.code
+    ? error.code
+    : 'GITHUB_GATEWAY_TERMINAL';
+  const signal = typeof error?.signal === 'string' && error.signal ? error.signal : null;
+  return {
+    failure_reason_code: 'PROVIDER_THROTTLED',
+    terminal_reason_class: 'PROVIDER_THROTTLED',
+    retryable: false,
+    error_code: errorCode,
+    signal,
+  };
+}
+
 const TERMINAL_ATTEMPT_STATES = new Set([
   'STALE', 'NOCHANGE', 'DECLINED', 'FAILED_BUDGET', 'FAILED_AUTHOR',
   'FAILED_ORACLE', 'FAILED_INFRA_TERMINAL',
@@ -1262,8 +1394,20 @@ const TERMINAL_LINEAGE_JOURNAL_STATES = new Set([
   'ABORTED_BUDGET', 'FAILED_INFRA_TERMINAL',
 ]);
 
-async function writeAttempt(dirs, spec, state, detail, timings, startedAt) {
+export async function writeAttempt(dirs, spec, state, detail, timings, startedAt, failure = null) {
   const updatedAt = new Date();
+  const laneHours = Math.max(0, updatedAt.getTime() - startedAt.getTime()) / 3_600_000;
+  const attribution = buildAttemptAttribution({
+    qualification: {
+      duration_ms: spec.qualification?.review_duration_ms ?? null,
+      input_tokens: spec.qualification?.input_tokens ?? null,
+      cached_input_tokens: spec.qualification?.cached_input_tokens ?? null,
+      output_tokens: spec.qualification?.output_tokens ?? null,
+      reasoning_tokens: spec.qualification?.reasoning_tokens ?? null,
+    },
+    author: {duration_ms: timings.find((item) => item.stage === 'author')?.duration_ms ?? null},
+    execution: {wall_ms: Math.max(0, updatedAt.getTime() - startedAt.getTime()), lane_hours: laneHours},
+  });
   await writeFile(path.join(dirs.base, 'attempt.json'), `${JSON.stringify({
     schema_version: spec.schema_version === 2 ? 2 : 1,
     ...(spec.schema_version === 2 ? {
@@ -1271,14 +1415,25 @@ async function writeAttempt(dirs, spec, state, detail, timings, startedAt) {
       task_id: spec.task_id,
       attempt_sequence: spec.attempt_sequence,
       work_category: spec.work_category,
-      terminal_reason_class: terminalReasonClass(state),
+      terminal_reason_class: failure?.terminal_reason_class ?? terminalReasonClass(state),
+      ...(failure ? {
+        failure_reason_code: failure.failure_reason_code,
+        retryable: failure.retryable,
+        error_code: failure.error_code,
+        signal: failure.signal,
+      } : {}),
     } : {}),
     state,
+    profile: spec.executor.profile,
+    workspace_mode: spec.workspace_mode ?? 'readonly',
     started_at: startedAt.toISOString(),
     updated_at: updatedAt.toISOString(),
-    lane_hours: Math.max(0, updatedAt.getTime() - startedAt.getTime()) / 3_600_000,
+    prepare_duration_ms: Math.max(0, updatedAt.getTime() - startedAt.getTime()),
+    lane_hours: laneHours,
     terminal_reason: detail ?? null,
     timings,
+    attribution,
+    attribution_complete: validateAttemptAttribution(attribution),
   }, null, 2)}\n`);
 }
 
@@ -1315,7 +1470,7 @@ export async function attemptLineageForSpec(runsDir, spec) {
       attempt_id: record.mission_id,
       attempt_sequence: record.attempt_sequence,
       state,
-      terminal_reason_class: terminalReasonClass(state) ?? record.terminal_reason_class ?? null,
+      terminal_reason_class: record.terminal_reason_class ?? terminalReasonClass(state) ?? null,
     });
   }
   attempts.push({
@@ -1348,7 +1503,7 @@ export async function validateActiveSpecs(specsDir) {
   return specs;
 }
 
-async function prepareMission(spec, options) {
+export async function prepareMission(spec, options) {
   const dirs = missionDirs(options.runsDir, spec.mission_id);
   const resourceControlFile = path.join(options.runsDir, 'phase0', 'resource-control.json');
   const startedAt = new Date();
@@ -1365,7 +1520,19 @@ async function prepareMission(spec, options) {
       previous.terminal_reason = detail;
       await writeFile(path.join(dirs.base, 'attempt.json'), `${JSON.stringify(previous, null, 2)}\n`);
     }
-    return {state, spec, detail, timings: previous.timings ?? []};
+    return {
+      state,
+      spec,
+      detail,
+      timings: previous.timings ?? [],
+      ...(previous.failure_reason_code ? {
+        failure_reason_code: previous.failure_reason_code,
+        terminal_reason_class: previous.terminal_reason_class,
+        retryable: previous.retryable,
+        error_code: previous.error_code,
+        signal: previous.signal,
+      } : {}),
+    };
   }
   const resourceControl = {
     ...(await loadResourceControl(resourceControlFile)),
@@ -1388,18 +1555,47 @@ async function prepareMission(spec, options) {
   };
   try {
     await writeAttempt(dirs, spec, 'QUALIFIED', null, timings, startedAt);
-    const checked = await stage('prepare_recheck', () => recheck(spec, log, {mode: 'prepare', deadline}));
+    const prepareRecheck = options.prepareAdapter?.recheck ?? recheck;
+    const checked = await stage('prepare_recheck', () => prepareRecheck(spec, log, {mode: 'prepare', deadline}));
     if (!checked.clean) {
       const detail = checked.reasons.join('; ');
       await writeAttempt(dirs, spec, 'STALE', detail, timings, startedAt);
       return {state: 'STALE', spec, detail, timings};
     }
-    const image = await stage('executor_image', () => resolveBatchImage(spec, options, log, deadline));
     const repo = await stage('clone', () => cloneBase(spec, dirs.authorWorkspace, deadline));
-    const cacheKey = await dependencyCacheKey(spec, repo, image);
-    const cacheDir = path.join(DEPENDENCY_CACHE_ROOT, cacheKey);
+    const detectedToolchain = await stage('toolchain_classification', () => detectToolchainClass(spec.executor.profile, repo));
+    const toolchainClass = spec.executor.toolchain_class ?? detectedToolchain.toolchain_class;
+    const toolchainConfig = toolchainClass ? PROFILE_REGISTRY.toolchain_classes?.[toolchainClass] : null;
+    const executionSpec = toolchainConfig
+      ? {...spec, executor: {...spec.executor, image: toolchainConfig.image, toolchain_class: toolchainClass}}
+      : spec;
+    const image = await stage('executor_image', () => resolveBatchImage(executionSpec, options, log, deadline));
+    const architecture = await stage('executor_architecture', () => resolveImageArchitecture(image, deadline));
+    const cacheIdentity = {
+      architecture,
+      repositoryNodeId: checked.snapshot.repository.node_id,
+      trustDomain: 'authored',
+    };
+    const cacheKey = await dependencyCacheKey(executionSpec, repo, image, cacheIdentity);
+    const cacheDir = path.join(DEPENDENCY_CACHE_ROOT, cacheIdentity.trustDomain, cacheKey);
     await mkdir(cacheDir, {recursive: true, mode: 0o700});
-    const authorRun = await stage('author', () => runAuthorContainer(spec, dirs, {image, log, cacheDir, deadline}));
+    const nativeFallback = toolchainClass?.endsWith('-pure') ? async () => {
+      const nativeClass = `${spec.executor.profile}-native`;
+      const nativeConfig = PROFILE_REGISTRY.toolchain_classes[nativeClass];
+      const nativeSpec = {...spec, executor: {...spec.executor, image: nativeConfig.image, toolchain_class: nativeClass}};
+      const nativeImage = await resolveBatchImage(nativeSpec, options, log, deadline);
+      const nativeArchitecture = await resolveImageArchitecture(nativeImage, deadline);
+      const nativeCacheKey = await dependencyCacheKey(nativeSpec, repo, nativeImage, {
+        ...cacheIdentity, architecture: nativeArchitecture,
+      });
+      const nativeCacheDir = path.join(DEPENDENCY_CACHE_ROOT, cacheIdentity.trustDomain, nativeCacheKey);
+      await mkdir(nativeCacheDir, {recursive: true, mode: 0o700});
+      return {image: nativeImage, architecture: nativeArchitecture, cacheKey: nativeCacheKey,
+        cacheDir: nativeCacheDir, toolchainClass: nativeClass};
+    } : null;
+    const authorRun = await stage('author', () => runAuthorContainer(executionSpec, dirs, {
+      image, log, cacheDir, cacheKey, architecture, toolchainClass, nativeFallback, deadline,
+    }));
     const result = await stage('canonical_commit', () => normalizeAuthorResult(spec, repo, dirs.ready, deadline));
     if (result.noChange) {
       await writeAttempt(dirs, spec, 'NOCHANGE', 'author produced no change', timings, startedAt);
@@ -1407,7 +1603,7 @@ async function prepareMission(spec, options) {
     }
     await log(`canonical commit ${result.commit.slice(0, 12)}; ${result.changedFiles.length} files / ${result.lines} changed lines`);
     let oracle = await stage('differential_oracle', () => runDifferentialOracle(
-      spec, dirs, repo, result, image, log, deadline, authorRun.dependencySnapshot,
+      spec, dirs, repo, result, authorRun.image, log, deadline, authorRun.dependencySnapshot,
     ));
 
     const snapshotFile = path.join(dirs.ready, 'issue_snapshot.json');
@@ -1420,7 +1616,7 @@ async function prepareMission(spec, options) {
     const issueSnapshotBytes = await readFile(snapshotFile);
     const attempts = await attemptLineageForSpec(options.runsDir, spec);
     const bundle = await stage('canonical_verifier', () => runCanonicalVerifier(
-      spec, dirs, repo, result, image, snapshotFile, log, deadline,
+      spec, dirs, repo, result, authorRun.image, snapshotFile, log, deadline,
       spec.schema_version === 2 ? {
         issueSnapshotBytes,
         result,
@@ -1477,14 +1673,25 @@ async function prepareMission(spec, options) {
       policy_snapshot_sha256: sha256(await readFile(policyFile)),
       oracle_sha256: oracle.sha,
       patch_review_sha256: sha256(Buffer.from(canonical(patchReview))),
-      risk_flags: patchReview.risks,
+      risk_flags: [
+        ...patchReview.risks,
+        ...(spec.workspace_mode === 'writable_copy'
+          ? [{code: 'workspace-writable-copy', files: spec.workspace_write_allowlist ?? []}] : []),
+      ],
       changed_file_classes: result.classes.map((item) => ({path: item.path, class: item.class})),
       pr_title: spec.pr.title,
       pr_body_sha256: sha256(Buffer.from(body)),
       pr_claim_text: normalizedPrClaimText(body),
-      executor_image_digest: image,
+      executor_image_digest: authorRun.image,
+      executor_architecture: authorRun.architecture,
+      repository_node_id: checked.snapshot.repository.node_id,
+      toolchain_class: authorRun.toolchainClass,
+      toolchain_signals: detectedToolchain.signals,
+      toolchain_escalation: authorRun.toolchainEscalation,
+      cache_trust_domain: 'authored',
+      workspace_mode: spec.workspace_mode ?? 'readonly',
       author_image_digest: authorRun.authorImage,
-      dependency_cache_key: cacheKey,
+      dependency_cache_key: authorRun.cacheKey,
       dependency_snapshot_sha256: authorRun.dependencySnapshot.digest,
       timings,
       total_duration_ms: Date.now() - startedAt.getTime(),
@@ -1503,18 +1710,27 @@ async function prepareMission(spec, options) {
     await writeAttempt(dirs, spec, 'READY', null, timings, startedAt);
     return {state: 'READY', spec, dirs, manifest, manifestDigest: digest, classes: result.classes};
   } catch (error) {
-    if (isProviderThrottle(error)) {
+    const gatewayFailure = githubProviderThrottleFailure(error);
+    if (gatewayFailure) {
+      await tripPersistentProviderThrottle(resourceControlFile, {
+        provider: 'GitHub',
+        signal: gatewayFailure.signal ?? gatewayFailure.error_code,
+        gatewayStateDir: path.join(options.runsDir, 'gh-gateway-state'),
+      });
+    } else if (isProviderThrottle(error)) {
       await tripPersistentProviderThrottle(resourceControlFile, {
         provider: 'OpenAI', signal: 'provider rate-limit or throttle detected',
+        gatewayStateDir: path.join(options.runsDir, 'gh-gateway-state'),
       });
     }
     const budget = deadline.expired() || /timed out|deadline exhausted/i.test(error.message);
-    const state = budget ? 'FAILED_BUDGET'
+    const state = gatewayFailure ? 'FAILED_INFRA_TERMINAL'
+      : budget ? 'FAILED_BUDGET'
       : activeStage === 'author' ? 'FAILED_AUTHOR'
         : ['differential_oracle', 'canonical_verifier', 'oracle_binding', 'patch_review'].includes(activeStage) ? 'FAILED_ORACLE'
           : 'FAILED_INFRA_TERMINAL';
-    await writeAttempt(dirs, spec, state, error.message, timings, startedAt);
-    return {state, spec, detail: error.message, timings};
+    await writeAttempt(dirs, spec, state, error.message, timings, startedAt, gatewayFailure);
+    return {state, spec, detail: error.message, timings, ...(gatewayFailure ?? {})};
   }
 }
 
@@ -1529,6 +1745,13 @@ export function buildBatchBoard(results) {
   const batchDigest = batchApprovalDigest(manifests);
   const failures = results.filter((result) => result.state !== 'READY').map((result) => ({
     mission_id: result.spec.mission_id, candidate: result.spec.candidate, state: result.state, detail: result.detail ?? null,
+    ...(result.failure_reason_code ? {
+      failure_reason_code: result.failure_reason_code,
+      terminal_reason_class: result.terminal_reason_class,
+      retryable: result.retryable,
+      error_code: result.error_code,
+      signal: result.signal,
+    } : {}),
   }));
   const machine = {
     schema_version: 1,
@@ -1598,7 +1821,7 @@ export function parseOssArgs(argv) {
   }
   const options = {...DEFAULTS, command, requestedCommand, ids: [], approve: null, approvalRecord: null,
     push: true, retryInfraTerminal: false, batch: null, board: null, warmOutput: null,
-    warmManifest: null, minimumFreeBytes: 5 * 1024 * 1024 * 1024};
+    warmManifest: null, phase1Runtime: null, minimumFreeBytes: 5 * 1024 * 1024 * 1024};
   while (argv.length) {
     const value = argv.shift();
     if (value === '--approve') options.approve = argv.shift();
@@ -1609,6 +1832,7 @@ export function parseOssArgs(argv) {
     else if (value === '--board') options.board = path.resolve(argv.shift());
     else if (value === '--warm-output') options.warmOutput = path.resolve(argv.shift());
     else if (value === '--warm-manifest') options.warmManifest = path.resolve(argv.shift());
+    else if (value === '--phase1-runtime') options.phase1Runtime = path.resolve(argv.shift());
     else if (value === '--minimum-free-gb') options.minimumFreeBytes = Number(argv.shift()) * 1024 * 1024 * 1024;
     else if (value === '--specs') options.specsDir = path.resolve(argv.shift());
     else if (value === '--runs') options.runsDir = path.resolve(argv.shift());
@@ -1663,6 +1887,10 @@ async function main() {
     return;
   }
   const specs = await loadSpecs(options);
+  const repositories = specs.map((spec) => {
+    const candidate = parseCandidate(spec.candidate);
+    return `${candidate.owner}/${candidate.repo}`;
+  });
   if (options.warmManifest) options.warmCache = JSON.parse(await readFile(options.warmManifest, 'utf8'));
   if (options.command === 'warm') {
     const warmed = await warmBatch(specs, {minimumFreeBytes: options.minimumFreeBytes});
@@ -1688,11 +1916,13 @@ async function main() {
     return;
   }
   if (options.command === 'prepare') {
+    await assertPhase1Runtime(options.phase1Runtime, {action: 'prepare', repositories});
     const results = await pool(specs, options.concurrency, (spec) => prepareMission(spec, options));
     await printBoard(results, options);
     if (results.some((result) => result.state.startsWith('FAILED'))) process.exitCode = 1;
     return;
   }
+  await assertPhase1Runtime(options.phase1Runtime, {action: 'ship', repositories});
   const {shipBatch} = await import('./ship.mjs');
   const {loadReviewerRoster} = await import('./campaign/phase0/roster.mjs');
   const [signedBatchApproval, roster] = await Promise.all([

@@ -4,10 +4,91 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {reviewPatch} from './review-patch.mjs';
-import {OSS_IDENTITY, canonical, directoryDigest, git, sha256} from './core.mjs';
+import {OSS_IDENTITY, canonical, directoryDigest, ghRequestClass, git, recheck, sha256} from './core.mjs';
+import {GitHubThrottleError} from './gh-gateway.mjs';
 
 const digest = (char) => `sha256:${char.repeat(64)}`;
 const oid = (char) => char.repeat(40);
+
+test('GitHub command routing classifies reads and mutations and has no direct gh spawn', async () => {
+  assert.equal(ghRequestClass(['pr', 'list', '--repo', 'owner/repo']), 'rest_read');
+  assert.equal(ghRequestClass(['api', 'graphql', '-f', 'query=query{viewer{login}}']), 'graphql');
+  assert.equal(ghRequestClass(['pr', 'create', '--repo', 'owner/repo']), 'mutation');
+  const [coreSource, reviewSource, shipSource] = await Promise.all([
+    readFile(new URL('./core.mjs', import.meta.url), 'utf8'),
+    readFile(new URL('./review-issue.mjs', import.meta.url), 'utf8'),
+    readFile(new URL('./ship.mjs', import.meta.url), 'utf8'),
+  ]);
+  for (const source of [coreSource, reviewSource, shipSource]) {
+    assert.doesNotMatch(source, /\brun\(['"]gh['"]/);
+  }
+  assert.match(shipSource, /download public attestation bundle', await shipRun\(deadline, 'gh'/);
+  assert.doesNotMatch(shipSource, /shipGit\([^\n]*'push'/);
+  assert.match(coreSource, /\['pr', 'list',[^\n]*'--limit', '100'/);
+  assert.doesNotMatch(coreSource, /'--limit', '500'/);
+});
+
+test('live recheck never falls back after a gateway throttle stop', async () => {
+  const throttle = Object.create(GitHubThrottleError.prototype);
+  Object.defineProperty(throttle, 'message', {value: 'secondary rate limit', configurable: true});
+  let calls = 0;
+  await assert.rejects(() => recheck({candidate: 'owner/repo#1'}, async () => {}, {
+    repoPolicy: {repositories: {}},
+    gh: async () => {
+      calls += 1;
+      throw throttle;
+    },
+  }), (error) => error === throttle);
+  assert.equal(calls, 1);
+});
+
+test('every outbound git push is authorized under the gateway lock and recorded without content', async () => {
+  const ship = await import('./ship.mjs');
+  const events = [];
+  const result = await ship.guardedGitPush(null, '/tmp/offline-repo', 'owner/repo', [
+    'origin', 'HEAD:refs/heads/test',
+  ], {
+    withGatewayLock: async (options, operation) => {
+      events.push(['lock', options]);
+      try { return await operation(); }
+      finally { events.push(['unlock']); }
+    },
+    assertNetworkAllowed: async (options) => events.push(['assert', options]),
+    runCommand: async (deadline, commandName, args) => {
+      events.push(['run', deadline, commandName, args]);
+      return {code: 0, stdout: '', stderr: ''};
+    },
+    recordLedgerEvent: async (event, options) => events.push(['ledger', event, options]),
+  });
+  assert.equal(result.code, 0);
+  assert.deepEqual(events.map(([event]) => event), ['lock', 'assert', 'run', 'ledger', 'unlock']);
+  assert.equal(events[1][1].gatewayLockHeld, true);
+  assert.deepEqual(events[2][3], [
+    '-C', '/tmp/offline-repo', 'push', 'origin', 'HEAD:refs/heads/test',
+  ]);
+  assert.deepEqual(events[3][1], {class: 'git_push', repo_target: 'owner/repo'});
+  assert.equal(events[3][2].gatewayLockHeld, true);
+  assert.equal(JSON.stringify(events[3]).includes('HEAD:refs/heads/test'), false);
+});
+
+test('ship never retries or aggregates past a terminal GitHub gateway stop', async () => {
+  const {runIndependentBatch, runShipStateMachine} = await import('./ship.mjs');
+  const throttle = new GitHubThrottleError('GitHub secondary rate limit stopped the gateway');
+  let calls = 0;
+  const journal = {state: 'APPROVED', retry_count: 0, transitions: []};
+  await assert.rejects(() => runShipStateMachine({manifest: {mission_id: 'M-THROTTLE'}}, journal, {
+    deadline: {expired: () => false},
+    save: async () => {},
+    preflight: async () => { calls += 1; throw throttle; },
+  }), (error) => error === throttle);
+  assert.equal(calls, 1);
+  assert.equal(journal.retry_count, 0);
+  assert.equal(journal.state, 'APPROVED');
+
+  await assert.rejects(() => runIndependentBatch([{id: 'M-THROTTLE'}], async () => {
+    throw throttle;
+  }), (error) => error === throttle);
+});
 
 function subject(id, repo) {
   return {

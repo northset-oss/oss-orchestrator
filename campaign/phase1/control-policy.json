@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "metric_policies": [
+    {
+      "id": "attempt_first_pass_ready_rate",
+      "metric": "attempt_first_pass_ready_rate",
+      "scope": "profile",
+      "window": "last_50_attempts",
+      "warning": 0.5,
+      "stop": 0.35,
+      "action": "hold_profile",
+      "resume": {"operator": ">=", "value": 0.5, "window": "next_30_attempts"}
+    }
+  ],
+  "stop_conditions": [
+    {"id": "unacknowledged_maintainer_messages_over_12h", "metric": "unacknowledged_maintainer_messages_over_12h", "scope": "global", "operator": ">", "threshold": 5, "action": "hold_all_new_authored_prs"},
+    {"id": "changes_requested_without_substantive_response_over_24h_rate", "metric": "changes_requested_without_substantive_response_over_24h_rate", "scope": "global", "operator": ">", "threshold": 0.05, "action": "hold_all_new_authored_prs"},
+    {"id": "repository_sla_missed", "metric": "repository_sla_missed_count", "scope": "repository", "operator": ">=", "threshold": 1, "action": "hold_all_new_authored_prs"},
+    {"id": "untriaged_upstream_ci_failures_over_24h", "metric": "untriaged_upstream_ci_failures_over_24h", "scope": "global", "operator": ">", "threshold": 10, "action": "hold_all_new_authored_prs"},
+    {"id": "operator_reports_queue_unserviceable", "metric": "operator_reports_queue_unserviceable_count", "scope": "global", "operator": ">=", "threshold": 1, "action": "hold_all_new_authored_prs"}
+  ],
+  "sev_actions": {
+    "SEV_1": {"repository": "permanent_repository_pause_pending_founder_adjudication", "platform": "global_publication_stop"},
+    "SEV_2": {"threshold": 2, "window_days": 7, "action": "global_rate_drop_one_step"},
+    "SEV_3": {"action": "mission_outcome_only"}
+  },
+  "closure_policy": {
+    "min_samples": null,
+    "reason_codes": ["implementation_disagreement", "duplicate_or_superseded", "scope_or_policy", "process_concern", "maintainer_stop", "unknown"]
+  }
+}

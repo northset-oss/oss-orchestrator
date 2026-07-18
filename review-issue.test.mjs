@@ -15,6 +15,7 @@ import {
   sameRepositoryOpenPrs,
   validatedInvitation,
   validatedRepositoryPolicyEvidence,
+  verifierCompatibilityReasons,
 } from './review-issue.mjs';
 import {canonical, sha256, taskIdForCandidate} from './core.mjs';
 import {candidateEvidenceKey} from './candidate-lake.mjs';
@@ -45,10 +46,23 @@ test('review prompt rejects pure coverage tasks that cannot produce a differenti
   assert.match(source, /Pure test-coverage work for behavior that already passes is ineligible/);
 });
 
+test('review prompt rejects a complete fix that cannot fit the current lane', async () => {
+  const source = await readFile(new URL('./review-issue.mjs', import.meta.url), 'utf8');
+  assert.match(source, /complete fix, including cleanup required to keep repository checks passing/);
+  assert.match(source, /at most five changed files and 300 changed lines/);
+});
+
 test('the strengthened reviewer prompt has a new immutable version', async () => {
   const source = await readFile(new URL('./review-issue.mjs', import.meta.url), 'utf8');
-  assert.match(source, /export const REVIEW_PROMPT_VERSION = 3/);
+  assert.match(source, /export const REVIEW_PROMPT_VERSION = 4/);
   assert.match(source, /review_prompt_version: REVIEW_PROMPT_VERSION/);
+});
+
+test('GitHub evidence uses the gateway and bounds pull-request history to one page', async () => {
+  const source = await readFile(new URL('./review-issue.mjs', import.meta.url), 'utf8');
+  assert.match(source, /command === 'gh'[\s\S]*runGhCommand/);
+  assert.match(source, /\['pr', 'list',[\s\S]*?'--limit', '100'/);
+  assert.doesNotMatch(source, /'--limit', '500'/);
 });
 
 test('reviewer live facts recompute the same canonical queued evidence identity', () => {
@@ -132,6 +146,17 @@ test('hard gates reject closed, assigned, archived, and occupied issues', () => 
     repoData: {isArchived: false, isFork: false},
     exactOpenPrs: [],
   }), []);
+});
+
+test('verifier compatibility rejects tracked Git submodules before semantic review', () => {
+  const gitIndex = [
+    `100644 ${'a'.repeat(40)} 0\tREADME.md`,
+    `160000 ${'b'.repeat(40)} 0\tpkg/ui/web`,
+  ].join('\n');
+  assert.deepEqual(verifierCompatibilityReasons(gitIndex), [
+    'Repository contains tracked Git submodules unsupported by the canonical verifier: pkg/ui/web',
+  ]);
+  assert.deepEqual(verifierCompatibilityReasons(`100644 ${'a'.repeat(40)} 0\tREADME.md\n`), []);
 });
 
 function acceptedResult() {

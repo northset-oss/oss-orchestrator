@@ -12,8 +12,9 @@ import {chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile} from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {PROFILE_REGISTRY, canonical, createDeadline, isInvitationLabel, normalizeLabel, repositoryPolicyLocator, run, sha256, taskIdForCandidate} from './core.mjs';
+import {PROFILE_REGISTRY, canonical, createDeadline, isInvitationLabel, normalizeLabel, repositoryPolicyLocator, run, runGhCommand, sha256, taskIdForCandidate} from './core.mjs';
 import {candidateEvidenceKey} from './candidate-lake.mjs';
+import {isGhGatewayTerminalError} from './gh-gateway.mjs';
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const MODEL = process.env.OSS_REVIEW_MODEL || 'gpt-5.6-sol';
@@ -23,7 +24,7 @@ export const CODEX_OUTPUT_LIMIT_BYTES = Number(process.env.OSS_REVIEW_OUTPUT_LIM
 export const GITHUB_EVIDENCE_OUTPUT_LIMIT_BYTES = Number(
   process.env.OSS_GITHUB_EVIDENCE_OUTPUT_LIMIT_BYTES ?? 10_000_000,
 );
-export const REVIEW_PROMPT_VERSION = 3;
+export const REVIEW_PROMPT_VERSION = 4;
 const QUALIFICATION_TTL_MS = 2 * 60 * 60 * 1000;
 const RELATED_PRS_MAX = 12;
 const RELATED_PRS_HYDRATE_MAX = 8;
@@ -64,11 +65,14 @@ export function parseIssue(value) {
 }
 
 async function checked(command, args, options = {}) {
-  const result = await run(command, args, {
+  const runOptions = {
     timeoutMs: 45_000,
     outputLimitBytes: GITHUB_EVIDENCE_OUTPUT_LIMIT_BYTES,
     ...options,
-  });
+  };
+  const result = command === 'gh'
+    ? await runGhCommand(args, {...runOptions, label: `review-issue:${args.slice(0, 2).join(' ')}`})
+    : await run(command, args, runOptions);
   if (result.code !== 0) {
     const detail = (result.stderr || result.stdout).trim().slice(-2000);
     throw new Error(`${command} ${args.join(' ')} failed${result.timedOut ? ' (timeout)' : ''}: ${detail}`);
@@ -152,6 +156,16 @@ export function hardGateReasons({issueData, repoData, exactOpenPrs = []}) {
   if (repoData.isFork) reasons.push('Repository is a fork rather than the canonical project.');
   if (exactOpenPrs.length) reasons.push(`Open implementation PR found: ${exactOpenPrs.map((pr) => pr.url).join(', ')}`);
   return reasons;
+}
+
+export function verifierCompatibilityReasons(gitIndex) {
+  const submodules = String(gitIndex ?? '').split('\n').flatMap((line) => {
+    const match = /^160000\s+[0-9a-f]{40,64}\s+\d+\t(.+)$/.exec(line);
+    return match ? [match[1]] : [];
+  });
+  return submodules.length
+    ? [`Repository contains tracked Git submodules unsupported by the canonical verifier: ${submodules.join(', ')}`]
+    : [];
 }
 
 function rejectResult(issue, reasons) {
@@ -338,7 +352,7 @@ Return ACCEPT only if every gate below is affirmatively proven. Uncertainty is R
 1. Issue is live, open, unassigned to anyone outside Northset, and has no credible current human claimant outside Northset. A current AysajanE plan-to-work comment or assignment is Northset's own operator evidence, not a competing claimant; record it as process evidence and continue checking every other gate.
 2. No open direct, linked, overlapping, or semantically equivalent implementation PR exists. Read the packet's exact and possible PR matches plus timeline.
 3. The requested behavior is still absent or defective on the checked-out current default branch; cite exact path:line evidence. An old open issue is not proof.
-4. Scope and expected behavior are bounded and settled by the issue or maintainer discussion. No design question, broad umbrella, external blocker, or multi-repo program.
+4. Scope and expected behavior are bounded and settled by the issue or maintainer discussion. No design question, broad umbrella, external blocker, or multi-repo program. The complete fix, including cleanup required to keep repository checks passing, must plausibly fit at most five changed files and 300 changed lines. Trace direct registrations and required static/generated cleanup before accepting; reject rather than omit required cleanup to make the estimate fit.
 5. A real existing deterministic focused test/build/lint harness can exercise the change locally without credentials, production access, special hardware, subjective visual judgment, or a new harness invented from scratch. Derive its exact command from the checked-out source; absence of a crawler-preseeded command is not a rejection reason. The proposed regression test must fail against the checked-out base behavior and pass after the smallest production fix. Pure test-coverage work for behavior that already passes is ineligible because it cannot satisfy the differential red/green receipt. Give the exact command.
 6. Current repository contribution instructions do not prohibit this AI-assisted workflow and do not leave a material process conflict unresolved. Ordinary human claim comments, CLA/DCO, or disclosure steps are allowed but must be listed.
 7. A current invitation is proven by a qualifying label, assignment to AysajanE, an explicit OWNER/MEMBER/COLLABORATOR invitation, or repository policy opening unassigned issues to contributions. In an evidence-bound lake review, candidate_repository_policy may approve an exact live custom label only when candidate_repository_policy_sha256 is also present; report that as label evidence and let host validation bind the policy bytes. Repository-policy evidence from the target repository must use an exact GitHub blob URL pinned to the supplied base commit, including supporting line numbers. Return the exact evidence URL and observation time.
@@ -363,7 +377,7 @@ async function collectEvidence(issue, deadline) {
     'nameWithOwner,url,isArchived,isFork,licenseInfo,defaultBranchRef,description'], {deadline});
   const timelineJson = await checked('gh', ['api', '--paginate', '--slurp',
     '-H', 'Accept: application/vnd.github+json', `repos/${repoArg}/issues/${issue.number}/timeline`], {deadline});
-  const allPrJson = await checked('gh', ['pr', 'list', '-R', repoArg, '--state', 'all', '--limit', '500',
+  const allPrJson = await checked('gh', ['pr', 'list', '-R', repoArg, '--state', 'all', '--limit', '100',
     '--json', 'number,title,body,url,headRefName,state,updatedAt,closedAt,mergedAt,author'], {deadline});
 
   const issueData = parseJson(issueJson, 'gh issue view');
@@ -695,6 +709,14 @@ async function review(issue, deadline = createDeadline(REVIEW_BUDGET_MS), reques
     if (evidenceBinding && liveCandidateEvidence.evidence_key !== evidenceBinding.expectedEvidenceKey) {
       throw new Error(`candidate evidence drift: reviewer observed ${liveCandidateEvidence.evidence_key}, queued ${evidenceBinding.expectedEvidenceKey}`);
     }
+    const compatibilityReasons = verifierCompatibilityReasons(await checked('git', [
+      '-C', repoDir, 'ls-files', '-s',
+    ], {deadline, timeoutMs: 30_000}));
+    if (compatibilityReasons.length) {
+      return {...rejectResult(issue, compatibilityReasons), base_commit: baseCommit,
+        executor_profile: requestedProfile, issue_updated_at: evidence.issueData.updatedAt,
+        candidate_evidence_key: liveCandidateEvidence?.evidence_key ?? null};
+    }
     if (hardReasons.length) {
       return {...rejectResult(issue, hardReasons), base_commit: baseCommit, executor_profile: requestedProfile,
         issue_updated_at: evidence.issueData.updatedAt, candidate_evidence_key: liveCandidateEvidence.evidence_key};
@@ -853,6 +875,7 @@ async function main() {
     expectedEvidenceKey, repoPolicySha256, repoPolicySnapshot,
   }); }
   catch (error) {
+    if (isGhGatewayTerminalError(error)) throw error;
     if (deadline.expired() || /timeout|deadline|output limit/i.test(error.message)) {
       const reason = /output limit/i.test(error.message)
         ? 'Qualification evidence exceeded the fast-lane output cap.'
@@ -872,7 +895,8 @@ async function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT_FILE) {
   main().catch((error) => {
-    console.error(`review error: ${error.message}`);
+    const marker = isGhGatewayTerminalError(error) ? ` [${error.code}]` : '';
+    console.error(`review error${marker}: ${error.message}`);
     process.exit(error.message.includes('deadline') || error.message.includes('timeout') ? 2 : 1);
   });
 }

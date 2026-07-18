@@ -30,6 +30,8 @@ import {fileURLToPath} from 'node:url';
 
 import {PROFILE_REGISTRY, isInvitationLabel, normalizeLabel, taskIdForCandidate} from './core.mjs';
 import {candidateEvidenceKey, canonicalCandidate, openCandidateLake} from './candidate-lake.mjs';
+import {assertPhase1Runtime} from './campaign/phase1/runtime-guard.mjs';
+import {ghRequest, isGhGatewayTerminalError} from './gh-gateway.mjs';
 
 export {isInvitationLabel, normalizeLabel};
 
@@ -237,6 +239,13 @@ export function parseArgs(argv, env = process.env) {
   if (searchShards > 12) throw new Error('--search-shards must be at most 12');
   const labelPages = positiveInteger(options.get('--label-pages') ?? '3', '--label-pages');
   if (labelPages > 10) throw new Error('--label-pages must be at most 10');
+  const discoveryFile = options.has('--discovery-file')
+    ? path.resolve(options.get('--discovery-file'))
+    : env.OSS_FIND_DISCOVERY_FILE ? path.resolve(env.OSS_FIND_DISCOVERY_FILE) : null;
+  const gatewayWaveId = env.OSS_GATEWAY_WAVE_ID ?? null;
+  const gatewayWaveBudget = env.OSS_GATEWAY_WAVE_BUDGET === undefined || env.OSS_GATEWAY_WAVE_BUDGET === ''
+    ? null
+    : nonNegativeInteger(env.OSS_GATEWAY_WAVE_BUDGET, 'OSS_GATEWAY_WAVE_BUDGET');
 
   const historyFile = path.resolve(options.get('--history') ?? env.OSS_FIND_HISTORY ?? DEFAULT_HISTORY);
   const reviewScript = path.resolve(options.get('--review-script') ?? env.OSS_FIND_REVIEW_SCRIPT ?? DEFAULT_REVIEWER);
@@ -249,7 +258,7 @@ export function parseArgs(argv, env = process.env) {
     '--preflight-limit', '--stars-min', '--max-comments', '--max-push-age-days',
     '--min-score', '--max-per-owner', '--qualification-ttl-minutes', '--history',
     '--review-script', '--repo-policy', '--output', '--audit', '--created-window-days',
-    '--updated-window-days', '--search-shards', '--label-pages',
+    '--updated-window-days', '--search-shards', '--label-pages', '--discovery-file',
   ]);
   for (const key of options.keys()) if (!known.has(key)) throw new Error(`unknown argument ${key}`);
 
@@ -279,6 +288,9 @@ export function parseArgs(argv, env = process.env) {
     updatedWindowDays,
     searchShards,
     labelPages,
+    discoveryFile,
+    gatewayWaveId,
+    gatewayWaveBudget,
     historyFile,
     reviewScript,
     repoPolicyFile,
@@ -312,6 +324,7 @@ Core options:
   --max-per-owner N                 Maximum selected candidates per GitHub owner (default: 2)
 
 Search controls:
+  --discovery-file path             Use an archive discovery file; skip all live search calls
   --labels a,b                      Invitation labels (default: good first issue,help wanted)
   --terms a,b                       Optional high-signal phrases; labels remain mandatory
   --repos owner/repo,...            Optional targeted repository set
@@ -441,7 +454,7 @@ export function runBounded(command, args, {
 function transientFailure(result) {
   if (result.timedOut) return true;
   const text = `${result.stderr}\n${result.stdout}`;
-  return /(?:secondary rate limit|rate limit|HTTP 429|HTTP 5\d\d|502|503|504|ECONNRESET|ETIMEDOUT|connection reset|temporary failure|service unavailable)/i.test(text);
+  return /(?:HTTP 5\d\d|502|503|504|ECONNRESET|ETIMEDOUT|connection reset|temporary failure|service unavailable)/i.test(text);
 }
 
 async function pause(ms, deadline) {
@@ -455,10 +468,23 @@ async function commandJson(label, command, args, {
   retries = 1,
   maxOutputBytes = 8_000_000,
   env,
+  requestClass,
+  waveId,
+  waveBudget,
 } = {}) {
   let last;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
-    last = await runBounded(command, args, {deadline, timeoutMs, maxOutputBytes, env});
+    last = command === 'gh'
+      ? await ghRequest(args, {
+        label,
+        requestClass,
+        env,
+        timeoutMs: deadline ? deadline.timeoutFor(timeoutMs) : timeoutMs,
+        maxBuffer: maxOutputBytes,
+        waveId,
+        waveBudget,
+      })
+      : await runBounded(command, args, {deadline, timeoutMs, maxOutputBytes, env});
     if (last.code === 0) {
       try {
         return JSON.parse(last.stdout);
@@ -506,6 +532,7 @@ function labelsOf(issue) {
 const HARD_BLOCKED_LABEL = /(?:^|\b)(security|vulnerability|cve|bug bounty|bounty|dependencies?|translation|localization|documentation|docs|hacktoberfest|needs design|proposal|rfc|breaking change)(?:\b|$)/i;
 const HARD_BLOCKED_TITLE = /\b(translate|translation|documentation|docs?|readme|typo|bount(?:y|ies)|security|vulnerabilit(?:y|ies)|cve[- ]?\d*|dependency update|upgrade dependenc|release checklist|migration|benchmark|performance|concurrency|distributed|rfc|proposal|redesign)\b/i;
 const LOW_VALUE_TITLE = /\b(campaign|call for contributors|onboard|review an open pr|write (?:a|the) (?:blog|review)|compare .+ project|stars? drive|launch checklist|create (?:a )?(?:logo|image|pixel art)|add yourself)\b/i;
+const LOW_YIELD_SCOPE_TITLE = /(?:\b(?:improve|increase|expand|extend|boost)\b.{0,32}\b(?:test )?coverage\b|\bfeature request\b|\b(?:add|create|introduce|implement|expose)\b.{0,48}\b(?:new )?(?:feature|api|cli|command[- ]line|endpoint|flag|option)\b|\b(?:add|expand|improve|create|implement)\b.{0,48}\b(?:hardware|kubernetes|k8s|end[- ]to[- ]end|e2e)\b|\b(?:hardware|kubernetes|k8s|end[- ]to[- ]end|e2e)\b.{0,32}\b(?:integration|test(?:ing)?|suite|coverage|support)\b|\b(?:umbrella|tracking|meta) issue\b|\bepic\b)/i;
 
 export function lowValueReason(issue) {
   if (issue.isLocked) return 'locked';
@@ -515,7 +542,7 @@ export function lowValueReason(issue) {
   if (labels.some((label) => HARD_BLOCKED_LABEL.test(label))) return 'excluded label';
   const title = String(issue.title ?? '');
   if (HARD_BLOCKED_TITLE.test(title)) return 'excluded task type';
-  if (LOW_VALUE_TITLE.test(title)) return 'low-value task type';
+  if (LOW_VALUE_TITLE.test(title) || LOW_YIELD_SCOPE_TITLE.test(title)) return 'low-value task type';
   return null;
 }
 
@@ -590,7 +617,7 @@ export async function discoverRepositoryInvitationLabels(repository, fetchPage, 
 }
 
 export function buildSearchPlan(config) {
-  if (config.includeOnly) return [];
+  if (config.includeOnly || config.discoveryFile) return [];
   const plan = [];
   const add = ({label, term = null, language = null, repositories = [], sort = 'updated', order = 'desc', window = null}) => {
     const queryParts = [];
@@ -800,6 +827,58 @@ export function mergeIncludedCandidates(candidates, included) {
   return [...merged.values()];
 }
 
+/**
+ * Load the archive miner's discovery artifact (or the older root-array form)
+ * into the same normalized records produced by live REST search.
+ */
+export async function loadDiscoveryFile(file) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(file, 'utf8'));
+  } catch (error) {
+    throw new Error(`invalid discovery file ${file}: ${error.message}`);
+  }
+  const values = Array.isArray(parsed) ? parsed : parsed?.unscreened_candidates ?? parsed?.candidates;
+  if (!Array.isArray(values)) {
+    throw new Error(`discovery file ${file} must be an array or contain unscreened_candidates[]`);
+  }
+
+  const latest = new Map();
+  for (const [index, value] of values.entries()) {
+    if (!value || typeof value !== 'object') throw new Error(`discovery file ${file} candidate ${index + 1} must be an object`);
+    const candidate = value.candidate ?? value.key;
+    let identity;
+    try { identity = parseCandidateKey(candidate); }
+    catch (error) { throw new Error(`discovery file ${file} candidate ${index + 1}: ${error.message}`); }
+    const observed = value.event_at ?? value.updated_at ?? value.updated ?? value.created_at ?? value.created ?? null;
+    const previous = latest.get(identity.key.toLowerCase());
+    if (previous && Date.parse(previous.observed ?? '') > Date.parse(observed ?? '')) continue;
+    latest.set(identity.key.toLowerCase(), {value, identity, observed});
+  }
+
+  const discovered = new Map();
+  for (const {value, identity} of latest.values()) {
+    const repository = `${identity.owner}/${identity.repo}`;
+    const labels = (value.labels ?? []).map((label) => typeof label === 'string' ? {name: label} : label);
+    const issue = {
+      number: identity.number,
+      title: String(value.title ?? ''),
+      body: String(value.body_excerpt ?? value.body ?? ''),
+      url: value.url ?? `https://github.com/${repository}/issues/${identity.number}`,
+      repository: {nameWithOwner: repository},
+      labels,
+      assignees: value.assignees ?? [],
+      updatedAt: value.updated_at ?? value.updated ?? value.event_at ?? null,
+      createdAt: value.created_at ?? value.created ?? null,
+      isLocked: Boolean(value.locked ?? value.is_locked),
+      commentsCount: Number(value.comments_count ?? value.comments ?? 0),
+      authorAssociation: value.author_association ?? null,
+    };
+    mergeSearchResult(discovered, issue, 'discovery-file');
+  }
+  return [...discovered.values()];
+}
+
 async function loadRepoPolicy(file) {
   const contents = await readIfExists(file);
   if (!contents) return {cooldowns: {}};
@@ -867,6 +946,9 @@ async function checkRateLimits(config, plan, deadline, audit) {
   const rate = await commandJson('GitHub rate-limit check', 'gh', ['api', 'rate_limit'], {
     deadline,
     timeoutMs: config.ghTimeoutMs,
+    requestClass: 'rest_read',
+    waveId: config.gatewayWaveId,
+    waveBudget: config.gatewayWaveBudget,
   });
   const search = rate?.resources?.search;
   const graphql = rate?.resources?.graphql;
@@ -891,6 +973,9 @@ async function discover(config, plan, deadline, audit) {
     let response = await commandJson(`GitHub issue search ${query.id}`, 'gh', searchArgs(query, config), {
       deadline,
       timeoutMs: config.ghTimeoutMs,
+      requestClass: 'search',
+      waveId: config.gatewayWaveId,
+      waveBudget: config.gatewayWaveBudget,
     });
     if (response?.incomplete_results === true && !deadline.expired()) {
       await pause(500, deadline);
@@ -898,6 +983,9 @@ async function discover(config, plan, deadline, audit) {
         deadline,
         timeoutMs: config.ghTimeoutMs,
         retries: 0,
+        requestClass: 'search',
+        waveId: config.gatewayWaveId,
+        waveBudget: config.gatewayWaveBudget,
       });
     }
     if (!response || !Array.isArray(response.items)) throw new Error(`GitHub issue search ${query.id} returned an invalid response`);
@@ -925,7 +1013,8 @@ async function northsetPrSearch(config, deadline, query, label) {
     '-H', `X-GitHub-Api-Version: ${GITHUB_REST_API_VERSION}`,
     'search/issues', '-f', `q=${query}`, '-f', 'sort=updated', '-f', 'order=desc', '-f', 'per_page=100',
     '--jq', '{total_count,incomplete_results,items:[.items[]|{repository_url,created_at}]}',
-  ], {deadline, timeoutMs: config.ghTimeoutMs});
+  ], {deadline, timeoutMs: config.ghTimeoutMs, requestClass: 'search',
+    waveId: config.gatewayWaveId, waveBudget: config.gatewayWaveBudget});
   if (response?.incomplete_results === true && !deadline.expired()) {
     await pause(500, deadline);
     response = await commandJson(`${label} retry`, 'gh', [
@@ -934,7 +1023,8 @@ async function northsetPrSearch(config, deadline, query, label) {
       '-H', `X-GitHub-Api-Version: ${GITHUB_REST_API_VERSION}`,
       'search/issues', '-f', `q=${query}`, '-f', 'sort=updated', '-f', 'order=desc', '-f', 'per_page=100',
       '--jq', '{total_count,incomplete_results,items:[.items[]|{repository_url,created_at}]}',
-    ], {deadline, timeoutMs: config.ghTimeoutMs, retries: 0});
+    ], {deadline, timeoutMs: config.ghTimeoutMs, retries: 0, requestClass: 'search',
+      waveId: config.gatewayWaveId, waveBudget: config.gatewayWaveBudget});
   }
   if (!response || !Array.isArray(response.items) || response.incomplete_results === true) {
     throw new Error(`${label} was incomplete or invalid`);
@@ -957,10 +1047,13 @@ function repositoryCounts(items) {
 async function openNorthsetPolicyCounts(config, deadline, audit) {
   const query = 'is:pr is:open author:AysajanE';
   const today = new Date().toISOString().slice(0, 10);
-  const [response, dailyResponse] = await Promise.all([
-    northsetPrSearch(config, deadline, query, 'Northset open-PR repository check'),
-    northsetPrSearch(config, deadline, `is:pr author:AysajanE created:>=${today}`, 'Northset daily-PR repository check'),
-  ]);
+  const response = await northsetPrSearch(config, deadline, query, 'Northset open-PR repository check');
+  const dailyResponse = await northsetPrSearch(
+    config,
+    deadline,
+    `is:pr author:AysajanE created:>=${today}`,
+    'Northset daily-PR repository check',
+  );
   const openCounts = repositoryCounts(response.items);
   const dailyCounts = repositoryCounts(dailyResponse.items);
   audit.add('northset_open_pr_repositories_checked', {
@@ -1017,6 +1110,8 @@ export function filterDiscovered(candidates, {
 export function buildPreflightQuery(candidates) {
   const fields = candidates.map((candidate, index) => `
     c${index}: repository(owner: ${JSON.stringify(candidate.owner)}, name: ${JSON.stringify(candidate.repo)}) {
+      id
+      owner { id login }
       nameWithOwner
       isArchived
       isFork
@@ -1030,6 +1125,7 @@ export function buildPreflightQuery(candidates) {
         target { ... on Commit { oid } }
       }
       issue(number: ${candidate.number}) {
+        id
         number
         title
         bodyText
@@ -1082,6 +1178,8 @@ export function normalizePreflight(candidate, repository) {
   return {
     candidate: candidate.key,
     repository: repository ? {
+      node_id: repository.id,
+      owner: repository.owner ? {node_id: repository.owner.id, login: repository.owner.login} : null,
       name_with_owner: repository.nameWithOwner,
       archived: repository.isArchived,
       fork: repository.isFork,
@@ -1094,6 +1192,7 @@ export function normalizePreflight(candidate, repository) {
       default_head: repository.defaultBranchRef?.target?.oid ?? null,
     } : null,
     issue: issue ? {
+      node_id: issue.id,
       number: issue.number,
       title: issue.title,
       url: issue.url,
@@ -1125,11 +1224,11 @@ export function normalizePreflight(candidate, repository) {
         })),
     } : null,
     discovery: {
-      title: candidate.title || issue?.title || '',
-      body_excerpt: String(candidate.body || issue?.bodyText || '').slice(0, 4000),
-      labels: candidate.labels?.length ? candidate.labels : (issue?.labels?.nodes ?? []).map((item) => item.name),
-      updated_at: candidate.updated_at,
-      comments_count: candidate.comments_count,
+      title: issue?.title ?? candidate.title ?? '',
+      body_excerpt: String(issue?.bodyText ?? candidate.body ?? '').slice(0, 4000),
+      labels: issue ? (issue.labels?.nodes ?? []).map((item) => item.name) : (candidate.labels ?? []),
+      updated_at: issue?.updatedAt ?? candidate.updated_at,
+      comments_count: issue?.comments?.totalCount ?? candidate.comments_count,
       queries: candidate.discovery_queries,
     },
   };
@@ -1170,7 +1269,8 @@ export function scorePreflight(preflight, profile, nowMs = Date.now()) {
   const labels = preflight.issue?.labels ?? [];
   if (labels.some((label) => normalizeLabel(label).includes('good first issue'))) add('good-first-issue invitation', 5);
   if (labels.some((label) => normalizeLabel(label).endsWith('help wanted') || normalizeLabel(label) === 'help wanted')) add('help-wanted invitation', 5);
-  if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(preflight.issue?.author_association)) add('maintainer-authored issue', 8);
+  const maintainerAuthored = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(preflight.issue?.author_association);
+  if (maintainerAuthored) add('maintainer-authored issue', 8);
 
   const language = preflight.repository?.primary_language;
   if ((PROFILE_LANGUAGES[profile] ?? []).includes(language)) add(`profile language ${language}`, 12);
@@ -1204,7 +1304,17 @@ export function scorePreflight(preflight, profile, nowMs = Date.now()) {
   if (highCount) add('bounded correctness title signal', Math.min(12, highCount * 4));
 
   const body = `${preflight.discovery?.body_excerpt ?? ''} ${preflight.issue?.title ?? ''}`;
-  if (/\b(expected|actual|repro|steps|test|assert)\b/i.test(body)) add('observable-behavior signal', 4);
+  const behaviorSignalCount = [
+    /\bexpected\b/i,
+    /\bactual\b/i,
+    /\b(?:repro(?:duction)?|steps? to reproduce)\b/i,
+    /\b(?:tests?|assert(?:ion)?)\b/i,
+  ].filter((pattern) => pattern.test(body)).length;
+  if (behaviorSignalCount) add('observable-behavior signal', Math.min(12, behaviorSignalCount * 3));
+  if (maintainerAuthored && behaviorSignalCount >= 2 &&
+      /\b(?:bug|fix|incorrect|wrong|fails?|failure|regression|crash|error)\b/i.test(title)) {
+    add('maintainer-authored evidenced defect', 8);
+  }
   if (/\b(feature|proposal|design|refactor|api|option|flag|performance|benchmark|concurrency|distributed)\b/i.test(title)) {
     add('broader-design title risk', -15);
   }
@@ -1307,6 +1417,9 @@ async function preflightCandidates(candidates, config, deadline, audit) {
       deadline,
       timeoutMs: config.ghTimeoutMs,
       maxOutputBytes: 12_000_000,
+      requestClass: 'graphql',
+      waveId: config.gatewayWaveId,
+      waveBudget: config.gatewayWaveBudget,
     });
     if (response?.errors?.length) throw new Error(`GitHub candidate preflight returned GraphQL errors: ${JSON.stringify(response.errors).slice(0, 2000)}`);
     for (let index = 0; index < group.length; index += 1) {
@@ -1504,17 +1617,30 @@ export function isFatalReviewerInfrastructureError(message) {
     || (/model\s+[^\s]+\s+is\s+unavailable/.test(normalized));
 }
 
+export function isTerminalGitHubSubprocessError(message) {
+  return /\bGITHUB_(?:PROVIDER_THROTTLED|GATEWAY_REFUSED|GATEWAY_TERMINAL)\b/.test(String(message ?? ''));
+}
+
+export class GitHubSubprocessTerminalError extends Error {
+  constructor(message, options = {}) {
+    super(message, options);
+    this.name = 'GitHubSubprocessTerminalError';
+    this.code = 'GITHUB_GATEWAY_SUBPROCESS_TERMINAL';
+  }
+}
+
 async function reviewQueue(queue, config, deadline, audit, history, runId) {
   const accepted = [];
   const terminal = [];
   let cursor = 0;
   let started = 0;
   let fatalInfrastructureError = null;
+  let terminalGitHubError = null;
 
   const enough = () => selectDiverse(accepted, config.requested, config.maxPerOwner).selected.length >= config.requested;
 
   async function worker() {
-    while (!deadline.expired() && !enough() && fatalInfrastructureError == null) {
+    while (!deadline.expired() && !enough() && fatalInfrastructureError == null && terminalGitHubError == null) {
       const index = cursor++;
       if (index >= queue.length) return;
       const candidate = queue[index];
@@ -1555,8 +1681,9 @@ async function reviewQueue(queue, config, deadline, audit, history, runId) {
           : result.outputLimitExceeded ? 'REJECTED_REVIEW_OUTPUT_LIMIT'
             : 'REJECTED_REVIEW_TOOL_ERROR';
         error = (result.stderr || result.stdout || `exit ${result.code}`).trim().slice(-3000);
-        if (terminalState === 'REJECTED_REVIEW_TOOL_ERROR' && isFatalReviewerInfrastructureError(error)) {
-          fatalInfrastructureError ??= error;
+        if (terminalState === 'REJECTED_REVIEW_TOOL_ERROR') {
+          if (isTerminalGitHubSubprocessError(error)) terminalGitHubError ??= error;
+          else if (isFatalReviewerInfrastructureError(error)) fatalInfrastructureError ??= error;
         }
       } else {
         try {
@@ -1608,6 +1735,9 @@ async function reviewQueue(queue, config, deadline, audit, history, runId) {
   const workers = Array.from({length: Math.min(config.concurrency, queue.length || 1)}, () => worker());
   await Promise.all(workers);
   await history.flush();
+  if (terminalGitHubError != null) {
+    throw new GitHubSubprocessTerminalError(`semantic reviewer hit a terminal GitHub gateway stop: ${terminalGitHubError}`);
+  }
   if (fatalInfrastructureError != null) {
     throw new Error(`semantic reviewer infrastructure failure: ${fatalInfrastructureError}`);
   }
@@ -1699,8 +1829,11 @@ function publicConfig(config) {
     exclusion_files: config.exclusionFiles,
     inclusion_files: config.inclusionFiles,
     include_only: config.includeOnly,
+    discovery_file: config.discoveryFile,
     review_script: config.reviewScript,
     repo_policy_file: config.repoPolicyFile,
+    gateway_wave_id: config.gatewayWaveId,
+    gateway_wave_budget: config.gatewayWaveBudget,
   };
 }
 
@@ -1776,13 +1909,14 @@ export async function qualifyQueueRecords(records, {
   }
   const results = new Array(unique.length);
   let cursor = 0;
+  let terminalGitHubError = null;
   const runner = reviewRunner ?? (async (record) => {
     return runBounded(process.execPath, reviewerInvocationArgs(record, {profile, reviewScript}),
     {timeoutMs: reviewTimeoutMs, maxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES});
   });
 
   async function lane() {
-    while (cursor < unique.length) {
+    while (cursor < unique.length && terminalGitHubError === null) {
       const index = cursor++;
       const record = unique[index];
       try {
@@ -1828,6 +1962,12 @@ export async function qualifyQueueRecords(records, {
           continue;
         }
         const executed = await runner(record);
+        if (!executed?.verdict && ![0, 2].includes(executed?.code)) {
+          const detail = String(executed?.stderr || executed?.stdout || `exit ${executed?.code}`).trim().slice(-3000);
+          if (isTerminalGitHubSubprocessError(detail)) {
+            throw new GitHubSubprocessTerminalError(`semantic reviewer hit a terminal GitHub gateway stop: ${detail}`);
+          }
+        }
         const review = executed?.verdict ? executed : JSON.parse(executed.stdout);
         const code = executed?.verdict ? (review.verdict === 'ACCEPT' ? 0 : 2) : executed.code;
         validateReview(review, record.candidate, code, profile, {
@@ -1856,12 +1996,31 @@ export async function qualifyQueueRecords(records, {
         results[index] = {candidate: record.candidate, evidence_key: record.evidence_key,
           state: review.verdict === 'ACCEPT' ? 'ACCEPTED' : 'REJECTED_SEMANTIC', cache_hit: false, review};
       } catch (error) {
-        results[index] = {candidate: record.candidate, evidence_key: record.evidence_key,
+        if (error instanceof GitHubSubprocessTerminalError || isGhGatewayTerminalError(error)) {
+          terminalGitHubError ??= error;
+          return;
+        }
+        const failure = {candidate: record.candidate, evidence_key: record.evidence_key,
           state: 'REVIEW_TOOL_ERROR', cache_hit: false, error: error.message};
+        await lake.recordCandidateState({...failure, observed_at: now().toISOString()}, {
+          candidate: record.candidate,
+          evidenceKey: record.evidence_key,
+          state: failure.state,
+          stateClass: 'retryable',
+          source: 'find-candidates qualify',
+        });
+        results[index] = failure;
       }
     }
   }
   await Promise.all(Array.from({length: Math.min(concurrency, unique.length || 1)}, () => lane()));
+  if (terminalGitHubError) {
+    if (terminalGitHubError instanceof GitHubSubprocessTerminalError) throw terminalGitHubError;
+    throw new GitHubSubprocessTerminalError(
+      `semantic reviewer hit a terminal GitHub gateway stop: ${terminalGitHubError.message}`,
+      {cause: terminalGitHubError},
+    );
+  }
   return results;
 }
 
@@ -1883,8 +2042,12 @@ async function runCrawlCommand(argv) {
   const eligibleKeys = new Set();
   const persistedThisRun = new Set();
   const preflightPersisted = new Set();
-  for (const profile of profiles) {
+  for (const [profileIndex, profile] of profiles.entries()) {
     const config = parseArgs([String(count), '--profile', profile, ...values]);
+    // One archive corpus is profile-independent. The first pass can assign each
+    // repository across the full requested profile set, so repeating GraphQL
+    // hydration for later profiles would only consume gateway capacity.
+    if (config.discoveryFile && profileIndex > 0) continue;
     const deadline = new Deadline(config.totalBudgetMs);
     const audit = new AuditLog(randomUUID());
     const [seen, included, repoPolicy] = await Promise.all([
@@ -1894,20 +2057,35 @@ async function runCrawlCommand(argv) {
     ]);
     config.repoPolicy = repoPolicy;
     config.repoPolicySha = sha256(Buffer.from(canonical(repoPolicy)));
-    if (config.repositories.length) {
+    if (!config.discoveryFile && config.repositories.length) {
       for (const repository of config.repositories) {
         const scanned = await discoverRepositoryInvitationLabels(repository, async ({page, perPage}) =>
           commandJson(`repository labels ${repository} page ${page}`, 'gh', [
             'api', `repos/${repository}/labels?per_page=${perPage}&page=${page}`, '--jq', '[.[]|.name]',
-          ], {deadline, timeoutMs: config.ghTimeoutMs}), {policy: repoPolicy, maxPages: config.labelPages});
+          ], {deadline, timeoutMs: config.ghTimeoutMs, requestClass: 'rest_read',
+            waveId: config.gatewayWaveId, waveBudget: config.gatewayWaveBudget}),
+        {policy: repoPolicy, maxPages: config.labelPages});
         config.labels = [...new Set([...config.labels, ...scanned.labels])];
         audit.add('repository_invitation_labels_scanned', {repository, ...scanned});
       }
     }
     const plan = buildSearchPlan(config);
-    await checkRateLimits(config, plan, deadline, audit);
-    const counts = await openNorthsetPolicyCounts(config, deadline, audit);
-    const searched = await discover(config, plan, deadline, audit);
+    let counts;
+    let searched;
+    if (config.discoveryFile) {
+      searched = await loadDiscoveryFile(config.discoveryFile);
+      counts = {openCounts: new Map(), dailyCounts: new Map()};
+      audit.add('discovery_file_loaded', {
+        file: config.discoveryFile,
+        candidates: searched.length,
+        live_searches_skipped: true,
+        northset_policy_searches_skipped: true,
+      });
+    } else {
+      await checkRateLimits(config, plan, deadline, audit);
+      counts = await openNorthsetPolicyCounts(config, deadline, audit);
+      searched = await discover(config, plan, deadline, audit);
+    }
     const discovered = mergeIncludedCandidates(searched, included);
     for (const candidate of discovered) discoveredKeys.add(candidate.key.toLowerCase());
     for (const candidate of discovered) {
@@ -1969,6 +2147,11 @@ async function runCrawlCommand(argv) {
         repo: record.repository.name_with_owner, ...record.repository, test_profile: assignedProfile,
         install_command: entry.install_command, full_check_commands: entry.full_check_commands ?? [],
         invitation_label_map: invitationLabelMap, ...caps,
+        ...(config.discoveryFile ? {} : {
+          open_northset_prs: counts.openCounts.get(record.repository.name_with_owner.toLowerCase()) ?? 0,
+          northset_prs_opened_today: counts.dailyCounts.get(record.repository.name_with_owner.toLowerCase()) ?? 0,
+        }),
+        observed_at: new Date().toISOString(),
         raw: record.repository, provenance: {finder_version: FINDER_VERSION, phase: 'crawl_preflight'},
       });
       await lake.upsertIssue({
@@ -2013,13 +2196,25 @@ async function runQualifyCommand(argv) {
   const profile = takeOption(values, ['--profile'], 'node');
   const reviewScript = commandOutput(takeOption(values, ['--review-script']), DEFAULT_REVIEWER);
   const timeoutSeconds = positiveInteger(takeOption(values, ['--review-timeout-seconds'], '300'), '--review-timeout-seconds');
+  const phase1RuntimeValue = takeOption(values, ['--phase1-runtime'], null);
+  const phase1Runtime = phase1RuntimeValue ? path.resolve(phase1RuntimeValue) : null;
   if (values.length) throw new Error(`unknown qualify argument ${values[0]}`);
   const loaded = JSON.parse(await readFile(queueFile, 'utf8'));
   const queue = Array.isArray(loaded) ? loaded : loaded.queue;
   if (!Array.isArray(queue)) throw new Error('review queue must be an array or an object with queue[]');
+  const count = countValue ? positiveInteger(countValue, '--count') : queue.length;
+  const selected = queue.slice(0, count);
+  await assertPhase1Runtime(phase1Runtime, {
+    action: 'qualify',
+    repositories: selected.map((record) => {
+      const candidate = parseCandidateKey(record.candidate);
+      return `${candidate.owner}/${candidate.repo}`;
+    }),
+    units: selected.length,
+  });
   const lake = await openCandidateLake(lakeFile);
   const results = await qualifyQueueRecords(queue, {
-    lake, profile, count: countValue ? positiveInteger(countValue, '--count') : queue.length,
+    lake, profile, count,
     concurrency, reviewScript, reviewTimeoutMs: timeoutSeconds * 1000,
   });
   const report = {schema_version: 1, command: 'qualify', profile, queue_file: queueFile,
@@ -2080,9 +2275,22 @@ async function main() {
     config.repoPolicy = repoPolicy;
     config.repoPolicySha = sha256(Buffer.from(canonical(repoPolicy)));
     const plan = buildSearchPlan(config);
-    await checkRateLimits(config, plan, deadline, audit);
-    const northsetPolicyCounts = await openNorthsetPolicyCounts(config, deadline, audit);
-    const searched = await discover(config, plan, deadline, audit);
+    let northsetPolicyCounts;
+    let searched;
+    if (config.discoveryFile) {
+      searched = await loadDiscoveryFile(config.discoveryFile);
+      northsetPolicyCounts = {openCounts: new Map(), dailyCounts: new Map()};
+      audit.add('discovery_file_loaded', {
+        file: config.discoveryFile,
+        candidates: searched.length,
+        live_searches_skipped: true,
+        northset_policy_searches_skipped: true,
+      });
+    } else {
+      await checkRateLimits(config, plan, deadline, audit);
+      northsetPolicyCounts = await openNorthsetPolicyCounts(config, deadline, audit);
+      searched = await discover(config, plan, deadline, audit);
+    }
     const discovered = mergeIncludedCandidates(searched, included);
     audit.add('discovery_completed', {
       unique_candidates: discovered.length,

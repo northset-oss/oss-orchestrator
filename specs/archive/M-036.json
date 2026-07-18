@@ -1,0 +1,180 @@
+{
+  "schema_version": 2,
+  "mission_id": "M-036",
+  "task_id": "TASK-OSS-DA402D4FF9866B83",
+  "attempt_sequence": 4,
+  "work_category": "test_infrastructure_fix",
+  "authoring_mode": "test_only_then_fix",
+  "allow_modified_existing_tests": true,
+  "candidate": "aminueza/terraform-provider-minio#1037",
+  "target_repo": "https://github.com/aminueza/terraform-provider-minio",
+  "issue_url": "https://github.com/aminueza/terraform-provider-minio/issues/1037",
+  "base_branch": "main",
+  "base_commit": "8cbd15a09178d9d90c07d135b24fe5d60a118529",
+  "problem_statement": "Endpoint-dependent replication acceptance tests fail through their generic precheck when SECOND_MINIO_ENDPOINT is unset instead of being treated as unavailable local test infrastructure.",
+  "acceptance_criteria": [
+    "When SECOND_MINIO_ENDPOINT is unset, every endpoint-dependent TestAccS3BucketReplication test skips with a short explanatory message.",
+    "TestAccDataSourceMinioS3BucketReplicationStatus_withReplication skips under the same condition.",
+    "When the replication endpoint is configured, the existing acceptance-test execution remains unchanged."
+  ],
+  "non_goals": [
+    "Do not change provider runtime behavior or its public API.",
+    "Do not alter Docker Compose configuration or tests that do not depend on replication endpoints.",
+    "Do not skip the endpoint-independent TestAccS3BucketReplication_attribute_migration unit-style regression test."
+  ],
+  "constraints": [
+    "Do not change provider runtime behavior or its public API.",
+    "Do not alter Docker Compose configuration or tests that do not depend on replication endpoints.",
+    "Do not skip the endpoint-independent TestAccS3BucketReplication_attribute_migration unit-style regression test.",
+    "Do not add dependencies, change lockfiles or CI, update generated output, add binaries or symlinks, or rename files.",
+    "Keep the contribution limited to production source and an oracle-bound regression test."
+  ],
+  "implementation_hints": [],
+  "process_requirements": [
+    "Recheck the issue and PR state immediately before claiming work.",
+    "Use a Conventional Commit message and sign the commit with `git commit -s` for DCO compliance.",
+    "Complete the pull-request template and reference `Fixes #1037`.",
+    "Run the focused red/green command and required lint checks; accurately disclose whether real-MinIO acceptance tests were run."
+  ],
+  "source_evidence": [
+    "minio/resource_minio_s3_bucket_replication_test.go:410 — secondaryMinioEndpoint := os.Getenv(\"SECOND_MINIO_ENDPOINT\")",
+    "minio/resource_minio_s3_bucket_replication_test.go:414 — PreCheck:          func() { testAccPreCheck(t) },",
+    "minio/data_source_minio_s3_bucket_replication_status_test.go:40 — secondaryMinioEndpoint := os.Getenv(\"SECOND_MINIO_ENDPOINT\")",
+    "minio/data_source_minio_s3_bucket_replication_status_test.go:44 — PreCheck:          func() { testAccPreCheck(t) },",
+    "minio/provider_test.go:64 — \"SECOND_MINIO_ENDPOINT\",",
+    "minio/provider_test.go:91 — t.Fatalf(\"missing environment variables for acceptance tests: %s (see the \\\"test\\\" service in docker-compose.yml for the full set)\", strings.Join(missing, \", \"))",
+    ".github/CONTRIBUTING.md:265 — go test ./minio/... -v",
+    "README.md:150 — An [`AGENTS.md`](./AGENTS.md) at the repository root gives any agent the conventions, argument names, and error-handling patterns it needs to contribute here."
+  ],
+  "qualification": {
+    "finder_run_id": null,
+    "candidate_rank": null,
+    "finder_elapsed_ms": null,
+    "review_duration_ms": 164013,
+    "review_id": "sha256:456c605388a82abf83289058a28f56427b5bd78cda081d00864750d51d7351d6",
+    "review_prompt_version": 3,
+    "reviewed_at": "2026-07-17T20:22:56.710Z",
+    "qualification_expires_at": "2026-07-17T22:22:56.710Z",
+    "evidence_sha256": "sha256:28494624d1f539b3fce58b14c0fc66804735fdf00a0d6e186ece815393abb92f",
+    "issue_updated_at": "2026-07-17T02:05:44Z",
+    "requested_model": "gpt-5.6-sol",
+    "actual_model": null,
+    "reasoning_effort": "xhigh",
+    "service_tier": "fast",
+    "model_requests": null,
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_tokens": null,
+    "source_evidence": [
+      "minio/resource_minio_s3_bucket_replication_test.go:410 — secondaryMinioEndpoint := os.Getenv(\"SECOND_MINIO_ENDPOINT\")",
+      "minio/resource_minio_s3_bucket_replication_test.go:414 — PreCheck:          func() { testAccPreCheck(t) },",
+      "minio/data_source_minio_s3_bucket_replication_status_test.go:40 — secondaryMinioEndpoint := os.Getenv(\"SECOND_MINIO_ENDPOINT\")",
+      "minio/data_source_minio_s3_bucket_replication_status_test.go:44 — PreCheck:          func() { testAccPreCheck(t) },",
+      "minio/provider_test.go:64 — \"SECOND_MINIO_ENDPOINT\",",
+      "minio/provider_test.go:91 — t.Fatalf(\"missing environment variables for acceptance tests: %s (see the \\\"test\\\" service in docker-compose.yml for the full set)\", strings.Join(missing, \", \"))",
+      ".github/CONTRIBUTING.md:265 — go test ./minio/... -v",
+      "README.md:150 — An [`AGENTS.md`](./AGENTS.md) at the repository root gives any agent the conventions, argument names, and error-handling patterns it needs to contribute here."
+    ],
+    "invitation_evidence": {
+      "type": "label",
+      "url": "https://github.com/aminueza/terraform-provider-minio/issues/1037",
+      "observed_at": "2026-07-17T20:20:21.716Z"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "Endpoint-dependent replication acceptance tests fail through their generic precheck when SECOND_MINIO_ENDPOINT is unset instead of being treated as unavailable local test infrastructure.",
+      "expected_behavior": [
+        "When SECOND_MINIO_ENDPOINT is unset, every endpoint-dependent TestAccS3BucketReplication test skips with a short explanatory message.",
+        "TestAccDataSourceMinioS3BucketReplicationStatus_withReplication skips under the same condition.",
+        "When the replication endpoint is configured, the existing acceptance-test execution remains unchanged."
+      ],
+      "non_goals": [
+        "Do not change provider runtime behavior or its public API.",
+        "Do not alter Docker Compose configuration or tests that do not depend on replication endpoints.",
+        "Do not skip the endpoint-independent TestAccS3BucketReplication_attribute_migration unit-style regression test."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/aminueza/terraform-provider-minio/issues/1037",
+          "author_association": "COLLABORATOR",
+          "summary": "A repository collaborator identifies the failing local behavior, names the affected replication test families, and requests a short t.Skip guard when SECOND_MINIO_ENDPOINT is unset."
+        }
+      ]
+    },
+    "related_prs": [
+      {
+        "url": "https://github.com/aminueza/terraform-provider-minio/pull/1040",
+        "state": "MERGED",
+        "relationship": "not_related",
+        "disposition": "Changes site-replication cleanup when TF_ACC is unset in resource_minio_site_replication_test.go; it does not guard bucket-replication tests on SECOND_MINIO_ENDPOINT.",
+        "reopened_by": null
+      },
+      {
+        "url": "https://github.com/aminueza/terraform-provider-minio/pull/1032",
+        "state": "MERGED",
+        "relationship": "not_related",
+        "disposition": "Introduced the replication-status data-source acceptance test but contains no missing-endpoint skip and predates issue #1037.",
+        "reopened_by": null
+      }
+    ]
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "minio/resource_minio_s3_bucket_replication_test.go"
+    ],
+    "command": "env -u MINIO_ENDPOINT -u MINIO_USER -u MINIO_PASSWORD -u MINIO_ENABLE_HTTPS -u SECOND_MINIO_ENDPOINT -u SECOND_MINIO_USER -u SECOND_MINIO_PASSWORD -u SECOND_MINIO_ENABLE_HTTPS -u THIRD_MINIO_ENDPOINT -u THIRD_MINIO_USER -u THIRD_MINIO_PASSWORD -u THIRD_MINIO_ENABLE_HTTPS -u FOURTH_MINIO_ENDPOINT -u FOURTH_MINIO_USER -u FOURTH_MINIO_PASSWORD -u FOURTH_MINIO_ENABLE_HTTPS TF_ACC=1 go test ./minio -run '^TestAccS3BucketReplication_oneway_simple$' -count=1",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "missing environment variables for acceptance tests",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix: Tier A candidate for the Go pilot profile, subject to a same-day ",
+    "summary": "Endpoint-dependent replication acceptance tests fail through their generic precheck when SECOND_MINIO_ENDPOINT is unset instead of being treated as unavailable local test infrastructure."
+  },
+  "executor": {
+    "profile": "go",
+    "profile_status": "pilot",
+    "image": "golang:1.26.4-bookworm",
+    "install_commands": [
+      "go mod download"
+    ],
+    "commands": [
+      "env -u MINIO_ENDPOINT -u MINIO_USER -u MINIO_PASSWORD -u MINIO_ENABLE_HTTPS -u SECOND_MINIO_ENDPOINT -u SECOND_MINIO_USER -u SECOND_MINIO_PASSWORD -u SECOND_MINIO_ENABLE_HTTPS -u THIRD_MINIO_ENDPOINT -u THIRD_MINIO_USER -u THIRD_MINIO_PASSWORD -u THIRD_MINIO_ENABLE_HTTPS -u FOURTH_MINIO_ENDPOINT -u FOURTH_MINIO_USER -u FOURTH_MINIO_PASSWORD -u FOURTH_MINIO_ENABLE_HTTPS TF_ACC=1 go test ./minio -run '^TestAccS3BucketReplication_oneway_simple$' -count=1"
+    ],
+    "reasoning_effort": "xhigh",
+    "profile_production_proven": false
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "schema_version": 2,
+      "defaults": {
+        "max_open_prs": 1,
+        "daily_pr_cap": 1
+      },
+      "repositories": {
+        "prometheus/client_js": {
+          "max_open_prs": 0,
+          "daily_pr_cap": 0,
+          "cooldown_until": "manual-release",
+          "reason": "Maintainer bandwidth concern; a new contribution requires an explicit invitation."
+        }
+      },
+      "cooldowns": {
+        "prometheus/client_js": {
+          "reason": "Maintainer reported AI-generated PR bandwidth exhaustion on 2026-07-13; keep paused until the existing interaction is resolved or a maintainer explicitly invites new work.",
+          "evidence_url": "https://github.com/prometheus/client_js/pull/773#issuecomment-4953870322"
+        }
+      }
+    },
+    "checks_not_run": [],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

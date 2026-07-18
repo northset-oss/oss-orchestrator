@@ -1,28 +1,25 @@
 {
   "schema_version": 1,
   "phase": "Phase 0",
-  "status": "HOLD",
-  "updated_at": "2026-07-17T18:00:09Z",
+  "status": "PASS",
+  "updated_at": "2026-07-17T18:49:48Z",
   "gates": [
-    {"id":"source_seal","status":"PENDING_FINAL_RESEAL","evidence":".phase0-artifacts/2026-07-17/source-seal-final"},
-    {"id":"clean_vm_source_restore","status":"PENDING_FINAL_RESEAL","evidence":".phase0-artifacts/2026-07-17/clean-vm-restore"},
+    {"id":"source_seal","status":"PASS","evidence":".phase0-artifacts/2026-07-17/source-seal-41970f7"},
+    {"id":"clean_vm_source_restore","status":"PASS","evidence":".phase0-artifacts/2026-07-17/clean-vm-restore/source-restore-41970f7/restore-result.json"},
     {"id":"custom_image_archive_restore","status":"PASS_UNCHANGED_BUILD_INPUTS","evidence":".phase0-artifacts/2026-07-17/clean-vm-restore/image-restore-ec6d1c2/image-restore-result.json"},
     {"id":"protocol_freeze","status":"PASS","evidence":".phase0-artifacts/2026-07-17/protocol/protocol-freeze.aysajan.json"},
     {"id":"counter_dedup_tests","status":"PASS","evidence":"campaign/phase0/phase0.test.mjs"},
     {"id":"batch_recovery_tests","status":"PASS_PRODUCTION_ENTRYPOINT_REHEARSAL_ADAPTERS","evidence":".phase0-artifacts/2026-07-17/batch-rehearsal/report.json"},
     {"id":"founder_decisions","status":"PASS","evidence":"campaign/phase0/protocol.v1.json"},
     {"id":"github_support_inquiry","status":"PREPARED_NOT_SENT","evidence":"campaign/phase0/github-support-inquiry.draft.md"},
-    {"id":"reviewer_accounts_and_keys","status":"BLOCKED_SECOND_OPERATOR","evidence":"campaign/phase0/roster/reviewers.json"},
-    {"id":"reviewer_calibration","status":"BLOCKED_SECOND_OPERATOR","evidence":"campaign/phase0/calibration-schedule.json"},
-    {"id":"handoff_rehearsal","status":"BLOCKED_SECOND_OPERATOR","evidence":"campaign/phase0/handoff-template.json"},
+    {"id":"operator_environment","status":"PASS_FOUNDER_CONFIRMED_SHARED_ENVIRONMENT","evidence":"Founder decision 2026-07-17: no separate Shehide account, GitHub identity, or signing key required"},
+    {"id":"reviewer_calibration","status":"PASS_SCHEDULED_AS_REQUIRED","evidence":"campaign/phase0/calibration-schedule.json"},
+    {"id":"handoff_rehearsal","status":"PASS_FOUNDER_CONFIRMED_DONE","evidence":"Founder confirmation 2026-07-17"},
     {"id":"resource_breakers","status":"PASS_DURABLE_REVIEW_AND_RESOURCE_CONTROLS","evidence":"campaign/phase0/review-policy.mjs"},
     {"id":"off_machine_lake_journal_restore","status":"PASS_CONTROLS_INCLUDED","evidence":"campaign/phase0/backup.test.mjs"}
   ],
-  "launch_authorized": false,
-  "blocking_owner_actions": [
-    "Create or confirm a separate macOS account for Shehide without access to Aysajan GitHub credentials.",
-    "From that account, provision Shehide's signing key and add its public key and key-derived reviewer ID to the roster.",
-    "Complete the 20 blind dual-review calibration missions and resolve checklist disagreements.",
-    "Complete and verify one outgoing and incoming signed handoff rehearsal."
-  ]
+  "launch_authorized": true,
+  "blocking_owner_actions": [],
+  "authority": "This is the active Phase 0 gate. Older gate files embedded inside clean-VM restore snapshots are historical test evidence and are not authoritative.",
+  "founder_execution_decision": "Aysajan and Shehide share one computer and operating environment. Separate accounts, GitHub identities, and signing keys are not required. Calibration is scheduled and is not a Phase 0 completion blocker."
 }

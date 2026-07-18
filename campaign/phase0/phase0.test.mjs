@@ -27,6 +27,8 @@ import {
 import {
   assertTaskResourcePolicy,
   assertPhase0Spec,
+  clearPersistentProviderThrottle,
+  isProviderThrottle,
   loadResourceControl,
   remainingTaskLaneMs,
   ResourceBreakers,
@@ -193,13 +195,87 @@ test('provider throttle writes a durable no-auto-resume pause', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'northset-resource-control-'));
   t.after(() => import('node:fs/promises').then(({rm}) => rm(root, {recursive: true, force: true})));
   const file = path.join(root, 'resource-control.json');
-  await tripPersistentProviderThrottle(file, {provider: 'OpenAI', signal: '429', at: '2026-07-17T12:00:00Z'});
+  await tripPersistentProviderThrottle(file, {
+    provider: 'OpenAI', signal: '429', at: '2026-07-17T12:00:00Z',
+    gatewayStateDir: path.join(root, 'gateway-state'),
+  });
   const control = await loadResourceControl(file);
   assert.deepEqual(control.provider_pause, {
     kind: 'PROVIDER_THROTTLED', provider: 'OpenAI', signal: '429',
     tripped_at: '2026-07-17T12:00:00Z', auto_resume: false,
   });
   assert.throws(() => assertTaskResourcePolicy({task_id: 'TASK-2', attempt_sequence: 1}, control), /founder review/i);
+});
+
+test('persistent provider throttle trip and clearance serialize on the gateway lock', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-resource-gateway-lock-'));
+  t.after(() => import('node:fs/promises').then(({rm}) => rm(root, {recursive: true, force: true})));
+  const file = path.join(root, 'resource-control.json');
+  const gatewayStateDir = path.join(root, 'gateway-state');
+  const lockOptions = {testMode: true, timing: {lockPollMs: 1}};
+  const {acquireGhGatewayLock} = await import('../../gh-gateway.mjs');
+
+  let release = await acquireGhGatewayLock({stateDir: gatewayStateDir, ...lockOptions});
+  let settled = false;
+  const trip = tripPersistentProviderThrottle(file, {
+    provider: 'GitHub', signal: 'GITHUB_SECONDARY_RATE_LIMIT', gatewayStateDir,
+    gatewayLockOptions: lockOptions,
+  }).finally(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  await release();
+  await trip;
+
+  release = await acquireGhGatewayLock({stateDir: gatewayStateDir, ...lockOptions});
+  settled = false;
+  const clear = clearPersistentProviderThrottle(file, {
+    founderDecisionId: 'founder-clear-lock-test', gatewayStateDir,
+    gatewayLockOptions: lockOptions,
+  }).finally(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  await release();
+  await clear;
+});
+
+test('provider throttle classification covers GitHub secondary limits without treating permission 403s as throttles', () => {
+  const secondaryLimit = {
+    status: 403,
+    stderr: JSON.stringify({
+      documentation_url: 'https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api#about-secondary-rate-limits',
+      message: 'You have exceeded a secondary rate limit. Please wait a few minutes before you try again.',
+    }),
+  };
+  assert.equal(isProviderThrottle(secondaryLimit), true);
+  assert.equal(isProviderThrottle({status: 429, message: 'Too Many Requests'}), true);
+  assert.equal(isProviderThrottle('Retry-After: 60'), true);
+  assert.equal(isProviderThrottle('403: abuse detection mechanism triggered'), true);
+  assert.equal(isProviderThrottle('403: API rate limit exceeded'), true);
+  assert.equal(isProviderThrottle('403: API RATE_LIMITED'), true);
+  assert.equal(isProviderThrottle('secondary_rate_limit'), true);
+  assert.equal(isProviderThrottle('403 Forbidden: rate limit exceeded'), true);
+  assert.equal(isProviderThrottle('HTTP 403: Resource not accessible by integration'), false);
+  assert.equal(isProviderThrottle('Issue 403 documents rate limit behavior'), false);
+  assert.equal(isProviderThrottle('Issue 429 handles an ordinary response'), false);
+});
+
+test('persistent provider throttle clearance requires and records a founder decision', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-resource-clearance-'));
+  t.after(() => import('node:fs/promises').then(({rm}) => rm(root, {recursive: true, force: true})));
+  const file = path.join(root, 'resource-control.json');
+  const gatewayStateDir = path.join(root, 'gateway-state');
+  await tripPersistentProviderThrottle(file, {
+    provider: 'GitHub', signal: 'secondary rate limit', at: '2026-07-18T12:14:00Z', gatewayStateDir,
+  });
+  await assert.rejects(() => clearPersistentProviderThrottle(file, {gatewayStateDir}), /founder decision/i);
+  const clearance = await clearPersistentProviderThrottle(file, {
+    founderDecisionId: 'founder-rate-resume-1', at: '2026-07-18T15:00:00Z',
+    gatewayStateDir,
+  });
+  assert.equal(clearance.founder_decision_id, 'founder-rate-resume-1');
+  const control = await loadResourceControl(file);
+  assert.equal(control.provider_pause, null);
+  assert.deepEqual(control.provider_pause_clearances, [clearance]);
 });
 
 test('resource usage derives cumulative lane hours from prior task attempt records', async (t) => {
@@ -372,7 +448,10 @@ test('signed handoff requires every operational field and incoming confirmation'
     exception_lane_tasks: [], machine_disk_status: {disk_percent: 10, memory_percent: 20},
   };
   const handoff = createHandoff(payload, outgoing.privateKey);
-  assert.throws(() => confirmHandoff(handoff, outgoing.privateKey, '2026-07-17T12:05:00Z'), /distinct/i);
+  const sharedIdentityConfirmation = confirmHandoff(handoff, outgoing.privateKey, '2026-07-17T12:05:00Z');
+  assert.equal(verifyHandoff(sharedIdentityConfirmation, new Map([
+    [reviewerIdFromPublicKey(outgoing.publicKey), outgoing.publicKey],
+  ])), true);
   const confirmed = confirmHandoff(handoff, incoming.privateKey, '2026-07-17T12:05:00Z');
   const roster = new Map([
     [reviewerIdFromPublicKey(outgoing.publicKey), outgoing.publicKey],

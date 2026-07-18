@@ -1,0 +1,172 @@
+{
+  "schema_version": 2,
+  "mission_id": "M-033",
+  "task_id": "TASK-OSS-2F4BD311206662B9",
+  "attempt_sequence": 1,
+  "work_category": "defect_fix",
+  "authoring_mode": "test_only_then_fix",
+  "allow_modified_existing_tests": false,
+  "candidate": "status-im/status-go#7644",
+  "target_repo": "https://github.com/status-im/status-go",
+  "issue_url": "https://github.com/status-im/status-go/issues/7644",
+  "base_branch": "develop",
+  "base_commit": "c863f95ed457eb7e858d8b9c1ee74cc30e42d201",
+  "problem_statement": "wakuext_sendChatMessage accepts a reply whose non-empty responseTo identifies no stored message and returns a result instead of an error.",
+  "acceptance_criteria": [
+    "A non-empty responseTo must identify an existing message.",
+    "A nonexistent responseTo causes sendChatMessage to return an error before dispatching the message.",
+    "Replies to existing messages continue to succeed."
+  ],
+  "non_goals": [
+    "Do not change invalid-chat validation.",
+    "Do not change the Python SDK.",
+    "Do not add an option, flag, or new public API."
+  ],
+  "constraints": [
+    "Do not change invalid-chat validation.",
+    "Do not change the Python SDK.",
+    "Do not add an option, flag, or new public API.",
+    "Do not add dependencies, change lockfiles or CI, update generated output, add binaries or symlinks, or rename files.",
+    "Keep the contribution limited to production source and an oracle-bound regression test."
+  ],
+  "implementation_hints": [],
+  "process_requirements": [
+    "Comment on the issue before beginning work.",
+    "Wait for approval from a core contributor after the claim comment.",
+    "Work from a fork on develop; target develop and assign the PR to yourself.",
+    "Include regression tests and describe the affected area in the PR.",
+    "Use Conventional Commit formatting.",
+    "Obtain two core-developer reviews and satisfy the 50% patch-coverage requirement."
+  ],
+  "source_evidence": [
+    "services/ext/api.go:702 — return api.service.messenger.SendChatMessage(ctx, message)",
+    "protocol/messenger.go:2104 — chat, ok := m.allChats.Load(message.ChatId)",
+    "protocol/messenger.go:2173 — rawMessage, err = m.dispatchMessage(ctx, rawMessage)",
+    "protocol/messenger.go:2178 — msg, err := m.pullMessagesAndResponsesFromDB([]*common.Message{message})",
+    "protocol/message_persistence.go:760 — where := fmt.Sprintf(\"WHERE NOT(m1.hide) AND m1.id IN (%s)\", inVector)",
+    "protocol/messenger_reply_test.go:62 — replyMessage.ResponseTo = messageID",
+    "Makefile:564 — go test -v -tags '$(BUILD_TAGS)' $(PKG) -run '$(TEST)' $(if $(TESTIFY_M),-testify.m '$(TESTIFY_M)')",
+    "CONTRIBUTING.md:23 — 2. Wait for approval from one of the core contributors."
+  ],
+  "qualification": {
+    "finder_run_id": null,
+    "candidate_rank": null,
+    "finder_elapsed_ms": null,
+    "review_duration_ms": 213223,
+    "review_id": "sha256:1dd351682e95cfafe4456f277142bfc7377a525bc874dcc1ee09f139815fabdf",
+    "review_prompt_version": 3,
+    "reviewed_at": "2026-07-17T20:26:56.796Z",
+    "qualification_expires_at": "2026-07-17T22:26:56.796Z",
+    "evidence_sha256": "sha256:f9e2e3c5b5650c4dafc74a43c37b4b3861702554ad29812c8157397748074bf7",
+    "issue_updated_at": "2026-07-17T15:48:41Z",
+    "requested_model": "gpt-5.6-sol",
+    "actual_model": null,
+    "reasoning_effort": "xhigh",
+    "service_tier": "fast",
+    "model_requests": null,
+    "input_tokens": null,
+    "cached_input_tokens": null,
+    "output_tokens": null,
+    "reasoning_tokens": null,
+    "source_evidence": [
+      "services/ext/api.go:702 — return api.service.messenger.SendChatMessage(ctx, message)",
+      "protocol/messenger.go:2104 — chat, ok := m.allChats.Load(message.ChatId)",
+      "protocol/messenger.go:2173 — rawMessage, err = m.dispatchMessage(ctx, rawMessage)",
+      "protocol/messenger.go:2178 — msg, err := m.pullMessagesAndResponsesFromDB([]*common.Message{message})",
+      "protocol/message_persistence.go:760 — where := fmt.Sprintf(\"WHERE NOT(m1.hide) AND m1.id IN (%s)\", inVector)",
+      "protocol/messenger_reply_test.go:62 — replyMessage.ResponseTo = messageID",
+      "Makefile:564 — go test -v -tags '$(BUILD_TAGS)' $(PKG) -run '$(TEST)' $(if $(TESTIFY_M),-testify.m '$(TESTIFY_M)')",
+      "CONTRIBUTING.md:23 — 2. Wait for approval from one of the core contributors."
+    ],
+    "invitation_evidence": {
+      "type": "label",
+      "url": "https://github.com/status-im/status-go/issues/7644",
+      "observed_at": "2026-07-17T20:23:33.841Z"
+    },
+    "pre_author_notice_required": false,
+    "pre_author_notice": null,
+    "acceptance_contract": {
+      "problem": "wakuext_sendChatMessage accepts a reply whose non-empty responseTo identifies no stored message and returns a result instead of an error.",
+      "expected_behavior": [
+        "A non-empty responseTo must identify an existing message.",
+        "A nonexistent responseTo causes sendChatMessage to return an error before dispatching the message.",
+        "Replies to existing messages continue to succeed."
+      ],
+      "non_goals": [
+        "Do not change invalid-chat validation.",
+        "Do not change the Python SDK.",
+        "Do not add an option, flag, or new public API."
+      ],
+      "design_evidence": [
+        {
+          "url": "https://github.com/status-im/status-go/issues/7644",
+          "author_association": "MEMBER",
+          "summary": "The member-authored issue supplies the failing RPC input and states that an invalid responseTo currently returns result where invalid chatId returns error."
+        },
+        {
+          "url": "https://github.com/status-im/status-go/issues/7644#issuecomment-5004991034",
+          "author_association": "MEMBER",
+          "summary": "A repository member confirms that responseTo should be validated."
+        }
+      ]
+    },
+    "related_prs": []
+  },
+  "oracle": {
+    "kind": "regression_test",
+    "test_paths": [
+      "protocol/messenger_reply_test.go"
+    ],
+    "command": "make test-single PKG=./protocol TEST='^TestMessengerReplySuite$' TESTIFY_M='^TestInvalidResponseTo$'",
+    "base_expected": "nonzero",
+    "base_exit_code": 1,
+    "base_failure_contains": "TestInvalidResponseTo",
+    "patched_expected": "zero"
+  },
+  "pr": {
+    "title": "fix: Tier A candidate under the pilot Go profile. The current branch d",
+    "summary": "wakuext_sendChatMessage accepts a reply whose non-empty responseTo identifies no stored message and returns a result instead of an error."
+  },
+  "executor": {
+    "profile": "go",
+    "profile_status": "pilot",
+    "image": "golang:1.26.4-bookworm",
+    "install_commands": [
+      "go mod download"
+    ],
+    "commands": [
+      "make test-single PKG=./protocol TEST='^TestMessengerReplySuite$' TESTIFY_M='^TestInvalidResponseTo$'"
+    ],
+    "reasoning_effort": "xhigh",
+    "profile_production_proven": false
+  },
+  "receipt": {
+    "repo_policy_snapshot": {
+      "schema_version": 2,
+      "defaults": {
+        "max_open_prs": 1,
+        "daily_pr_cap": 1
+      },
+      "repositories": {
+        "prometheus/client_js": {
+          "max_open_prs": 0,
+          "daily_pr_cap": 0,
+          "cooldown_until": "manual-release",
+          "reason": "Maintainer bandwidth concern; a new contribution requires an explicit invitation."
+        }
+      },
+      "cooldowns": {
+        "prometheus/client_js": {
+          "reason": "Maintainer reported AI-generated PR bandwidth exhaustion on 2026-07-13; keep paused until the existing interaction is resolved or a maintainer explicitly invites new work.",
+          "evidence_url": "https://github.com/prometheus/client_js/pull/773#issuecomment-4953870322"
+        }
+      }
+    },
+    "checks_not_run": [],
+    "limitations": [
+      "Does not prove code quality",
+      "Does not prove security",
+      "Contributor self-run record of Northset's own contribution; not the maintainer's verification."
+    ]
+  }
+}

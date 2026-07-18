@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "protocol_id": "northset-receipt-campaign",
+  "amendment_id": "A1-github-api-budget-and-pacing",
+  "amends_version": "1.0.0",
+  "resulting_version": "1.1.0",
+  "status": "draft_pending_founder_signature",
+  "drafted_at": "2026-07-18T17:53:57Z",
+  "effective_at": null,
+  "prospective_only": true,
+  "no_regrading_prior_data": true,
+  "motivation": {
+    "incident_id": "github-secondary-rate-limit-20260718T121400Z",
+    "incident_class": "provider_rate_limit",
+    "evidence_file": "runs/phase1/shift3-go-a-tier-a-search-20260718.json",
+    "evidence_sha256": "9974b1cceaf7e58e5e4b28b62fdc03d5cf58547262a5023bd9421f32a1b86b91",
+    "root_cause": "Multiple concurrent workers issued GitHub Search and GraphQL screening requests from one account with no machine-wide coordination. Primary quotas were healthy; the burst shape tripped GitHub's dynamic secondary limit. Protocol v1 froze publication pacing and throttle stop behavior but did not govern read-side API traffic shape.",
+    "adversarial_review": "Codex adversarial review 2026-07-18 (session 019f75d8-c4da-7d13-b1ba-58a700434c43); all seven findings remediated before this draft."
+  },
+  "scope_note": "This amendment only adds controls and narrows permitted behavior. Every provision of protocol v1 remains in force unchanged. It judges no previously collected data.",
+  "adds": {
+    "github_api_budget_and_pacing": {
+      "single_gateway": {
+        "rule": "Every GitHub API request from campaign tooling (gh CLI and any api.github.com HTTP) MUST pass through the machine-wide gateway. Exactly one production GitHub spawn site is permitted, inside the gateway module.",
+        "git_push_rule": "Every outbound git push MUST obtain gateway authorization (hold, breaker, and latch check) immediately before the push and MUST append a content-free ledger event.",
+        "recorded_exclusions": [
+          "read-only git-protocol traffic against public repositories (clone, fetch, pull)",
+          "GitHub Pages content polling (*.github.io) at a bounded interval",
+          "GH Archive downloads (data.gharchive.org); these never touch the GitHub API"
+        ]
+      },
+      "concurrency": {
+        "github_requests_in_flight_machine_wide": 1
+      },
+      "pacing_floors": {
+        "minimum_between_any_two_requests_ms": 1000,
+        "uniform_jitter_added_ms_max": 500,
+        "minimum_before_search_class_request_ms": 6000,
+        "minimum_after_mutation_class_request_ms": 3000
+      },
+      "request_classes": ["search", "graphql", "rest_read", "mutation"],
+      "page_bounds": {
+        "search_and_list_requests_max_results_per_call": 100,
+        "multi_page_broad_sweeps": "prohibited (the 500-result multi-page search pattern that caused the incident is disallowed)"
+      },
+      "wave_budgets": {
+        "search_class_requires_declared_wave_with_budget": true,
+        "declared_budget_immutable_once_persisted": true,
+        "budget_inflation_by_redeclaration": "refused"
+      },
+      "daily_budget_aimd": {
+        "starting_cap_requests_per_utc_day": 2000,
+        "ceiling": 5000,
+        "floor": 500,
+        "alert_threshold_percent": 75,
+        "clean_day_definition": "UTC day with at least one gateway request and zero throttle detections",
+        "additive_increase_after_clean_day_percent": 20,
+        "multiplicative_decrease_after_throttled_day": 0.5,
+        "governs_capacity_only": true,
+        "never_clears_latches_holds_or_breakers": true,
+        "environment_overrides_require_founder_decision": true
+      },
+      "throttle_classification": {
+        "terminal_signals": [
+          "secondary rate limit message text",
+          "abuse detection message text",
+          "HTTP 429",
+          "Retry-After header or phrasing",
+          "HTTP 403 accompanied by rate-limit or abuse phrasing",
+          "exit-zero GraphQL responses whose errors[].type, errors[].code, or errors[].extensions.code is RATE_LIMITED in any casing or separator form"
+        ],
+        "on_detection": [
+          "no retry at any layer, ever",
+          "latch the durable gateway pause (auto_resume false)",
+          "trip the persistent phase-0 provider-throttle breaker",
+          "raise the PROVIDER_THROTTLED failure class (protocol v1 failure_taxonomy) as a global pipeline hold pending founder review"
+        ],
+        "hold_scope_actions": ["discover", "qualify", "prepare", "ship"],
+        "transient_retry_policy": {
+          "permitted_only_for": "HTTP 5xx and network-level errors (ECONNRESET, ETIMEDOUT, connection reset, service unavailable)",
+          "max_retries": 1,
+          "delay_ms": 500
+        }
+      },
+      "clearance": {
+        "founder_decision_only": true,
+        "founder_decision_id_globally_unique_never_reused": true,
+        "clearance_binds_cleared_pause_signal_and_tripped_at": true,
+        "already_cleared_holds_cannot_clear_new_pauses": true,
+        "verify_then_clear_under_gateway_lock": true,
+        "resume_sequence": "clear-hold, then exactly one rate_limit probe through the gateway before any other request"
+      },
+      "request_accounting": {
+        "ledger_file": "runs/gh-request-ledger.jsonl",
+        "daily_budget_state_file": "runs/gh-gateway-state/daily-request-budget.json",
+        "every_request_ledgered_with_redacted_argv": true,
+        "ledger_event_kinds": ["request", "budget_alert", "lock_reclaimed", "git_push"],
+        "redaction": "PR bodies, field payload values, tokens, and credential query parameters never appear in ledger entries"
+      },
+      "discovery_policy": {
+        "order_of_preference": [
+          "candidate lake within its 48h freshness window",
+          "GH Archive offline mining (zero GitHub API)",
+          "live GitHub search as bounded precision top-up under a declared wave budget"
+        ],
+        "just_in_time_verification": "live GitHub checks are reserved for JIT verification of candidates about to be used, via batched GraphQL"
+      },
+      "gateway_safety_invariants": {
+        "hard_request_timeout_must_be_below_stale_lock_threshold": true,
+        "current_defaults_informative": {
+          "hard_request_timeout_ms": 120000,
+          "stale_lock_threshold_ms": 600000,
+          "lock_heartbeat_ms": 5000
+        },
+        "lock_reclaim_requires": "stale heartbeat AND (holder process dead OR process start identity mismatch); reclaim is ledgered and resets pacing"
+      },
+      "enforcement_modules_informative": [
+        "gh-gateway.mjs",
+        "campaign/phase0/resource-breakers.mjs",
+        "campaign/phase1/controls.mjs",
+        "campaign/phase1/controls-cli.mjs",
+        "campaign/phase1/runtime-guard.mjs",
+        "archive-miner.mjs",
+        "find-candidates.mjs"
+      ]
+    }
+  },
+  "deviations_recorded": [
+    "Clearances are bound and replay-proof but not cryptographically signed; decision-ID uniqueness plus signal/tripped_at binding covers the replay threat for a founder-local CLI.",
+    "The three-record clearance (campaign hold, phase-0 breaker, gateway latch) is mismatch-atomic under the gateway lock but not crash-transactional across its three JSON files; a crash mid-clear leaves a visibly partial state that refuses requests rather than resuming.",
+    "Read-only public git traffic and Pages polling intentionally remain outside the gateway; they are not GitHub API traffic."
+  ],
+  "signing_instructions": "Per amendment_control in protocol v1: the founder signs by (1) setting status to signed, (2) setting effective_at to a time at or after signing and before any behavior this amendment governs is relied upon, (3) recording a globally unused founder_decision_id below, (4) computing sha256 over this file with the signature block fields at their pre-signature values and recording it in the founder decision record. No prior data is regraded.",
+  "signature": {
+    "signed": false,
+    "founder_decision_id": null,
+    "signed_at": null
+  }
+}
