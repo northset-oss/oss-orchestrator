@@ -4,9 +4,9 @@
   "amendment_id": "A1-github-api-budget-and-pacing",
   "amends_version": "1.0.0",
   "resulting_version": "1.1.0",
-  "status": "draft_pending_founder_signature",
+  "status": "signed",
   "drafted_at": "2026-07-18T17:53:57Z",
-  "effective_at": null,
+  "effective_at": "2026-07-18T18:02:06Z",
   "prospective_only": true,
   "no_regrading_prior_data": true,
   "motivation": {
@@ -132,8 +132,9 @@
   ],
   "signing_instructions": "Per amendment_control in protocol v1: the founder signs by (1) setting status to signed, (2) setting effective_at to a time at or after signing and before any behavior this amendment governs is relied upon, (3) recording a globally unused founder_decision_id below, (4) computing sha256 over this file with the signature block fields at their pre-signature values and recording it in the founder decision record. No prior data is regraded.",
   "signature": {
-    "signed": false,
-    "founder_decision_id": null,
-    "signed_at": null
+    "signed": true,
+    "founder_decision_id": "founder-2026-07-18-protocol-amendment-a1-signed",
+    "signed_at": "2026-07-18T18:02:06Z",
+    "draft_sha256": "7409b9405c9ebd501aba1ab37a506824874fab52341d953849363f0e5bd60d5f"
   }
 }
