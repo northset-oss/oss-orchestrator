@@ -26,6 +26,7 @@ import {
   lowValueReason,
   mechanicalDecision,
   mergeIncludedCandidates,
+  ModelProviderThrottleError,
   normalizeLabel,
   normalizePreflight,
   normalizeRestSearchIssue,
@@ -46,6 +47,7 @@ const digest = (char) => `sha256:${char.repeat(64)}`;
 
 function gatewayTestEnv(root) {
   return {
+    OSS_GH_CANONICAL_ROOT: root,
     OSS_GH_GATEWAY_TEST_MODE: '1',
     OSS_GH_GATEWAY_TEST_MIN_SPACING_MS: '0',
     OSS_GH_GATEWAY_TEST_SEARCH_SPACING_MS: '0',
@@ -458,6 +460,110 @@ test('qualify hard-stops on a terminal reviewer gateway marker without recording
   assert.deepEqual(await lake.candidateStates({candidate: value.candidate}), []);
 });
 
+test('qualify latches only a trusted structured model 429 and stops its remaining lane', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'finder-qualify-model-stop-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const resourceControlFile = path.join(root, 'resource-control.json');
+  const gatewayOptions = {stateDir: path.join(root, 'gateway-state')};
+
+  const negativeLake = await openCandidateLake(path.join(root, 'negative.sqlite'));
+  const negativeValue = preflight();
+  const negativeEvidence = candidateEvidenceKey({
+    candidate: negativeValue.candidate, base_commit: negativeValue.repository.default_head,
+    issue_updated_at: negativeValue.issue.updated_at, labels: negativeValue.issue.labels, assignees: [],
+    comments_tail_sha256: digest('1'), timeline_prs_sha256: digest('2'), repo_policy_sha256: digest('3'),
+  });
+  await negativeLake.upsertIssue({...negativeValue, evidence_key: negativeEvidence, profile: 'node', raw: negativeValue});
+  const [negative] = await qualifyQueueRecords([{
+    candidate: negativeValue.candidate, evidence_key: negativeEvidence, preflight: negativeValue,
+    repository_profile: {known_test_command: true},
+  }], {
+    lake: negativeLake,
+    profile: 'node',
+    resourceControlFile,
+    gatewayOptions,
+    reviewRunner: async () => ({
+      code: 1,
+      stdout: 'HTTP 429 Too Many Requests',
+      stderr: 'secondary rate limit; honor Retry-After',
+    }),
+  });
+  assert.equal(negative.state, 'REVIEW_TOOL_ERROR');
+  await assert.rejects(() => readFile(resourceControlFile), {code: 'ENOENT'});
+
+  const positiveLake = await openCandidateLake(path.join(root, 'positive.sqlite'));
+  const queue = [];
+  for (const number of [21, 22, 23]) {
+    const value = preflight({
+      candidate: `owner/repo#${number}`,
+      issue: {...negativeValue.issue, number, url: `https://github.com/owner/repo/issues/${number}`},
+    });
+    const evidenceKey = candidateEvidenceKey({
+      candidate: value.candidate, base_commit: value.repository.default_head,
+      issue_updated_at: value.issue.updated_at, labels: value.issue.labels, assignees: [],
+      comments_tail_sha256: digest('4'), timeline_prs_sha256: digest('5'), repo_policy_sha256: digest('6'),
+    });
+    await positiveLake.upsertIssue({...value, evidence_key: evidenceKey, profile: 'node', raw: value});
+    queue.push({candidate: value.candidate, evidence_key: evidenceKey,
+      preflight: {...value, repo_policy_sha256: digest('6')},
+      repository_profile: {known_test_command: true}});
+  }
+  const reviewCalls = path.join(root, 'model-review-calls.jsonl');
+  const siblingStarted = path.join(root, 'model-review-sibling-started');
+  const obsoleteCompletion = path.join(root, 'model-review-obsolete-completed');
+  const reviewer = path.join(root, 'structured-reviewer.mjs');
+  await writeFile(reviewer, `#!/usr/bin/env node
+import {appendFileSync, existsSync, writeFileSync} from 'node:fs';
+import {setTimeout as delay} from 'node:timers/promises';
+const args = process.argv.slice(2);
+const candidate = args[0];
+appendFileSync(${JSON.stringify(reviewCalls)}, candidate + '\\n');
+if (candidate.endsWith('#22')) {
+  writeFileSync(${JSON.stringify(siblingStarted)}, 'started\\n');
+  await delay(10_000);
+  writeFileSync(${JSON.stringify(obsoleteCompletion)}, 'completed\\n');
+  process.exit(2);
+}
+for (let attempt = 0; attempt < 200 && !existsSync(${JSON.stringify(siblingStarted)}); attempt += 1) {
+  await delay(10);
+}
+if (!existsSync(${JSON.stringify(siblingStarted)})) throw new Error('sibling reviewer did not start');
+writeFileSync(process.env.OSS_MODEL_RUNNER_STATUS_FILE, JSON.stringify({
+  schema_version: 1,
+  kind: 'MODEL_PROVIDER_ERROR',
+  trusted_model_provider_error: {
+    schema_version: 1,
+    source: 'model_runner_transport',
+    provider: 'OpenAI',
+    http_status: 429,
+    error_code: 'rate_limit_exceeded',
+  },
+}) + '\\n');
+process.exit(1);
+`);
+  await chmod(reviewer, 0o755);
+  const qualificationStartedMs = Date.now();
+  await assert.rejects(() => qualifyQueueRecords(queue, {
+    lake: positiveLake,
+    profile: 'node',
+    concurrency: 2,
+    reviewScript: reviewer,
+    reviewTimeoutMs: 15_000,
+    resourceControlFile,
+    gatewayOptions,
+  }), (error) => error instanceof ModelProviderThrottleError && error.retryable === false);
+  assert.ok(Date.now() - qualificationStartedMs < 5_000, 'active sibling reviewer was not cancelled promptly');
+  assert.deepEqual((await readFile(reviewCalls, 'utf8')).trim().split('\n').sort(), ['owner/repo#21', 'owner/repo#22']);
+  await assert.rejects(() => readFile(obsoleteCompletion), {code: 'ENOENT'});
+  const control = JSON.parse(await readFile(resourceControlFile, 'utf8'));
+  assert.equal(control.provider_pause.provider, 'OpenAI');
+  assert.equal(control.provider_pause.signal, 'OPENAI_MODEL_RATE_LIMIT');
+  assert.equal(control.provider_pause.auto_resume, false);
+  for (const record of queue) {
+    assert.deepEqual(await positiveLake.candidateStates({candidate: record.candidate}), []);
+  }
+});
+
 test('qualify reuses only an unexpired exact-evidence review and refuses a stale queue', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'finder-qualify-cache-'));
   t.after(() => rm(root, {recursive: true, force: true}));
@@ -678,7 +784,7 @@ test('qualify command enforces the activated Phase-1 JIT window before review st
     '--lake', path.join(root, 'lake.sqlite'),
     '--out', path.join(root, 'qualifications.json'),
     '--phase1-runtime', runtime,
-  ], process.env);
+  ], {...process.env, ...gatewayTestEnv(root)});
   assert.equal(result.code, 1);
   assert.match(result.stderr, /Phase-1 runtime blocked qualify: OUTSIDE_JIT_WINDOW/);
 });

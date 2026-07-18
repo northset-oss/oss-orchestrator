@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "incidents": [
+    {
+      "incident_id": "phase1-pr39-unauthorized-publication",
+      "severity": "SEV_1",
+      "scope": "platform",
+      "event_class": "unauthorized_publication",
+      "incident_class": "authorization",
+      "occurred_at": "2026-07-17T20:36:59.000Z",
+      "evidence_url": "https://github.com/northset-oss/verification-pilot/pull/39",
+      "disposition": "retained_after_live_state_and_public_suite_verification",
+      "repository": null
+    },
+    {
+      "incident_id": "github-secondary-rate-limit-20260718T121400Z",
+      "severity": "SEV_1",
+      "scope": "platform",
+      "event_class": "platform_warning",
+      "incident_class": "provider_rate_limit",
+      "occurred_at": "2026-07-18T12:14:00.000Z",
+      "evidence_file": "runs/phase1/shift3-go-a-tier-a-search-20260718.json",
+      "evidence_sha256": "9974b1cceaf7e58e5e4b28b62fdc03d5cf58547262a5023bd9421f32a1b86b91",
+      "provider": "GitHub",
+      "signal": "secondary_rate_limit",
+      "disposition": "global_pipeline_hold_pending_founder_review_no_auto_resume",
+      "repository": null
+    }
+  ],
+  "closures": [],
+  "hold_clearances": [
+    {
+      "hold_id": "incident:phase1-pr39-unauthorized-publication",
+      "founder_decision_id": "founder-2026-07-17-pr39-retain-after-live-verification",
+      "cleared_at": "2026-07-17T23:10:10.005Z"
+    }
+  ]
+}

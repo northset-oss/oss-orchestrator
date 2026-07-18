@@ -114,6 +114,55 @@ test('cached hours skip fetch and missing language enrichment passes candidates 
   assert.deepEqual((await loadDiscoveryFile(settings.outputFile)).map((item) => item.key), ['owner/repo#1']);
 });
 
+test('corrupt cached hours are quarantined and recover by downloading on the next run', async (t) => {
+  const corruptFixtures = [
+    {name: 'empty', bytes: Buffer.alloc(0), error: /empty/},
+    {name: 'bad gzip magic', bytes: Buffer.from('not gzip'), error: /gzip magic/},
+    {name: 'invalid decompressed JSON', bytes: gzipSync('{broken json}\n'), error: /invalid JSON/},
+  ];
+
+  for (const fixture of corruptFixtures) {
+    await t.test(fixture.name, async (t) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'archive-corrupt-cache-'));
+      t.after(() => rm(root, {recursive: true, force: true}));
+      const settings = config(root);
+      const hour = archiveHourId(settings.from);
+      const cacheFile = path.join(settings.cacheDir, `${hour}.json.gz`);
+      await mkdir(settings.cacheDir, {recursive: true});
+      await writeFile(cacheFile, fixture.bytes);
+      let fetchCalls = 0;
+
+      const first = await mineArchives(settings, {
+        clock: () => 1_721_260_800_000,
+        fetchImpl: async () => { fetchCalls += 1; throw new Error('network forbidden on quarantine run'); },
+      });
+
+      assert.equal(fetchCalls, 0);
+      assert.equal(first.state, 'PARTIAL');
+      assert.equal(first.manifest.failed_hours.length, 1);
+      assert.match(first.manifest.failed_hours[0].error, fixture.error);
+      assert.equal(first.manifest.quarantined_hours.length, 1);
+      const quarantine = first.manifest.quarantined_hours[0];
+      assert.equal(quarantine.hour, hour);
+      assert.equal(quarantine.cache_file, cacheFile);
+      assert.equal(quarantine.quarantine_file, `${cacheFile}.corrupt-1721260800000`);
+      assert.match(quarantine.reason, fixture.error);
+      assert.deepEqual(await readFile(quarantine.quarantine_file), fixture.bytes);
+      await assert.rejects(readFile(cacheFile), {code: 'ENOENT'});
+
+      const second = await mineArchives(settings, {
+        fetchImpl: async () => { fetchCalls += 1; return response(200, [issueEvent()]); },
+      });
+
+      assert.equal(fetchCalls, 1);
+      assert.equal(second.state, 'COMPLETE');
+      assert.equal(second.manifest.mined_hours.length, 1);
+      assert.equal(second.manifest.quarantined_hours.length, 0);
+      assert.deepEqual(second.unscreened_candidates.map((item) => item.candidate), ['owner/repo#1']);
+    });
+  }
+});
+
 test('available local-lake enrichment applies the optional language filter read-only', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'archive-language-'));
   t.after(() => rm(root, {recursive: true, force: true}));
@@ -202,6 +251,7 @@ test('body-read failure preserves prior candidates in a written partial manifest
 
 function gatewayTestEnv(root) {
   return {
+    OSS_GH_CANONICAL_ROOT: root,
     OSS_GH_GATEWAY_TEST_MODE: '1',
     OSS_GH_GATEWAY_TEST_MIN_SPACING_MS: '0',
     OSS_GH_GATEWAY_TEST_SEARCH_SPACING_MS: '0',

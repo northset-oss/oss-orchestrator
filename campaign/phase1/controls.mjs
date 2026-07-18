@@ -144,8 +144,19 @@ export async function openCampaignControls(file, {
         throw new Error('repository incident requires owner/repo');
       }
       if (!Number.isFinite(Date.parse(input.occurred_at ?? ''))) throw new Error('incident occurred_at is invalid');
+      const githubProviderThrottle = input.incident_class === 'provider_rate_limit' && input.provider === 'GitHub';
+      if (githubProviderThrottle && (typeof input.signal !== 'string' || !input.signal.trim() ||
+          !Number.isFinite(Date.parse(input.tripped_at ?? '')))) {
+        throw new Error('GitHub provider throttle incidents require signal and tripped_at binding metadata');
+      }
+      const occurredAt = new Date(input.occurred_at).toISOString();
+      const trippedAt = githubProviderThrottle ? new Date(input.tripped_at).toISOString() : null;
+      if (githubProviderThrottle && trippedAt !== occurredAt) {
+        throw new Error('GitHub provider throttle incident tripped_at conflicts with occurred_at');
+      }
       const normalized = {...input, repository: input.repository?.toLowerCase() ?? null,
-        occurred_at: new Date(input.occurred_at).toISOString()};
+        occurred_at: occurredAt,
+        ...(githubProviderThrottle ? {signal: input.signal.trim(), tripped_at: trippedAt} : {})};
       return withGatewayLock({
         gatewayLockHeld,
         gatewayStateDir: writerGatewayStateDir,
@@ -154,7 +165,12 @@ export async function openCampaignControls(file, {
         state = await readState(absolute);
         const existing = state.incidents.find((item) => item.incident_id === normalized.incident_id);
         if (existing) {
-          if (!sameRecord(existing, normalized)) throw new Error('incident ID is a conflicting replay');
+          if (!sameRecord(existing, normalized)) {
+            const error = new Error('incident ID is a conflicting replay');
+            error.code = 'CAMPAIGN_INCIDENT_CONFLICTING_REPLAY';
+            error.incident_id = normalized.incident_id;
+            throw error;
+          }
           return existing;
         }
         state.incidents.push(normalized);
@@ -221,6 +237,44 @@ export async function openCampaignControls(file, {
         incident: incident ?? null,
         clearance: state.hold_clearances.find((item) => item.hold_id === hold_id) ?? null,
       };
+    },
+
+    async migrateProviderThrottleBinding({incident_id, signal, tripped_at, migrated_at} = {}, {
+      gatewayLockHeld = false,
+      gatewayStateDir: writerGatewayStateDir = gatewayStateDir,
+      gatewayLockOptions: writerGatewayLockOptions = gatewayLockOptions,
+    } = {}) {
+      if (typeof incident_id !== 'string' || !incident_id.trim() ||
+          typeof signal !== 'string' || !signal.trim() || !Number.isFinite(Date.parse(tripped_at ?? '')) ||
+          !Number.isFinite(Date.parse(migrated_at ?? ''))) {
+        throw new Error('provider throttle incident migration binding is invalid');
+      }
+      return withGatewayLock({
+        gatewayLockHeld,
+        gatewayStateDir: writerGatewayStateDir,
+        gatewayLockOptions: writerGatewayLockOptions,
+      }, async () => {
+        state = await readState(absolute);
+        const index = state.incidents.findIndex((item) => item.incident_id === incident_id.trim());
+        const incident = state.incidents[index];
+        if (!incident || incident.incident_class !== 'provider_rate_limit' || incident.provider !== 'GitHub') {
+          throw new Error('provider throttle incident migration target is missing or invalid');
+        }
+        const canonicalTrip = new Date(tripped_at).toISOString();
+        const occurredAt = Number.isFinite(Date.parse(incident.occurred_at ?? ''))
+          ? new Date(incident.occurred_at).toISOString() : null;
+        const existingTrip = Number.isFinite(Date.parse(incident.tripped_at ?? ''))
+          ? new Date(incident.tripped_at).toISOString() : null;
+        if (occurredAt !== canonicalTrip || (existingTrip !== null && existingTrip !== canonicalTrip)) {
+          throw new Error('provider throttle incident migration trip time conflicts with its recorded occurrence');
+        }
+        const normalized = {...incident, signal: signal.trim(), tripped_at: canonicalTrip,
+          migrated_at: new Date(migrated_at).toISOString()};
+        if (sameRecord(incident, normalized)) return {incident, changed: false};
+        state.incidents[index] = normalized;
+        await save();
+        return {incident: normalized, changed: true};
+      });
     },
 
     founderDecisionUsed(founderDecisionId) {

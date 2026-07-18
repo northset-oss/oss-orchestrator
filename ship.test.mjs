@@ -42,7 +42,7 @@ test('live recheck never falls back after a gateway throttle stop', async () => 
   assert.equal(calls, 1);
 });
 
-test('every outbound git push is authorized under the gateway lock and recorded without content', async () => {
+test('every outbound git push is authorized and finalized under the gateway lock', async () => {
   const ship = await import('./ship.mjs');
   const events = [];
   const result = await ship.guardedGitPush(null, '/tmp/offline-repo', 'owner/repo', [
@@ -58,17 +58,117 @@ test('every outbound git push is authorized under the gateway lock and recorded 
       events.push(['run', deadline, commandName, args]);
       return {code: 0, stdout: '', stderr: ''};
     },
-    recordLedgerEvent: async (event, options) => events.push(['ledger', event, options]),
+    recordTransportResult: async (transport, options) => events.push(['transport', transport, options]),
   });
   assert.equal(result.code, 0);
-  assert.deepEqual(events.map(([event]) => event), ['lock', 'assert', 'run', 'ledger', 'unlock']);
+  assert.deepEqual(events.map(([event]) => event), ['lock', 'assert', 'run', 'transport', 'unlock']);
   assert.equal(events[1][1].gatewayLockHeld, true);
   assert.deepEqual(events[2][3], [
     '-C', '/tmp/offline-repo', 'push', 'origin', 'HEAD:refs/heads/test',
   ]);
-  assert.deepEqual(events[3][1], {class: 'git_push', repo_target: 'owner/repo'});
+  assert.deepEqual(events[3][1], {
+    class: 'git_push',
+    repoTarget: 'owner/repo',
+    result: {code: 0, stdout: '', stderr: ''},
+  });
   assert.equal(events[3][2].gatewayLockHeld, true);
   assert.equal(JSON.stringify(events[3]).includes('HEAD:refs/heads/test'), false);
+});
+
+test('git push secondary-limit output trips gateway latch, breaker, and campaign incident', async (t) => {
+  const ship = await import('./ship.mjs');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-ship-push-throttle-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const gatewayOptions = {
+    stateDir: path.join(root, 'gateway'),
+    resourceControlFile: path.join(root, 'phase0', 'resource-control.json'),
+    controlStateFile: path.join(root, 'phase1', 'control-state.json'),
+    ledgerFile: path.join(root, 'gh-request-ledger.jsonl'),
+    testMode: true,
+    now: () => Date.parse('2026-07-18T12:14:00.000Z'),
+    timing: {minSpacingMs: 0, searchSpacingMs: 0, mutationSpacingMs: 0, jitterMaxMs: 0},
+  };
+  const secondaryLimit = await readFile(
+    new URL('./campaign/phase1/fixtures/github-secondary-rate-limit-20260718.json', import.meta.url),
+    'utf8',
+  );
+
+  await assert.rejects(() => ship.guardedGitPush(
+    null,
+    '/tmp/offline-repo',
+    'owner/repo',
+    ['origin', 'HEAD:refs/heads/test'],
+    {
+      gatewayOptions,
+      runCommand: async () => ({code: 0, stdout: secondaryLimit, stderr: ''}),
+    },
+  ), (error) => error?.code === 'GITHUB_PROVIDER_THROTTLED' &&
+    error?.signal === 'GITHUB_SECONDARY_RATE_LIMIT');
+
+  const [gateway, resourceControl, campaignControl] = await Promise.all([
+    readFile(path.join(gatewayOptions.stateDir, 'state.json'), 'utf8').then(JSON.parse),
+    readFile(gatewayOptions.resourceControlFile, 'utf8').then(JSON.parse),
+    readFile(gatewayOptions.controlStateFile, 'utf8').then(JSON.parse),
+  ]);
+  const incident = campaignControl.incidents.find((item) =>
+    item.incident_id === gateway.provider_pause.incident_id);
+  assert.ok(incident, 'campaign incident must bind to the gateway incident ID');
+  assert.equal(gateway.provider_pause.signal, 'GITHUB_SECONDARY_RATE_LIMIT');
+  assert.equal(resourceControl.provider_pause.incident_id, gateway.provider_pause.incident_id);
+  assert.equal(resourceControl.provider_pause.signal, gateway.provider_pause.signal);
+  assert.equal(resourceControl.provider_pause.tripped_at, gateway.provider_pause.tripped_at);
+  assert.equal(incident.signal, gateway.provider_pause.signal);
+  assert.equal(incident.tripped_at, gateway.provider_pause.tripped_at);
+  assert.equal(gateway.pending_incident, null);
+  assert.equal(gateway.last_request_at_ms, Date.parse('2026-07-18T12:14:00.000Z'));
+});
+
+test('git remote-helper 429 still latches every throttle record when the transport ledger is unwritable', async (t) => {
+  const ship = await import('./ship.mjs');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-ship-push-ledger-failure-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const gatewayOptions = {
+    stateDir: path.join(root, 'gateway'),
+    resourceControlFile: path.join(root, 'phase0', 'resource-control.json'),
+    controlStateFile: path.join(root, 'phase1', 'control-state.json'),
+    ledgerFile: path.join(root, 'unwritable-ledger'),
+    testMode: true,
+    now: () => Date.parse('2026-07-18T12:15:00.000Z'),
+    timing: {minSpacingMs: 0, searchSpacingMs: 0, mutationSpacingMs: 0, jitterMaxMs: 0},
+  };
+  await mkdir(gatewayOptions.ledgerFile);
+  let throttle;
+  try {
+    await ship.guardedGitPush(
+      null,
+      '/tmp/offline-repo',
+      'owner/repo',
+      ['origin', 'HEAD:refs/heads/test'],
+      {
+        gatewayOptions,
+        runCommand: async () => ({
+          code: 128,
+          stdout: '',
+          stderr: 'fatal: unable to access remote: The requested URL returned error: 429',
+        }),
+      },
+    );
+  } catch (error) {
+    throttle = error;
+  }
+  assert.ok(throttle instanceof GitHubThrottleError);
+  assert.equal(throttle.signal, 'HTTP_429');
+  assert.equal(throttle.cause?.code, 'EISDIR');
+  const [gateway, resourceControl, campaignControl] = await Promise.all([
+    readFile(path.join(gatewayOptions.stateDir, 'state.json'), 'utf8').then(JSON.parse),
+    readFile(gatewayOptions.resourceControlFile, 'utf8').then(JSON.parse),
+    readFile(gatewayOptions.controlStateFile, 'utf8').then(JSON.parse),
+  ]);
+  assert.equal(gateway.provider_pause.signal, 'HTTP_429');
+  assert.equal(gateway.pending_incident, null);
+  assert.equal(resourceControl.provider_pause.incident_id, gateway.provider_pause.incident_id);
+  assert.ok(campaignControl.incidents.some((incident) =>
+    incident.incident_id === gateway.provider_pause.incident_id));
 });
 
 test('ship never retries or aggregates past a terminal GitHub gateway stop', async () => {
@@ -88,6 +188,42 @@ test('ship never retries or aggregates past a terminal GitHub gateway stop', asy
   await assert.rejects(() => runIndependentBatch([{id: 'M-THROTTLE'}], async () => {
     throw throttle;
   }), (error) => error === throttle);
+});
+
+test('shipBatch real rate-safety gate cannot be disabled by adapter overrides', async (t) => {
+  const {shipBatch} = await import('./ship.mjs');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-ship-rate-gate-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const resourceControlFile = path.join(root, 'phase0', 'resource-control.json');
+  await mkdir(path.dirname(resourceControlFile), {recursive: true});
+  await writeFile(resourceControlFile, `${JSON.stringify({
+    schema_version: 1,
+    provider_pause: {
+      kind: 'PROVIDER_THROTTLED',
+      provider: 'GitHub',
+      signal: 'GITHUB_SECONDARY_RATE_LIMIT',
+      tripped_at: '2026-07-18T12:00:00.000Z',
+      auto_resume: false,
+    },
+    exception_task_ids: [],
+    active_exception: null,
+  })}\n`);
+  let overrideCalls = 0;
+  await assert.rejects(() => shipBatch([], {
+    adapter: {
+      assertGhRateSafetyAllowsAction: async () => {
+        overrideCalls += 1;
+        return true;
+      },
+    },
+    gatewayOptions: {
+      stateDir: path.join(root, 'gateway'),
+      resourceControlFile,
+      controlStateFile: path.join(root, 'phase1', 'control-state.json'),
+      ledgerFile: path.join(root, 'gh-request-ledger.jsonl'),
+    },
+  }), /persistent provider-throttle breaker is active/i);
+  assert.equal(overrideCalls, 0);
 });
 
 function subject(id, repo) {

@@ -1,16 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdir, mkdtemp, readFile, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import {
   evidenceBackstopsResult,
   enforceConservativeVerdict,
+  evidenceTruncationReasons,
   findExactOpenPrs,
   hardGateReasons,
   parseIssue,
   possibleSemanticPrs,
+  requireReviewModelRunnerSuccess,
   reviewerCandidateEvidenceKey,
   sameRepositoryOpenPrs,
   validatedInvitation,
@@ -21,6 +23,34 @@ import {canonical, sha256, taskIdForCandidate} from './core.mjs';
 import {candidateEvidenceKey} from './candidate-lake.mjs';
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
+
+test('review model runner emits only a trusted structured provider-error receipt', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-review-model-status-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const attackerReceipt = path.join(root, 'attacker.json');
+  await assert.rejects(() => requireReviewModelRunnerSuccess({
+    code: 1,
+    stdout: 'HTTP 429 Too Many Requests',
+    stderr: 'secondary rate limit; honor Retry-After',
+  }, {statusFile: attackerReceipt}), /codex review failed/);
+  await assert.rejects(() => readFile(attackerReceipt), {code: 'ENOENT'});
+
+  const trustedReceipt = path.join(root, 'trusted.json');
+  await assert.rejects(() => requireReviewModelRunnerSuccess({
+    code: 1,
+    stdout: [
+      JSON.stringify({type: 'item.completed', item: {type: 'agent_message',
+        text: 'candidate-controlled HTTP 429 secondary rate limit'}}),
+      JSON.stringify({type: 'turn.failed', error: {message: 'transport failed', codexErrorInfo: {
+        responseStreamConnectionFailed: {httpStatusCode: 429},
+      }}}),
+    ].join('\n'),
+    stderr: '',
+  }, {statusFile: trustedReceipt}), /codex review failed/);
+  const receipt = JSON.parse(await readFile(trustedReceipt, 'utf8'));
+  assert.equal(receipt.kind, 'MODEL_PROVIDER_ERROR');
+  assert.equal(receipt.trusted_model_provider_error.http_status, 429);
+});
 
 test('parses a machine key and a clean issue URL', () => {
   assert.deepEqual(parseIssue('owner/repo#123'), {
@@ -63,6 +93,18 @@ test('GitHub evidence uses the gateway and bounds pull-request history to one pa
   assert.match(source, /command === 'gh'[\s\S]*runGhCommand/);
   assert.match(source, /\['pr', 'list',[\s\S]*?'--limit', '100'/);
   assert.doesNotMatch(source, /'--limit', '500'/);
+  assert.doesNotMatch(source, /'--paginate'|'--slurp'/);
+});
+
+test('reviewer mechanically rejects evidence beyond the comments or timeline bounds', () => {
+  assert.deepEqual(evidenceTruncationReasons({
+    issueMeta: {comments: 301},
+    evidence_bounds: {timeline: {truncated: false}},
+  }), ['evidence_truncated_too_active: issue has 301 comments, above the 300-item evidence bound']);
+  assert.deepEqual(evidenceTruncationReasons({
+    issueMeta: {comments: 10},
+    evidence_bounds: {timeline: {truncated: true}},
+  }), ['evidence_truncated_too_active: issue timeline reached the 300-item evidence bound']);
 });
 
 test('reviewer live facts recompute the same canonical queued evidence identity', () => {

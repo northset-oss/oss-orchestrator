@@ -33,6 +33,7 @@ import {
   remainingTaskLaneMs,
   ResourceBreakers,
   resourceUsageForTask,
+  trustedModelProviderErrorFromCodexJsonl,
   tripPersistentProviderThrottle,
 } from './resource-breakers.mjs';
 import {
@@ -202,7 +203,9 @@ test('provider throttle writes a durable no-auto-resume pause', async (t) => {
   const control = await loadResourceControl(file);
   assert.deepEqual(control.provider_pause, {
     kind: 'PROVIDER_THROTTLED', provider: 'OpenAI', signal: '429',
-    tripped_at: '2026-07-17T12:00:00Z', auto_resume: false,
+    tripped_at: '2026-07-17T12:00:00.000Z',
+    incident_id: 'openai-provider-throttle-2026-07-17T12:00:00.000Z',
+    auto_resume: false,
   });
   assert.throws(() => assertTaskResourcePolicy({task_id: 'TASK-2', attempt_sequence: 1}, control), /founder review/i);
 });
@@ -248,7 +251,10 @@ test('provider throttle classification covers GitHub secondary limits without tr
   };
   assert.equal(isProviderThrottle(secondaryLimit), true);
   assert.equal(isProviderThrottle({status: 429, message: 'Too Many Requests'}), true);
-  assert.equal(isProviderThrottle('Retry-After: 60'), true);
+  assert.equal(isProviderThrottle('Retry-After: 60'), false);
+  assert.equal(isProviderThrottle('GitHub rate limit Retry-After: 60'), true);
+  assert.equal(isProviderThrottle('we should throttle the worker pool and honor retry-after',
+    {source: 'model_runner'}), false);
   assert.equal(isProviderThrottle('403: abuse detection mechanism triggered'), true);
   assert.equal(isProviderThrottle('403: API rate limit exceeded'), true);
   assert.equal(isProviderThrottle('403: API RATE_LIMITED'), true);
@@ -257,6 +263,72 @@ test('provider throttle classification covers GitHub secondary limits without tr
   assert.equal(isProviderThrottle('HTTP 403: Resource not accessible by integration'), false);
   assert.equal(isProviderThrottle('Issue 403 documents rate limit behavior'), false);
   assert.equal(isProviderThrottle('Issue 429 handles an ordinary response'), false);
+  assert.equal(isProviderThrottle('The requested URL returned error: 429'), false);
+  assert.equal(isProviderThrottle('error: 429'), false);
+  assert.equal(isProviderThrottle('The requested URL returned error: 429', {source: 'git_transport'}), true);
+  assert.equal(isProviderThrottle('error: 429', {source: 'git_transport'}), true);
+});
+
+test('model-runner throttle classification trusts only its structured transport field', () => {
+  const attackerText = {
+    code: 429,
+    status: 429,
+    stdout: 'HTTP 429 Too Many Requests',
+    stderr: 'You have exceeded a secondary rate limit; honor Retry-After.',
+    body: {message: 'provider throttled'},
+  };
+  assert.equal(isProviderThrottle(attackerText, {source: 'model_runner'}), false);
+  assert.equal(isProviderThrottle({
+    ...attackerText,
+    trusted_model_provider_error: {
+      schema_version: 1,
+      source: 'model_runner_transport',
+      provider: 'OpenAI',
+      http_status: 429,
+      error_code: 'rate_limit_exceeded',
+    },
+  }, {source: 'model_runner'}), true);
+  assert.equal(isProviderThrottle({
+    trusted_model_provider_error: {
+      schema_version: 1,
+      source: 'candidate_output',
+      provider: 'OpenAI',
+      http_status: 429,
+      error_code: 'rate_limit_exceeded',
+    },
+  }, {source: 'model_runner'}), false);
+  assert.equal(isProviderThrottle({
+    trusted_model_provider_error: {
+      schema_version: 1,
+      source: 'model_runner_transport',
+      provider: 'OpenAI',
+      http_status: '429',
+      error_code: 'not_a_transport_rate_code',
+    },
+  }, {source: 'model_runner'}), false);
+});
+
+test('Codex JSONL adapter trusts only typed transport failure metadata, never item text', () => {
+  assert.equal(trustedModelProviderErrorFromCodexJsonl([
+    JSON.stringify({type: 'item.completed', item: {type: 'agent_message',
+      text: 'HTTP 429 Too Many Requests; secondary rate limit'}}),
+    JSON.stringify({type: 'turn.failed', error: {message: 'candidate quoted HTTP 429'}}),
+  ].join('\n')), null);
+  assert.deepEqual(trustedModelProviderErrorFromCodexJsonl(JSON.stringify({
+    type: 'turn.failed',
+    error: {message: 'untrusted display text', codexErrorInfo: {
+      httpConnectionFailed: {httpStatusCode: 429},
+    }},
+  })), {
+    schema_version: 1,
+    source: 'model_runner_transport',
+    provider: 'OpenAI',
+    http_status: 429,
+    error_code: null,
+  });
+  assert.equal(trustedModelProviderErrorFromCodexJsonl(JSON.stringify({
+    type: 'turn.failed', error: {message: 'no numeric status', codexErrorInfo: 'usageLimitExceeded'},
+  })).error_code, 'usage_limit_exceeded');
 });
 
 test('persistent provider throttle clearance requires and records a founder decision', async (t) => {

@@ -9,7 +9,7 @@
 
 import {spawn} from 'node:child_process';
 import {createReadStream} from 'node:fs';
-import {mkdir, rename, rm, stat, writeFile} from 'node:fs/promises';
+import {mkdir, open, rename, rm, stat, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline';
 import {fileURLToPath} from 'node:url';
@@ -209,9 +209,32 @@ export async function enrichLanguages(candidates, {lakeFile = DEFAULT_LAKE, sqli
   }
 }
 
-async function fileExists(file) {
-  try { await stat(file); return true; }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+async function inspectCachedArchive(file) {
+  let metadata;
+  try { metadata = await stat(file); }
+  catch (error) {
+    if (error.code === 'ENOENT') return {exists: false, valid: false, reason: null};
+    throw error;
+  }
+  if (!metadata.isFile()) return {exists: true, valid: false, reason: 'cached archive is not a regular file'};
+  if (metadata.size === 0) return {exists: true, valid: false, reason: 'cached archive is empty'};
+  const handle = await open(file, 'r');
+  try {
+    const magic = Buffer.alloc(2);
+    const {bytesRead} = await handle.read(magic, 0, magic.length, 0);
+    if (bytesRead !== magic.length || magic[0] !== 0x1f || magic[1] !== 0x8b) {
+      return {exists: true, valid: false, reason: 'cached archive has invalid gzip magic bytes'};
+    }
+  } finally {
+    await handle.close();
+  }
+  return {exists: true, valid: true, reason: null};
+}
+
+async function quarantineCachedArchive(file, clock) {
+  const quarantineFile = `${file}.corrupt-${Math.trunc(clock())}`;
+  await rename(file, quarantineFile);
+  return quarantineFile;
 }
 
 async function atomicWrite(file, contents) {
@@ -292,6 +315,7 @@ export async function mineArchives(config, {
     requested_hours: [],
     mined_hours: [],
     skipped_cached_hours: [],
+    quarantined_hours: [],
     failed_hours: [],
     unattempted_hours: [],
     aborted: false,
@@ -305,8 +329,16 @@ export async function mineArchives(config, {
     const hour = archiveHourId(date);
     manifest.requested_hours.push(hour);
     const cacheFile = path.join(config.cacheDir, `${hour}.json.gz`);
-    const cached = await fileExists(cacheFile);
+    const cachedArchive = await inspectCachedArchive(cacheFile);
+    const cached = cachedArchive.exists;
     let download = {ok: true, attempts: []};
+    if (cached && !cachedArchive.valid) {
+      const quarantineFile = await quarantineCachedArchive(cacheFile, clock);
+      manifest.quarantined_hours.push({hour, cache_file: cacheFile, quarantine_file: quarantineFile,
+        reason: cachedArchive.reason});
+      manifest.failed_hours.push({hour, cache_file: cacheFile, error: cachedArchive.reason, attempts: []});
+      continue;
+    }
     if (!cached) {
       try {
         download = await downloadHour(`https://data.gharchive.org/${hour}.json.gz`, cacheFile, {
@@ -342,6 +374,11 @@ export async function mineArchives(config, {
         }
       }
     } catch (error) {
+      if (cached) {
+        const quarantineFile = await quarantineCachedArchive(cacheFile, clock);
+        manifest.quarantined_hours.push({hour, cache_file: cacheFile, quarantine_file: quarantineFile,
+          reason: error.message});
+      }
       manifest.failed_hours.push({hour, cache_file: cacheFile, error: error.message, attempts: download.attempts});
     }
   }

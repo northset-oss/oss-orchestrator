@@ -811,10 +811,29 @@ export function validateSpecs(specs) {
   return specs;
 }
 
-export function timelineApiArgs(owner, repo, num) {
+export function timelineApiArgs(owner, repo, num, page = 1) {
+  if (!Number.isInteger(page) || page < 1 || page > 3) throw new Error('timeline page must be 1..3');
   return [
-    'api', `repos/${owner}/${repo}/issues/${num}/timeline?per_page=100`, '--paginate', '--slurp',
+    'api', `repos/${owner}/${repo}/issues/${num}/timeline?per_page=100&page=${page}`,
   ];
+}
+
+export async function fetchBoundedGitHubPages(fetchPage, {pageSize = 100, maxPages = 3} = {}) {
+  if (typeof fetchPage !== 'function') throw new TypeError('bounded GitHub pagination requires a fetchPage function');
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100 ||
+      !Number.isInteger(maxPages) || maxPages < 1 || maxPages > 3) {
+    throw new Error('bounded GitHub pagination requires pageSize <= 100 and maxPages <= 3');
+  }
+  const pages = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const items = await fetchPage({page, perPage: pageSize});
+    if (!Array.isArray(items)) throw new Error(`GitHub page ${page} did not return an array`);
+    pages.push(items);
+    if (items.length < pageSize) {
+      return {pages, items: pages.flat(), page_size: pageSize, pages_fetched: page, truncated: false};
+    }
+  }
+  return {pages, items: pages.flat(), page_size: pageSize, pages_fetched: maxPages, truncated: true};
 }
 
 export function timelineCrossReferences(pages) {
@@ -901,9 +920,15 @@ export async function recheck(spec, log, options = {}) {
   const issue = await gh(['api', `repos/${owner}/${repo}/issues/${num}`,
     '--jq', '{number,state,title,html_url,assignees:[.assignees[].login],labels:[.labels[].name],created_at,updated_at,body,author_association,user:.user.login}']);
   let comments;
+  let commentsTruncated = false;
+  let commentPagesFetched = 0;
   try {
-    const commentPages = await gh(['api', `repos/${owner}/${repo}/issues/${num}/comments?per_page=100`, '--paginate', '--slurp']);
-    comments = Array.isArray(commentPages) ? commentPages.flat() : [];
+    const bounded = await fetchBoundedGitHubPages(({page}) => gh([
+      'api', `repos/${owner}/${repo}/issues/${num}/comments?per_page=100&page=${page}`,
+    ]));
+    comments = bounded.items;
+    commentsTruncated = bounded.truncated;
+    commentPagesFetched = bounded.pages_fetched;
   } catch (error) {
     if (isGhGatewayTerminalError(error)) throw error;
     await log(`recheck: issue comments REST check failed; retrying through GitHub GraphQL — ${error.message}`);
@@ -913,8 +938,10 @@ export async function recheck(spec, log, options = {}) {
       '-F', `owner=${owner}`, '-F', `name=${repo}`, '-F', `number=${num}`,
       '--jq', '{comments:[.data.repository.issue.comments.nodes[]|{html_url:.url,author_association:.authorAssociation,created_at:.createdAt,user:{login:(.author.login//""),type:(.author.__typename//"")}}],truncated:.data.repository.issue.comments.pageInfo.hasPreviousPage}',
     ]);
-    if (response?.truncated || !Array.isArray(response?.comments)) throw new Error('issue comments GraphQL fallback was incomplete');
+    if (!Array.isArray(response?.comments)) throw new Error('issue comments GraphQL fallback was invalid');
     comments = response.comments;
+    commentsTruncated = Boolean(response.truncated);
+    commentPagesFetched = 1;
   }
   const defaultRef = mode === 'pre-pr' ? null
     : repoData.default_head ? null : await gh(['api', `repos/${owner}/${repo}/git/ref/heads/${repoData.default_branch}`]);
@@ -924,8 +951,13 @@ export async function recheck(spec, log, options = {}) {
   const openPrs = allPrs.filter((pr) => pr.state === 'OPEN');
   const northsetOpen = openPrs.filter((pr) => pr.author?.login === 'AysajanE');
   let timeline;
+  let timelineTruncated = false;
+  let timelinePagesFetched = 0;
   try {
-    timeline = timelineCrossReferences(await gh(timelineApiArgs(owner, repo, num)));
+    const bounded = await fetchBoundedGitHubPages(({page}) => gh(timelineApiArgs(owner, repo, num, page)));
+    timeline = timelineCrossReferences(bounded.pages);
+    timelineTruncated = bounded.truncated;
+    timelinePagesFetched = bounded.pages_fetched;
   } catch (error) {
     if (isGhGatewayTerminalError(error)) throw error;
     await log(`recheck: timeline REST check failed; retrying through GitHub GraphQL — ${error.message}`);
@@ -936,8 +968,10 @@ export async function recheck(spec, log, options = {}) {
         '-F', `owner=${owner}`, '-F', `name=${repo}`, '-F', `number=${num}`,
         '--jq', '{timeline:[.data.repository.issue.timelineItems.nodes[]|select(.source!=null)|{source:.source.url,state:(.source.state|ascii_downcase),title:.source.title,is_pr:(.source.__typename=="PullRequest"),created_at:.createdAt}],truncated:.data.repository.issue.timelineItems.pageInfo.hasPreviousPage}',
       ]);
-      if (response?.truncated || !Array.isArray(response?.timeline)) throw new Error('timeline GraphQL fallback was incomplete');
+      if (!Array.isArray(response?.timeline)) throw new Error('timeline GraphQL fallback was invalid');
       timeline = response.timeline;
+      timelineTruncated = Boolean(response.truncated);
+      timelinePagesFetched = 1;
     } catch (fallbackError) {
       if (isGhGatewayTerminalError(fallbackError)) throw fallbackError;
       await log(`recheck: timeline check FAILED — ${fallbackError.message} (fail-closed → FAILED)`);
@@ -1020,11 +1054,17 @@ export async function recheck(spec, log, options = {}) {
   }
   const fetchedAt = now().toISOString().replace(/\.\d+Z$/, 'Z');
   const snapshot = {fetched_at: fetchedAt, issue, comments, timeline_cross_references: timeline,
+    evidence_bounds: {
+      comments: {page_size: 100, pages_fetched: commentPagesFetched, truncated: commentsTruncated},
+      timeline: {page_size: 100, pages_fetched: timelinePagesFetched, truncated: timelineTruncated},
+    },
     invitation_policy: invitationPolicy,
     design_policies: [...designPolicies.values()],
     pre_author_notice: preAuthorNotice,
     repository: repoData, default_branch_head: defaultHead, pull_requests_reviewed: allPrs};
   const reasons = [];
+  if (commentsTruncated) reasons.push('evidence_truncated_too_active: issue comments reached the 300-item evidence bound');
+  if (timelineTruncated) reasons.push('evidence_truncated_too_active: issue timeline reached the 300-item evidence bound');
   if (issue.state !== 'open') reasons.push(`issue is ${issue.state}`);
   if (issue.assignees.some((login) => login !== 'AysajanE')) reasons.push(`assigned to ${issue.assignees.join(', ')}`);
   if (repoData.archived || repoData.fork) reasons.push('repository is archived or a fork');

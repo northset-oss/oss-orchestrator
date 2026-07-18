@@ -36,6 +36,7 @@ import {normalizedPrClaimText, reviewPatch} from './review-patch.mjs';
 import {
   assertTaskResourcePolicy,
   assertPhase0Spec,
+  attachTrustedModelProviderErrorFromCodexJsonl,
   isProviderThrottle,
   loadResourceControl,
   remainingTaskLaneMs,
@@ -44,10 +45,14 @@ import {
 } from './campaign/phase0/resource-breakers.mjs';
 import {buildAttemptAttribution, validateAttemptAttribution} from './campaign/phase1/attribution.mjs';
 import {assertPhase1Runtime} from './campaign/phase1/runtime-guard.mjs';
-import {isGhGatewayTerminalError} from './gh-gateway.mjs';
+import {
+  assertGhRateSafetyAllowsAction,
+  resolveGhGatewayStateDir,
+} from './gh-gateway.mjs';
 
 const OSS_FILE = fileURLToPath(import.meta.url);
 const HERE = path.dirname(OSS_FILE);
+const MODEL_RUNNER_RESULT = Symbol('model-runner-result');
 const NORTHSET_OSS = process.env.NORTHSET_OSS_DIR ?? '/Users/aeziz-local/northset-oss';
 const RUN_MISSION = path.join(NORTHSET_OSS, 'bin', 'run-mission.mjs');
 const BUNDLE_CLI = path.join(NORTHSET_OSS, 'bin', 'bundle.mjs');
@@ -249,7 +254,7 @@ function authorPrompt(spec, phase = 'direct_fix') {
 
 export function authorDockerArgs(spec, workspace, image, codexHome, phase = 'direct_fix') {
   const command = [
-    `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model gpt-5.6-sol -c model_reasoning_effort=${quote(authorEffort(spec))} -c service_tier=fast ${quote(authorPrompt(spec, phase))}`,
+    `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model gpt-5.6-sol -c model_reasoning_effort=${quote(authorEffort(spec))} -c service_tier=fast ${quote(authorPrompt(spec, phase))}`,
   ];
   const args = commonDockerArgs(spec, workspace, image, {home: '/tmp', phase: 'author', protectGit: true});
   args.splice(args.length - 1, 0,
@@ -405,6 +410,26 @@ async function must(label, result) {
     throw new Error(`${label}${kind} failed: ${(result.stderr || result.stdout).trim().split('\n').slice(-3).join(' ')}`);
   }
   return result;
+}
+
+export async function requireModelRunnerSuccess(label, result) {
+  attachTrustedModelProviderErrorFromCodexJsonl(result);
+  try {
+    return await must(label, result);
+  } catch (error) {
+    Object.defineProperty(error, MODEL_RUNNER_RESULT, {value: result});
+    throw error;
+  }
+}
+
+async function runModelRunnerDocker(runImpl, args, options) {
+  try {
+    return attachTrustedModelProviderErrorFromCodexJsonl(await runDocker(runImpl, args, options));
+  } catch (error) {
+    attachTrustedModelProviderErrorFromCodexJsonl(error);
+    Object.defineProperty(error, MODEL_RUNNER_RESULT, {value: error});
+    throw error;
+  }
 }
 
 async function resolveImage(spec, log, deadline) {
@@ -719,15 +744,19 @@ export async function runAuthorContainer(spec, dirs, {
     const dependencySnapshot = await snapshotProfileDependencies(spec.executor.profile,
       path.join(dirs.authorWorkspace, 'repo'), path.join(dirs.base, 'dependency-snapshot'));
     await log(`dependency bootstrap snapshot fixed before credentialed authoring: ${dependencySnapshot.digest}`);
-    let author = await runDocker(runImpl, plan.author, {timeoutMs: AUTHOR_MODEL_ATTEMPT_MS, deadline});
-    await must(authoringMode === 'test_only_then_fix' ? 'test-only author container' : 'author container', author);
+    let author = await runModelRunnerDocker(
+      runImpl, plan.author, {timeoutMs: AUTHOR_MODEL_ATTEMPT_MS, deadline},
+    );
+    await requireModelRunnerSuccess(
+      authoringMode === 'test_only_then_fix' ? 'test-only author container' : 'author container', author,
+    );
     let authorDurationMs = author.durationMs ?? 0;
     if (authoringMode === 'test_only_then_fix') {
       await verifyTestOnlyAuthorResult(spec, dirs.authorWorkspace, effectiveImage, {deadline, runImpl, log, dependencySnapshot});
       const fixTimeoutMs = remainingAuthorModelMs(authorDurationMs);
       if (fixTimeoutMs <= 0) throw new Error('author attempt exhausted its shared 12-minute model budget before the fix-only phase');
-      author = await runDocker(runImpl, plan.authorFix, {timeoutMs: fixTimeoutMs, deadline});
-      await must('fix-only author container', author);
+      author = await runModelRunnerDocker(runImpl, plan.authorFix, {timeoutMs: fixTimeoutMs, deadline});
+      await requireModelRunnerSuccess('fix-only author container', author);
       authorDurationMs += author.durationMs ?? 0;
       if (authorDurationMs > AUTHOR_MODEL_ATTEMPT_MS) {
         throw new Error('author attempt exceeded its shared 12-minute model budget');
@@ -1371,7 +1400,7 @@ function terminalReasonClass(state) {
 }
 
 export function githubProviderThrottleFailure(error) {
-  if (!isGhGatewayTerminalError(error) && error?.code !== 'GITHUB_PROVIDER_THROTTLED') return null;
+  if (error?.code !== 'GITHUB_PROVIDER_THROTTLED') return null;
   const errorCode = typeof error?.code === 'string' && error.code
     ? error.code
     : 'GITHUB_GATEWAY_TERMINAL';
@@ -1383,6 +1412,32 @@ export function githubProviderThrottleFailure(error) {
     error_code: errorCode,
     signal,
   };
+}
+
+export async function latchPrepareProviderThrottle(error, {
+  activeStage,
+  resourceControlFile,
+  gatewayOptions = {},
+} = {}) {
+  const gatewayFailure = githubProviderThrottleFailure(error);
+  const modelRunnerResult = error?.[MODEL_RUNNER_RESULT] ?? null;
+  const modelProviderThrottle = !gatewayFailure && activeStage === 'author' && modelRunnerResult !== null &&
+    isProviderThrottle(modelRunnerResult, {source: 'model_runner'});
+  if (!gatewayFailure && !modelProviderThrottle) return {gatewayFailure: null, modelProviderThrottle: false};
+
+  const resourceControl = await loadResourceControl(resourceControlFile);
+  if (!resourceControl.provider_pause) {
+    await tripPersistentProviderThrottle(resourceControlFile, {
+      provider: gatewayFailure ? 'GitHub' : 'OpenAI',
+      signal: gatewayFailure
+        ? (gatewayFailure.signal ?? gatewayFailure.error_code)
+        : 'OPENAI_MODEL_RATE_LIMIT',
+      at: gatewayFailure ? (error?.tripped_at ?? new Date().toISOString()) : new Date().toISOString(),
+      incidentId: gatewayFailure ? (error?.incident_id ?? undefined) : undefined,
+      gatewayStateDir: resolveGhGatewayStateDir(gatewayOptions),
+    });
+  }
+  return {gatewayFailure, modelProviderThrottle};
 }
 
 const TERMINAL_ATTEMPT_STATES = new Set([
@@ -1710,19 +1765,11 @@ export async function prepareMission(spec, options) {
     await writeAttempt(dirs, spec, 'READY', null, timings, startedAt);
     return {state: 'READY', spec, dirs, manifest, manifestDigest: digest, classes: result.classes};
   } catch (error) {
-    const gatewayFailure = githubProviderThrottleFailure(error);
-    if (gatewayFailure) {
-      await tripPersistentProviderThrottle(resourceControlFile, {
-        provider: 'GitHub',
-        signal: gatewayFailure.signal ?? gatewayFailure.error_code,
-        gatewayStateDir: path.join(options.runsDir, 'gh-gateway-state'),
-      });
-    } else if (isProviderThrottle(error)) {
-      await tripPersistentProviderThrottle(resourceControlFile, {
-        provider: 'OpenAI', signal: 'provider rate-limit or throttle detected',
-        gatewayStateDir: path.join(options.runsDir, 'gh-gateway-state'),
-      });
-    }
+    const {gatewayFailure} = await latchPrepareProviderThrottle(error, {
+      activeStage,
+      resourceControlFile,
+      gatewayOptions: options.gatewayOptions ?? {},
+    });
     const budget = deadline.expired() || /timed out|deadline exhausted/i.test(error.message);
     const state = gatewayFailure ? 'FAILED_INFRA_TERMINAL'
       : budget ? 'FAILED_BUDGET'
@@ -1885,6 +1932,9 @@ async function main() {
     console.log(`status: ${result.changed ? 'updated' : 'current'} (${result.missions} contribution records)`);
     for (const mission of result.attention) console.log(`ATTENTION ${mission}: open PR needs a human response or has head drift`);
     return;
+  }
+  if (options.command === 'prepare' || options.command === 'ship') {
+    await assertGhRateSafetyAllowsAction();
   }
   const specs = await loadSpecs(options);
   const repositories = specs.map((spec) => {

@@ -37,8 +37,9 @@ import {
 import {assertPhase0Spec, resourceUsageForTask} from './campaign/phase0/resource-breakers.mjs';
 import {
   assertGhNetworkAllowed,
+  assertGhRateSafetyAllowsAction,
   isGhGatewayTerminalError,
-  ledgerEvent,
+  recordGhTransportResult,
   withGhGatewayLock,
 } from './gh-gateway.mjs';
 
@@ -79,7 +80,7 @@ function shipGit(deadline, cwd, ...args) {
 
 export async function guardedGitPush(deadline, cwd, repoTarget, args, {
   assertNetworkAllowed = assertGhNetworkAllowed,
-  recordLedgerEvent = ledgerEvent,
+  recordTransportResult = recordGhTransportResult,
   runCommand = shipRun,
   withGatewayLock = withGhGatewayLock,
   gatewayOptions = {},
@@ -92,14 +93,24 @@ export async function guardedGitPush(deadline, cwd, repoTarget, args, {
   }
   return withGatewayLock(gatewayOptions, async () => {
     await assertNetworkAllowed({...gatewayOptions, gatewayLockHeld: true});
+    let result;
+    let thrown = null;
     try {
-      return await runCommand(deadline, 'git', ['-C', cwd, 'push', ...args], {env: sanitizedGitEnv()});
-    } finally {
-      await recordLedgerEvent({class: 'git_push', repo_target: repoTarget}, {
-        ...gatewayOptions,
-        gatewayLockHeld: true,
-      });
+      result = await runCommand(deadline, 'git', ['-C', cwd, 'push', ...args], {env: sanitizedGitEnv()});
+    } catch (error) {
+      thrown = error;
     }
+    await recordTransportResult({
+      class: 'git_push',
+      repoTarget,
+      result,
+      ...(thrown ? {thrown} : {}),
+    }, {
+      ...gatewayOptions,
+      gatewayLockHeld: true,
+    });
+    if (thrown) throw thrown;
+    return result;
   });
 }
 
@@ -1788,7 +1799,9 @@ function resolveShipBatchAdapter(overrides) {
 export async function shipBatch(items, {
   approvedDigest, signedBatchApproval = null, reviewerRoster = null, retryInfraTerminal = false,
   concurrency = DEFAULT_SHIP_CONCURRENCY, log = async () => {}, adapter: adapterOverrides = null,
+  gatewayOptions = {},
 } = {}) {
+  await assertGhRateSafetyAllowsAction(gatewayOptions);
   const adapter = resolveShipBatchAdapter(adapterOverrides);
   const loadedRoster = reviewerRoster ?? await loadReviewerRoster();
   const roster = loadedRoster.keys ?? loadedRoster;

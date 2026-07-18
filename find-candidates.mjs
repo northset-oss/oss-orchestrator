@@ -17,6 +17,7 @@ import {spawn} from 'node:child_process';
 import {
   appendFile,
   mkdir,
+  mkdtemp,
   open,
   readFile,
   rename,
@@ -31,7 +32,19 @@ import {fileURLToPath} from 'node:url';
 import {PROFILE_REGISTRY, isInvitationLabel, normalizeLabel, taskIdForCandidate} from './core.mjs';
 import {candidateEvidenceKey, canonicalCandidate, openCandidateLake} from './candidate-lake.mjs';
 import {assertPhase1Runtime} from './campaign/phase1/runtime-guard.mjs';
-import {ghRequest, isGhGatewayTerminalError} from './gh-gateway.mjs';
+import {
+  assertGhRateSafetyAllowsAction,
+  ghRequest,
+  isGhGatewayTerminalError,
+  resolveGhGatewayStateDir,
+} from './gh-gateway.mjs';
+import {
+  TRUSTED_MODEL_PROVIDER_ERROR_FIELD,
+  isProviderThrottle,
+  loadResourceControl,
+  tripPersistentProviderThrottle,
+  trustedModelProviderError,
+} from './campaign/phase0/resource-breakers.mjs';
 
 export {isInvitationLabel, normalizeLabel};
 
@@ -43,6 +56,7 @@ const SCRIPT_DIR = path.dirname(SCRIPT_FILE);
 const DEFAULT_HISTORY = path.join(SCRIPT_DIR, 'runs', 'candidate-history-v2.jsonl');
 const DEFAULT_REVIEWER = path.join(SCRIPT_DIR, 'review-issue.mjs');
 const DEFAULT_REPO_POLICY = path.join(SCRIPT_DIR, 'repo-policy.json');
+const DEFAULT_RESOURCE_CONTROL = path.join(SCRIPT_DIR, 'runs', 'phase0', 'resource-control.json');
 const DEFAULT_LAKE = path.join(SCRIPT_DIR, 'candidate_lake.sqlite');
 const DEFAULT_LABELS = ['good first issue', 'help wanted'];
 export const SUPPORTED_PROFILES = Object.freeze(Object.keys(PROFILE_REGISTRY.profiles));
@@ -381,10 +395,17 @@ export function runBounded(command, args, {
   deadline,
   timeoutMs = 120_000,
   maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
+  signal: abortSignal = null,
 } = {}) {
   return new Promise((resolve) => {
+    if (abortSignal?.aborted) {
+      resolve({code: 130, stdout: '', stderr: 'operation aborted before subprocess start', timedOut: false,
+        outputLimitExceeded: false, aborted: true, signal: null});
+      return;
+    }
     if (deadline?.expired()) {
-      resolve({code: 124, stdout: '', stderr: 'global deadline expired', timedOut: true, outputLimitExceeded: false, signal: null});
+      resolve({code: 124, stdout: '', stderr: 'global deadline expired', timedOut: true,
+        outputLimitExceeded: false, aborted: false, signal: null});
       return;
     }
 
@@ -401,6 +422,7 @@ export function runBounded(command, args, {
     let stderrBytes = 0;
     let timedOut = false;
     let outputLimitExceeded = false;
+    let aborted = false;
     let spawnError = null;
     let terminating = false;
     let escalationTimer = null;
@@ -410,6 +432,7 @@ export function runBounded(command, args, {
       terminating = true;
       if (reason === 'timeout') timedOut = true;
       if (reason === 'output') outputLimitExceeded = true;
+      if (reason === 'abort') aborted = true;
       signalProcessTree(child, 'SIGTERM');
       escalationTimer = setTimeout(() => signalProcessTree(child, 'SIGKILL'), 2_000);
       escalationTimer.unref?.();
@@ -417,6 +440,8 @@ export function runBounded(command, args, {
 
     const timer = setTimeout(() => terminate('timeout'), allowedMs);
     timer.unref?.();
+    const abort = () => terminate('abort');
+    abortSignal?.addEventListener('abort', abort, {once: true});
 
     child.stdout.on('data', (chunk) => {
       stdoutBytes += chunk.length;
@@ -433,15 +458,17 @@ export function runBounded(command, args, {
     });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
+      abortSignal?.removeEventListener('abort', abort);
       if (escalationTimer) clearTimeout(escalationTimer);
       if (spawnError) stderr = `${stderr}${stderr ? '\n' : ''}${spawnError.message}`;
-      const normalizedCode = timedOut ? 124 : outputLimitExceeded ? 125 : (code ?? 127);
+      const normalizedCode = timedOut ? 124 : outputLimitExceeded ? 125 : aborted ? 130 : (code ?? 127);
       resolve({
         code: normalizedCode,
         stdout,
         stderr,
         timedOut,
         outputLimitExceeded,
+        aborted,
         signal,
       });
     });
@@ -1617,6 +1644,73 @@ export function isFatalReviewerInfrastructureError(message) {
     || (/model\s+[^\s]+\s+is\s+unavailable/.test(normalized));
 }
 
+export class ModelProviderThrottleError extends Error {
+  constructor(message = 'semantic reviewer hit a trusted model-provider throttle', options = {}) {
+    super(message, options);
+    this.name = 'ModelProviderThrottleError';
+    this.code = 'MODEL_PROVIDER_THROTTLED';
+    this.retryable = false;
+  }
+}
+
+function qualificationResourceControlFile(explicit = null) {
+  return path.resolve(explicit ?? process.env.OSS_RESOURCE_CONTROL_FILE ?? DEFAULT_RESOURCE_CONTROL);
+}
+
+export async function latchQualificationProviderThrottle(result, {
+  resourceControlFile = null,
+  gatewayOptions = {},
+  at = new Date().toISOString(),
+} = {}) {
+  if (!isProviderThrottle(result, {source: 'model_runner'})) return false;
+  const trusted = trustedModelProviderError(result);
+  const controlFile = qualificationResourceControlFile(resourceControlFile);
+  const control = await loadResourceControl(controlFile);
+  if (!control.provider_pause) {
+    await tripPersistentProviderThrottle(controlFile, {
+      provider: trusted.provider,
+      signal: 'OPENAI_MODEL_RATE_LIMIT',
+      at,
+      gatewayStateDir: resolveGhGatewayStateDir(gatewayOptions),
+    });
+  }
+  return true;
+}
+
+async function trustedReviewerReceipt(statusFile) {
+  let parsed;
+  try { parsed = JSON.parse(await readFile(statusFile, 'utf8')); }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw new Error(`model-runner status receipt is invalid: ${error.message}`);
+  }
+  if (parsed?.schema_version !== 1 || parsed?.kind !== 'MODEL_PROVIDER_ERROR') {
+    throw new Error('model-runner status receipt has an invalid envelope');
+  }
+  const trusted = trustedModelProviderError(parsed);
+  if (!trusted) throw new Error('model-runner status receipt has an invalid trusted provider signal');
+  return trusted;
+}
+
+async function runReviewerWithTrustedStatus(args, options) {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-model-runner-status-'));
+  const statusFile = path.join(root, 'status.json');
+  try {
+    // The receipt path is carried only in the trusted reviewer environment; the
+    // reviewer's Codex subprocess receives a small allowlisted environment that
+    // does not inherit this variable.
+    const result = await runBounded(process.execPath, args, {
+      ...options,
+      env: {...process.env, ...(options?.env ?? {}), OSS_MODEL_RUNNER_STATUS_FILE: statusFile},
+    });
+    const trusted = await trustedReviewerReceipt(statusFile);
+    if (trusted) Object.defineProperty(result, TRUSTED_MODEL_PROVIDER_ERROR_FIELD, {value: trusted});
+    return result;
+  } finally {
+    await rm(root, {recursive: true, force: true});
+  }
+}
+
 export function isTerminalGitHubSubprocessError(message) {
   return /\bGITHUB_(?:PROVIDER_THROTTLED|GATEWAY_REFUSED|GATEWAY_TERMINAL)\b/.test(String(message ?? ''));
 }
@@ -1636,11 +1730,15 @@ async function reviewQueue(queue, config, deadline, audit, history, runId) {
   let started = 0;
   let fatalInfrastructureError = null;
   let terminalGitHubError = null;
+  let terminalModelProviderError = null;
+  let modelProviderTrip = null;
+  const modelProviderCancellation = new AbortController();
 
   const enough = () => selectDiverse(accepted, config.requested, config.maxPerOwner).selected.length >= config.requested;
 
   async function worker() {
-    while (!deadline.expired() && !enough() && fatalInfrastructureError == null && terminalGitHubError == null) {
+    while (!deadline.expired() && !enough() && fatalInfrastructureError == null &&
+        terminalGitHubError == null && terminalModelProviderError == null) {
       const index = cursor++;
       if (index >= queue.length) return;
       const candidate = queue[index];
@@ -1664,10 +1762,11 @@ async function reviewQueue(queue, config, deadline, audit, history, runId) {
         preflight_evidence_sha256: candidate.evidence_sha256,
       });
 
-      const result = await runBounded(process.execPath, numericReviewerInvocationArgs(candidate.candidate, config), {
+      const result = await runReviewerWithTrustedStatus(numericReviewerInvocationArgs(candidate.candidate, config), {
         deadline,
         timeoutMs: config.reviewTimeoutMs,
         maxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES,
+        signal: modelProviderCancellation.signal,
       });
       const finishedAt = nowIso();
       const durationMs = Date.now() - startedMs;
@@ -1676,7 +1775,16 @@ async function reviewQueue(queue, config, deadline, audit, history, runId) {
       let qualification = null;
       let error = null;
 
-      if (![0, 2].includes(result.code)) {
+      if (isProviderThrottle(result, {source: 'model_runner'})) {
+        terminalState = 'REJECTED_REVIEW_TOOL_ERROR';
+        error = 'trusted model-runner transport reported a provider throttle';
+        terminalModelProviderError ??= new ModelProviderThrottleError();
+        modelProviderCancellation.abort();
+        modelProviderTrip ??= latchQualificationProviderThrottle(result);
+        await modelProviderTrip;
+      } else if (terminalModelProviderError !== null) {
+        return;
+      } else if (![0, 2].includes(result.code)) {
         terminalState = result.timedOut ? 'REJECTED_REVIEW_TIMEOUT'
           : result.outputLimitExceeded ? 'REJECTED_REVIEW_OUTPUT_LIMIT'
             : 'REJECTED_REVIEW_TOOL_ERROR';
@@ -1738,6 +1846,7 @@ async function reviewQueue(queue, config, deadline, audit, history, runId) {
   if (terminalGitHubError != null) {
     throw new GitHubSubprocessTerminalError(`semantic reviewer hit a terminal GitHub gateway stop: ${terminalGitHubError}`);
   }
+  if (terminalModelProviderError != null) throw terminalModelProviderError;
   if (fatalInfrastructureError != null) {
     throw new Error(`semantic reviewer infrastructure failure: ${fatalInfrastructureError}`);
   }
@@ -1893,6 +2002,8 @@ export async function qualifyQueueRecords(records, {
   qualificationTtlMs = 2 * 60 * 60 * 1000,
   now = () => new Date(),
   reviewRunner = null,
+  resourceControlFile = null,
+  gatewayOptions = {},
 } = {}) {
   if (!lake) throw new Error('qualify requires a candidate lake');
   if (!SUPPORTED_PROFILES.includes(profile)) throw new Error(`profile must be one of ${SUPPORTED_PROFILES.join(', ')}`);
@@ -1910,13 +2021,16 @@ export async function qualifyQueueRecords(records, {
   const results = new Array(unique.length);
   let cursor = 0;
   let terminalGitHubError = null;
-  const runner = reviewRunner ?? (async (record) => {
-    return runBounded(process.execPath, reviewerInvocationArgs(record, {profile, reviewScript}),
-    {timeoutMs: reviewTimeoutMs, maxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES});
+  let terminalModelProviderError = null;
+  let modelProviderTrip = null;
+  const modelProviderCancellation = new AbortController();
+  const runner = reviewRunner ?? (async (record, {signal} = {}) => {
+    return runReviewerWithTrustedStatus(reviewerInvocationArgs(record, {profile, reviewScript}),
+    {timeoutMs: reviewTimeoutMs, maxOutputBytes: DEFAULT_MAX_OUTPUT_BYTES, signal});
   });
 
   async function lane() {
-    while (cursor < unique.length && terminalGitHubError === null) {
+    while (cursor < unique.length && terminalGitHubError === null && terminalModelProviderError === null) {
       const index = cursor++;
       const record = unique[index];
       try {
@@ -1961,7 +2075,17 @@ export async function qualifyQueueRecords(records, {
             state: 'REJECTED_DETERMINISTIC', cache_hit: false, review: result};
           continue;
         }
-        const executed = await runner(record);
+        const executed = await runner(record, {signal: modelProviderCancellation.signal});
+        if (isProviderThrottle(executed, {source: 'model_runner'})) {
+          terminalModelProviderError ??= new ModelProviderThrottleError();
+          modelProviderCancellation.abort();
+          modelProviderTrip ??= latchQualificationProviderThrottle(executed, {
+            resourceControlFile, gatewayOptions, at: now().toISOString(),
+          });
+          await modelProviderTrip;
+          return;
+        }
+        if (terminalModelProviderError !== null) return;
         if (!executed?.verdict && ![0, 2].includes(executed?.code)) {
           const detail = String(executed?.stderr || executed?.stdout || `exit ${executed?.code}`).trim().slice(-3000);
           if (isTerminalGitHubSubprocessError(detail)) {
@@ -1996,6 +2120,7 @@ export async function qualifyQueueRecords(records, {
         results[index] = {candidate: record.candidate, evidence_key: record.evidence_key,
           state: review.verdict === 'ACCEPT' ? 'ACCEPTED' : 'REJECTED_SEMANTIC', cache_hit: false, review};
       } catch (error) {
+        if (terminalModelProviderError !== null || error instanceof ModelProviderThrottleError) return;
         if (error instanceof GitHubSubprocessTerminalError || isGhGatewayTerminalError(error)) {
           terminalGitHubError ??= error;
           return;
@@ -2021,6 +2146,7 @@ export async function qualifyQueueRecords(records, {
       {cause: terminalGitHubError},
     );
   }
+  if (terminalModelProviderError) throw terminalModelProviderError;
   return results;
 }
 
@@ -2036,6 +2162,7 @@ async function runCrawlCommand(argv) {
   if (!profiles.every((profile) => SUPPORTED_PROFILES.includes(profile))) {
     throw new Error(`--profile must contain only ${SUPPORTED_PROFILES.join(', ')}`);
   }
+  await assertGhRateSafetyAllowsAction();
   const lake = await openCandidateLake(lakeFile);
   const discoveredKeys = new Set();
   const preflightedKeys = new Set();
@@ -2199,6 +2326,7 @@ async function runQualifyCommand(argv) {
   const phase1RuntimeValue = takeOption(values, ['--phase1-runtime'], null);
   const phase1Runtime = phase1RuntimeValue ? path.resolve(phase1RuntimeValue) : null;
   if (values.length) throw new Error(`unknown qualify argument ${values[0]}`);
+  await assertGhRateSafetyAllowsAction();
   const loaded = JSON.parse(await readFile(queueFile, 'utf8'));
   const queue = Array.isArray(loaded) ? loaded : loaded.queue;
   if (!Array.isArray(queue)) throw new Error('review queue must be an array or an object with queue[]');
@@ -2251,6 +2379,8 @@ async function main() {
     process.stdout.write(usage());
     return;
   }
+
+  await assertGhRateSafetyAllowsAction();
 
   const runId = randomUUID();
   const deadline = new Deadline(config.totalBudgetMs);

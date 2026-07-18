@@ -1,5 +1,6 @@
 import {createPrivateKey, createPublicKey} from 'node:crypto';
-import {mkdir, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, rm, writeFile} from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
 import {batchApprovalDigest, canonical, manifestDigest, sha256, taskIdForCandidate} from '../../core.mjs';
@@ -463,11 +464,11 @@ class ProductionRehearsalAdapter {
   }
 }
 
-function readyBatch() {
+function readyBatch(gatewayOptions) {
   const fixture = buildReviewedMissions();
   const adapter = new ProductionRehearsalAdapter(fixture);
   const items = fixture.subjects.map(({id, spec}) => ({spec, missionDir: `/rehearsal/${id}`}));
-  return {fixture, adapter, items};
+  return {fixture, adapter, items, gatewayOptions};
 }
 
 async function invoke(batch, shipBatchImpl, options = {}) {
@@ -478,33 +479,53 @@ async function invoke(batch, shipBatchImpl, options = {}) {
     retryInfraTerminal: options.retryInfraTerminal ?? false,
     concurrency: 1,
     adapter: batch.adapter.operations(),
+    gatewayOptions: batch.gatewayOptions,
   });
   batch.adapter.recordProductionResults(results);
   return results;
 }
 
-export async function runRequiredBatchRehearsals({shipBatchImpl = productionShipBatch} = {}) {
+export async function runRequiredBatchRehearsals({
+  shipBatchImpl = productionShipBatch,
+  gatewayOptions = null,
+} = {}) {
+  if (gatewayOptions === null) {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'phase0-batch-gateway-'));
+    try {
+      return await runRequiredBatchRehearsals({
+        shipBatchImpl,
+        gatewayOptions: {
+          stateDir: path.join(root, 'gateway'),
+          resourceControlFile: path.join(root, 'phase0', 'resource-control.json'),
+          controlStateFile: path.join(root, 'phase1', 'control-state.json'),
+          ledgerFile: path.join(root, 'gh-request-ledger.jsonl'),
+        },
+      });
+    } finally {
+      await rm(root, {recursive: true, force: true});
+    }
+  }
   const reports = [];
 
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     await invoke(batch, shipBatchImpl);
     reports.push(batch.adapter.common('happy_path_25'));
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     batch.adapter.staleIds.add('M-001');
     await invoke(batch, shipBatchImpl);
     reports.push(batch.adapter.common('stale_before_publication'));
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     batch.adapter.ledgerChecksFail = true;
     await invoke(batch, shipBatchImpl);
     reports.push(batch.adapter.common('prepared_ledger_failure'));
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     batch.adapter.signingCrashAfter = 20;
     let crash;
     try { await invoke(batch, shipBatchImpl); } catch (error) { crash = error.message; }
@@ -516,7 +537,7 @@ export async function runRequiredBatchRehearsals({shipBatchImpl = productionShip
       total_unique_signatures: batch.adapter.signatures.size});
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     batch.adapter.pagesReady = false;
     await invoke(batch, shipBatchImpl);
     const before = batch.adapter.externalActions.upstream_pr_creations;
@@ -527,7 +548,7 @@ export async function runRequiredBatchRehearsals({shipBatchImpl = productionShip
       after_ready: {upstream_pr_creations: batch.adapter.externalActions.upstream_pr_creations - before}});
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     for (const id of ['M-003', 'M-014', 'M-025']) batch.adapter.failedPrIds.add(id);
     await invoke(batch, shipBatchImpl);
     const firstShipped = batch.adapter.counters().A_SHIPPED_PUBLIC;
@@ -539,7 +560,7 @@ export async function runRequiredBatchRehearsals({shipBatchImpl = productionShip
       recoverable_mission_ids: [...batch.adapter.failedPrAttempts].sort()});
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     batch.adapter.prCrashAfter = 12;
     let crash;
     try { await invoke(batch, shipBatchImpl); } catch (error) { crash = error.message; }
@@ -553,7 +574,7 @@ export async function runRequiredBatchRehearsals({shipBatchImpl = productionShip
       remote_adoptions: batch.adapter.remoteAdoptions});
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     batch.adapter.envelopeFails = true;
     await invoke(batch, shipBatchImpl);
     const state = batch.adapter.journals.get('M-001').state;
@@ -563,7 +584,7 @@ export async function runRequiredBatchRehearsals({shipBatchImpl = productionShip
       resume_state: batch.adapter.journals.get('M-001').state});
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     await invoke(batch, shipBatchImpl);
     const before = {...batch.adapter.externalActions};
     await invoke(batch, shipBatchImpl);
@@ -573,7 +594,7 @@ export async function runRequiredBatchRehearsals({shipBatchImpl = productionShip
       Object.fromEntries(Object.keys(after).map((key) => [key, after[key] - before[key]]))});
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     batch.adapter.subjects.get('M-001').manifest.patch_sha256 = fixtureDigest('M-001', 'mutated-patch');
     let error = null;
     try { await invoke(batch, shipBatchImpl); } catch (caught) { error = caught.message; }
@@ -581,7 +602,7 @@ export async function runRequiredBatchRehearsals({shipBatchImpl = productionShip
     reports.push({...batch.adapter.common('manifest_mutates_after_review'), approval_rejected: Boolean(error), error});
   }
   {
-    const batch = readyBatch();
+    const batch = readyBatch(gatewayOptions);
     batch.adapter.subjects.get('M-001').reviewRecords[0].disposition = 'HOLD';
     let error = null;
     try { await invoke(batch, shipBatchImpl); } catch (caught) { error = caught.message; }

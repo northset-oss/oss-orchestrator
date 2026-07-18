@@ -89,11 +89,100 @@ export async function resourceUsageForTask(runsDir, taskId) {
   return total;
 }
 
-export function isProviderThrottle(error) {
+export const TRUSTED_MODEL_PROVIDER_ERROR_FIELD = 'trusted_model_provider_error';
+
+// Model invocation adapters may populate this field only from their own transport
+// metadata. Callers must never synthesize it from subprocess output or model text.
+
+const MODEL_THROTTLE_ERROR_CODES = new Set([
+  'rate_limit_exceeded',
+  'usage_limit_exceeded',
+  'provider_rate_limited',
+  'provider_throttled',
+]);
+
+function codexTransportThrottleEvent(event) {
+  if (typeof event !== 'object' || event === null || Array.isArray(event)) return null;
+  const details = event.type === 'turn.failed'
+    ? event.error
+    : event.type === 'error' ? event : null;
+  if (typeof details !== 'object' || details === null || Array.isArray(details)) return null;
+  const codexErrorInfo = details.codex_error_info ?? details.codexErrorInfo ?? null;
+  const structuredTransportStatuses = typeof codexErrorInfo === 'object' && codexErrorInfo !== null &&
+      !Array.isArray(codexErrorInfo)
+    ? [
+      codexErrorInfo.http_connection_failed?.http_status_code,
+      codexErrorInfo.httpConnectionFailed?.httpStatusCode,
+      codexErrorInfo.response_stream_connection_failed?.http_status_code,
+      codexErrorInfo.responseStreamConnectionFailed?.httpStatusCode,
+      codexErrorInfo.response_stream_disconnected?.http_status_code,
+      codexErrorInfo.responseStreamDisconnected?.httpStatusCode,
+      codexErrorInfo.response_too_many_failed_attempts?.http_status_code,
+      codexErrorInfo.responseTooManyFailedAttempts?.httpStatusCode,
+    ] : [];
+  const httpStatus = [details.http_status_code, details.httpStatusCode, details.http_status,
+    ...structuredTransportStatuses].find((value) => Number.isInteger(value)) ?? null;
+  const rawErrorCode = typeof codexErrorInfo === 'string'
+    ? codexErrorInfo
+    : typeof details.error_code === 'string' ? details.error_code
+      : typeof details.errorCode === 'string' ? details.errorCode : null;
+  const errorCode = rawErrorCode?.replace(/[A-Z]/g, (character) => `_${character.toLowerCase()}`)
+    .trim().toLowerCase() ?? null;
+  if (httpStatus !== 429 && !MODEL_THROTTLE_ERROR_CODES.has(errorCode)) return null;
+  return {
+    schema_version: 1,
+    source: 'model_runner_transport',
+    provider: 'OpenAI',
+    http_status: httpStatus === 429 ? 429 : null,
+    error_code: errorCode,
+  };
+}
+
+export function trustedModelProviderErrorFromCodexJsonl(stdout) {
+  if (typeof stdout !== 'string' || !stdout) return null;
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    const trusted = codexTransportThrottleEvent(event);
+    if (trusted) return trusted;
+  }
+  return null;
+}
+
+export function attachTrustedModelProviderErrorFromCodexJsonl(result) {
+  if (typeof result !== 'object' || result === null || trustedModelProviderError(result)) return result;
+  const trusted = trustedModelProviderErrorFromCodexJsonl(result.stdout);
+  if (trusted) Object.defineProperty(result, TRUSTED_MODEL_PROVIDER_ERROR_FIELD, {value: trusted});
+  return result;
+}
+
+export function trustedModelProviderError(result) {
+  if (typeof result !== 'object' || result === null) return null;
+  const signal = result[TRUSTED_MODEL_PROVIDER_ERROR_FIELD];
+  if (typeof signal !== 'object' || signal === null || Array.isArray(signal) ||
+      signal.schema_version !== 1 || signal.source !== 'model_runner_transport' ||
+      signal.provider !== 'OpenAI') return null;
+  const httpStatus = Number.isInteger(signal.http_status) ? signal.http_status : null;
+  const errorCode = typeof signal.error_code === 'string' ? signal.error_code.trim().toLowerCase() : null;
+  if (httpStatus !== 429 && !MODEL_THROTTLE_ERROR_CODES.has(errorCode)) return null;
+  return {
+    schema_version: 1,
+    source: 'model_runner_transport',
+    provider: 'OpenAI',
+    http_status: httpStatus,
+    error_code: errorCode,
+  };
+}
+
+export function isProviderThrottle(error, {source = null} = {}) {
+  // Model output can contain arbitrary candidate-controlled text. The model-runner
+  // channel is therefore intentionally field-only: do not stringify or inspect any
+  // stdout, stderr, body, message, status, code, or response value on this path.
+  if (source === 'model_runner') return trustedModelProviderError(error) !== null;
   const statusValues = typeof error === 'object' && error !== null
     ? [error.status, error.statusCode, error.code, error.response?.status]
     : [];
-  if (statusValues.some((value) => Number(value) === 429)) return true;
   const text = typeof error === 'string'
     ? error
     : [error?.code, error?.message, error?.stdout, error?.stderr,
@@ -106,10 +195,15 @@ export function isProviderThrottle(error) {
         catch { return String(value); }
       })
       .join('\n');
-  if (/\bhttp(?:\/\d(?:\.\d)?)?\s*429\b|\b429\s+too many requests\b|\bstatus(?:\s+code)?\s*[:=]?\s*429\b/i.test(text) ||
-      /\bretry-after\b/i.test(text)) return true;
+  const providerContext = /\b(?:github|http(?:\/\d(?:\.\d)?)?|rate[_ -]*limit(?:ed|s)?|secondary|abuse|too many requests)\b/i
+    .test(text);
+  const gitTransport429 = source === 'git_transport' && /\b(?:returned\s+)?error:\s*429\b/i.test(text);
+  const numeric429 = statusValues.some((value) => Number(value) === 429) ||
+    /\bhttp(?:\/\d(?:\.\d)?)?\s*429\b|\b429\s+too many requests\b|\bstatus(?:\s+code)?\s*[:=]?\s*429\b|\b(?:returned\s+)?error:\s*429\b/i.test(text);
+  if (gitTransport429 || (numeric429 && providerContext)) return true;
+  if (/\bretry-after\b/i.test(text) && providerContext) return true;
   if (/\bsecondary[_ -]+rate[_ -]+limit(?:ed|s)?\b/i.test(text) || /\babuse[ -]+detection\b/i.test(text)) return true;
-  if (/\bthrottl(?:e|ed|ing)\b/i.test(text)) return true;
+  if (/\bthrottl(?:e|ed|ing)\b/i.test(text) && providerContext) return true;
   if (/(?:^|\n)\s*403(?:\s+forbidden)?\b[^\n]*\b(?:rate[_ -]*limit(?:ed|s)?|abuse)\b/i.test(text)) return true;
   const forbidden = statusValues.some((value) => Number(value) === 403) ||
     /\bhttp(?:\/\d(?:\.\d)?)?\s*403\b|\bstatus(?:\s+code)?\s*[:=]?\s*403\b/i.test(text);
@@ -130,17 +224,75 @@ export async function tripPersistentProviderThrottle(file, {
   provider,
   signal,
   at = new Date().toISOString(),
+  incidentId,
   gatewayLockHeld = false,
   gatewayStateDir,
   gatewayLockOptions,
 } = {}) {
+  if (typeof provider !== 'string' || !provider.trim() || typeof signal !== 'string' || !signal.trim() ||
+      (incidentId !== undefined && (typeof incidentId !== 'string' || !incidentId.trim())) ||
+      !Number.isFinite(Date.parse(at))) {
+    throw new Error('provider throttle trip binding metadata is invalid');
+  }
+  const effectiveIncidentId = incidentId?.trim() ??
+    `${provider.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-')}-provider-throttle-${new Date(at).toISOString()}`;
   return withGatewayLock({gatewayLockHeld, gatewayStateDir, gatewayLockOptions}, async () => {
     const value = await loadResourceControl(file);
+    const intended = {
+      kind: 'PROVIDER_THROTTLED', provider: provider.trim(), signal: signal.trim(),
+      tripped_at: new Date(at).toISOString(), incident_id: effectiveIncidentId, auto_resume: false,
+    };
     if (!value.provider_pause) {
-      value.provider_pause = {kind: 'PROVIDER_THROTTLED', provider, signal, tripped_at: at, auto_resume: false};
+      value.provider_pause = intended;
       await mkdir(path.dirname(file), {recursive: true, mode: 0o700});
       await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, {mode: 0o600});
+    } else if (!sameRecord(value.provider_pause, intended)) {
+      throw new Error('persistent provider throttle conflicts with the requested incident binding');
     }
+    return value.provider_pause;
+  });
+}
+
+export async function migratePersistentProviderThrottle(file, {
+  provider,
+  signal,
+  trippedAt,
+  migratedFromIncident,
+  migratedAt,
+  gatewayLockHeld = false,
+  gatewayStateDir,
+  gatewayLockOptions,
+} = {}) {
+  if (typeof provider !== 'string' || !provider.trim() || typeof signal !== 'string' || !signal.trim() ||
+      !Number.isFinite(Date.parse(trippedAt ?? '')) ||
+      typeof migratedFromIncident !== 'string' || !migratedFromIncident.trim() ||
+      !Number.isFinite(Date.parse(migratedAt ?? ''))) {
+    throw new Error('legacy provider-throttle migration metadata is invalid');
+  }
+  return withGatewayLock({gatewayLockHeld, gatewayStateDir, gatewayLockOptions}, async () => {
+    const value = await loadResourceControl(file);
+    const intended = {
+      kind: 'PROVIDER_THROTTLED',
+      provider: provider.trim(),
+      signal: signal.trim(),
+      tripped_at: new Date(trippedAt).toISOString(),
+      incident_id: migratedFromIncident.trim(),
+      auto_resume: false,
+      migrated_from_incident: migratedFromIncident.trim(),
+      migrated_at: new Date(migratedAt).toISOString(),
+    };
+    if (value.provider_pause) {
+      const existing = value.provider_pause;
+      const sameProvenance = existing.migrated_from_incident === migratedFromIncident.trim() &&
+        existing.incident_id === migratedFromIncident.trim() && existing.signal === signal.trim() &&
+        Number.isFinite(Date.parse(existing.tripped_at ?? '')) &&
+        new Date(existing.tripped_at).toISOString() === new Date(trippedAt).toISOString();
+      if (!sameProvenance) throw new Error('persistent provider throttle already exists with conflicting migration binding');
+      return existing;
+    }
+    value.provider_pause = intended;
+    await mkdir(path.dirname(file), {recursive: true, mode: 0o700});
+    await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, {mode: 0o600});
     return value.provider_pause;
   });
 }

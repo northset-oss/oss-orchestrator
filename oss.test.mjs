@@ -29,6 +29,8 @@ import {
   prepareMission,
   parseOssArgs,
   githubProviderThrottleFailure,
+  latchPrepareProviderThrottle,
+  requireModelRunnerSuccess,
   remainingAuthorModelMs,
   removeRunWorkspace,
   runAuthorContainer,
@@ -38,7 +40,7 @@ import {
   warmBatch,
   writeAttempt,
 } from './oss.mjs';
-import {GitHubThrottleError} from './gh-gateway.mjs';
+import {GitHubGatewayRefusalError, GitHubThrottleError} from './gh-gateway.mjs';
 import {
   OSS_IDENTITY,
   PROFILE_REGISTRY,
@@ -162,6 +164,7 @@ test('prepare records a gateway throttle as terminal PROVIDER_THROTTLED and neve
   let rechecks = 0;
   const options = {
     runsDir,
+    gatewayOptions: {stateDir: path.join(runsDir, 'gateway-state')},
     prepareAdapter: {
       recheck: async () => {
         rechecks += 1;
@@ -187,6 +190,7 @@ test('prepare records a gateway throttle as terminal PROVIDER_THROTTLED and neve
   const resourceControl = JSON.parse(await readFile(path.join(runsDir, 'phase0', 'resource-control.json'), 'utf8'));
   assert.equal(resourceControl.provider_pause.provider, 'GitHub');
   assert.equal(resourceControl.provider_pause.signal, 'GITHUB_SECONDARY_RATE_LIMIT');
+  await assert.rejects(() => readFile(path.join(runsDir, 'gh-gateway-state', 'state.json')), {code: 'ENOENT'});
 
   const replay = await prepareMission(value, options);
   assert.equal(replay.state, 'FAILED_INFRA_TERMINAL');
@@ -199,6 +203,87 @@ test('prepare records a gateway throttle as terminal PROVIDER_THROTTLED and neve
     attempt_sequence: 2,
   });
   assert.equal(lineage[0].terminal_reason_class, 'PROVIDER_THROTTLED');
+});
+
+test('non-throttle gateway refusals are never promoted to provider-throttle failures', () => {
+  const refusal = new GitHubGatewayRefusalError('daily budget is exhausted', {
+    reason: 'daily-budget-exhausted',
+  });
+  assert.equal(githubProviderThrottleFailure(refusal), null);
+});
+
+test('prepare does not classify quoted issue-body throttling language outside the GitHub gateway', async (t) => {
+  const runsDir = await mkdtemp(path.join(os.tmpdir(), 'northset-prepare-false-throttle-'));
+  t.after(() => rm(runsDir, {recursive: true, force: true}));
+  const value = spec({
+    mission_id: 'M-011',
+    schema_version: 2,
+    task_id: taskIdForCandidate('owner/repo#123'),
+    attempt_sequence: 1,
+    work_category: 'defect_fix',
+  });
+  const result = await prepareMission(value, {
+    runsDir,
+    gatewayOptions: {stateDir: path.join(runsDir, 'gateway-state')},
+    prepareAdapter: {
+      recheck: async () => {
+        throw new Error('issue body says: we should throttle the worker pool and honor retry-after');
+      },
+    },
+  });
+  assert.equal(result.state, 'FAILED_INFRA_TERMINAL');
+  assert.equal(result.failure_reason_code, undefined);
+  await assert.rejects(() => readFile(path.join(runsDir, 'phase0', 'resource-control.json')), {code: 'ENOENT'});
+});
+
+test('trusted author model-runner structured 429 latches OpenAI while untagged quoted author text does not', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'northset-author-model-throttle-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const resourceControlFile = path.join(root, 'phase0', 'resource-control.json');
+  let modelError;
+  try {
+    await requireModelRunnerSuccess('author container', {
+      code: 1,
+      stdout: JSON.stringify({type: 'turn.failed', error: {
+        message: 'HTTP 429 Too Many Requests',
+        codexErrorInfo: {responseTooManyFailedAttempts: {httpStatusCode: 429}},
+      }}),
+      stderr: 'candidate says secondary rate limit and Retry-After',
+    });
+  } catch (error) {
+    modelError = error;
+  }
+  const latched = await latchPrepareProviderThrottle(modelError, {
+    activeStage: 'author',
+    resourceControlFile,
+    gatewayOptions: {stateDir: path.join(root, 'gateway-state')},
+  });
+  assert.equal(latched.modelProviderThrottle, true);
+  const pause = JSON.parse(await readFile(resourceControlFile, 'utf8')).provider_pause;
+  assert.equal(pause.provider, 'OpenAI');
+  assert.equal(pause.signal, 'OPENAI_MODEL_RATE_LIMIT');
+  assert.equal(pause.auto_resume, false);
+
+  const quotedRoot = await mkdtemp(path.join(os.tmpdir(), 'northset-author-quoted-throttle-'));
+  t.after(() => rm(quotedRoot, {recursive: true, force: true}));
+  const quotedControl = path.join(quotedRoot, 'phase0', 'resource-control.json');
+  let quotedError;
+  try {
+    await requireModelRunnerSuccess('author container', {
+      code: 1,
+      stdout: 'HTTP 429 Too Many Requests',
+      stderr: 'candidate says secondary rate limit and Retry-After',
+    });
+  } catch (error) {
+    quotedError = error;
+  }
+  const quoted = await latchPrepareProviderThrottle(quotedError, {
+    activeStage: 'author',
+    resourceControlFile: quotedControl,
+    gatewayOptions: {stateDir: path.join(quotedRoot, 'gateway-state')},
+  });
+  assert.equal(quoted.modelProviderThrottle, false);
+  await assert.rejects(() => readFile(quotedControl), {code: 'ENOENT'});
 });
 
 test('prepare and ship command paths enforce activated Phase-1 schedule and incident holds', async (t) => {
@@ -224,7 +309,19 @@ test('prepare and ship command paths enforce activated Phase-1 schedule and inci
     ...overrides,
   });
   const controls = (incidents = []) => ({schema_version: 1, incidents, closures: [], hold_clearances: []});
-  const invoke = (commandArgs) => command(process.execPath, [path.join(import.meta.dirname, 'oss.mjs'), ...commandArgs], process.env);
+  const gatewayRoot = path.join(root, 'gateway');
+  const gatewayEnvironment = {
+    ...process.env,
+    OSS_GH_GATEWAY_TEST_MODE: '1',
+    OSS_GH_GATEWAY_TEST_LOCK_POLL_MS: '1',
+    OSS_GH_CANONICAL_ROOT: gatewayRoot,
+    OSS_GH_GATEWAY_STATE_DIR: path.join(gatewayRoot, 'state'),
+    OSS_GH_REQUEST_LEDGER: path.join(gatewayRoot, 'ledger.jsonl'),
+    OSS_RESOURCE_CONTROL_FILE: path.join(gatewayRoot, 'resource-control.json'),
+    OSS_CAMPAIGN_CONTROL_STATE: path.join(gatewayRoot, 'control-state.json'),
+  };
+  const invoke = (commandArgs) => command(process.execPath,
+    [path.join(import.meta.dirname, 'oss.mjs'), ...commandArgs], gatewayEnvironment);
 
   await writeFile(controlsFile, JSON.stringify(controls()));
   await writeFile(runtimeFile, JSON.stringify(runtime({board_monotonic_ms: monotonicNow() + 7 * 60 * 60 * 1000})));
@@ -846,6 +943,7 @@ test('dependency bootstrap has no credential mount; author mount appears only in
   assert.equal(bootstrap.some((part) => String(part).includes('/secret/codex')), false);
   assert.equal(bootstrap.includes('CODEX_HOME=/codex-home'), false);
   assert.ok(author.some((part) => String(part).includes('src=/secret/codex,dst=/codex-home')));
+  assert.match(author.at(-1), /codex exec --json/);
   for (const plan of [bootstrap, author]) {
     assert.ok(plan.includes('--rm'));
     assert.ok(plan.includes('--cap-drop=ALL'));
@@ -1186,8 +1284,7 @@ test('PR preparation rejects duplicate canonical or legacy receipt links before 
 
 test('timeline pagination and cross-reference parsing include closed attempts with timestamps', () => {
   const args = timelineApiArgs('owner', 'repo', 123);
-  assert.ok(args.includes('--paginate'));
-  assert.ok(args.includes('--slurp'));
+  assert.deepEqual(args, ['api', 'repos/owner/repo/issues/123/timeline?per_page=100&page=1']);
   assert.deepEqual(timelineCrossReferences([[{event: 'cross-referenced', created_at: '2026-01-01T00:00:00Z', source: {issue: {
     html_url: 'https://example/pr/1', state: 'closed', title: 'one', pull_request: {},
   }}}]]), [{source: 'https://example/pr/1', state: 'closed', title: 'one', is_pr: true, created_at: '2026-01-01T00:00:00Z'}]);
@@ -1209,15 +1306,16 @@ test('semantic PR matching is title-bounded and ignores unrelated dependency rel
 test('live recheck fails closed on invitation drift, issue drift, overlap, and Northset repo cap', async () => {
   assert.equal(LIVE_RECHECK_OUTPUT_LIMIT_BYTES, 10_000_000);
   const value = spec();
-  const state = {labels: ['help wanted'], updatedAt: value.qualification.issue_updated_at, comments: [], prs: [], timeline: [[]], designPresent: true, noticePresent: true};
+  const state = {labels: ['help wanted'], updatedAt: value.qualification.issue_updated_at, comments: [], prs: [], timeline: [], designPresent: true, noticePresent: true};
   const gh = async (args) => {
     const joined = args.join(' ');
     if (joined.includes('/issues/comments/1')) return state.designPresent ? {
       html_url: value.qualification.acceptance_contract.design_evidence[0].url,
       author_association: 'MEMBER', created_at: '2026-07-13T10:00:00Z',
     } : {html_url: 'https://github.com/owner/repo/issues/123#issuecomment-2', author_association: 'NONE'};
-    if (joined.includes('/comments?')) return [state.comments];
-    if (joined.includes('/timeline?')) return state.timeline;
+    const page = Number(/(?:\?|&)page=(\d+)/.exec(joined)?.[1] ?? 1);
+    if (joined.includes('/comments?')) return state.comments.slice((page - 1) * 100, page * 100);
+    if (joined.includes('/timeline?')) return state.timeline.slice((page - 1) * 100, page * 100);
     if (joined.startsWith('pr list')) return state.prs;
     if (joined.includes('/git/ref/heads/')) return {object: {sha: value.base_commit}};
     if (joined.includes('/issues/123')) return {
@@ -1229,6 +1327,22 @@ test('live recheck fails closed on invitation drift, issue drift, overlap, and N
   };
   const options = {gh, now: () => new Date('2026-07-13T12:00:00Z')};
   assert.equal((await recheck(value, async () => {}, options)).clean, true);
+  state.comments = Array.from({length: 300}, (_, index) => ({id: index + 1}));
+  const commentsBound = await recheck(value, async () => {}, options);
+  assert.equal(commentsBound.clean, false);
+  assert.ok(commentsBound.reasons.includes(
+    'evidence_truncated_too_active: issue comments reached the 300-item evidence bound'));
+  assert.deepEqual(commentsBound.snapshot.evidence_bounds.comments,
+    {page_size: 100, pages_fetched: 3, truncated: true});
+  state.comments = [];
+  state.timeline = Array.from({length: 300}, (_, index) => ({id: index + 1}));
+  const timelineBound = await recheck(value, async () => {}, options);
+  assert.equal(timelineBound.clean, false);
+  assert.ok(timelineBound.reasons.includes(
+    'evidence_truncated_too_active: issue timeline reached the 300-item evidence bound'));
+  assert.deepEqual(timelineBound.snapshot.evidence_bounds.timeline,
+    {page_size: 100, pages_fetched: 3, truncated: true});
+  state.timeline = [];
   const repoFallbackCalls = [];
   const repoFallbackGh = async (args) => {
     repoFallbackCalls.push(args);
@@ -1289,12 +1403,12 @@ test('live recheck fails closed on invitation drift, issue drift, overlap, and N
   }];
   state.prs = [{state: 'CLOSED', title: 'Parser bounded input fix', body: 'Fixes #123',
     url: 'https://github.com/owner/repo/pull/4', author: {login: 'someone'}, closedAt: '2026-07-12T12:00:00Z'}];
-  state.timeline = [[{event: 'cross-referenced', created_at: '2026-07-12T11:00:00Z', source: {issue: {
+  state.timeline = [{event: 'cross-referenced', created_at: '2026-07-12T11:00:00Z', source: {issue: {
     html_url: 'https://github.com/owner/repo/pull/4', state: 'closed', title: 'Parser bounded input fix',
     pull_request: {url: 'https://api.github.com/repos/owner/repo/pulls/4'},
-  }}}]];
+  }}}];
   assert.equal((await recheck(reviewedNotRelated, async () => {}, options)).clean, true);
-  state.timeline = [[]];
+  state.timeline = [];
   state.prs = [{state: 'OPEN', title: 'Other', body: '', url: 'https://github.com/owner/repo/pull/5', author: {login: 'AysajanE'}}];
   assert.match((await recheck(value, async () => {}, options)).reasons.join(' '), /already has an open PR/);
 

@@ -12,9 +12,14 @@ import {chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile} from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {PROFILE_REGISTRY, canonical, createDeadline, isInvitationLabel, normalizeLabel, repositoryPolicyLocator, run, runGhCommand, sha256, taskIdForCandidate} from './core.mjs';
+import {PROFILE_REGISTRY, canonical, createDeadline, fetchBoundedGitHubPages, isInvitationLabel, normalizeLabel, repositoryPolicyLocator, run, runGhCommand, sha256, taskIdForCandidate} from './core.mjs';
 import {candidateEvidenceKey} from './candidate-lake.mjs';
 import {isGhGatewayTerminalError} from './gh-gateway.mjs';
+import {
+  TRUSTED_MODEL_PROVIDER_ERROR_FIELD,
+  attachTrustedModelProviderErrorFromCodexJsonl,
+  trustedModelProviderError,
+} from './campaign/phase0/resource-breakers.mjs';
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const MODEL = process.env.OSS_REVIEW_MODEL || 'gpt-5.6-sol';
@@ -92,8 +97,24 @@ function parseJson(text, label) {
   catch (error) { throw new Error(`${label} returned invalid JSON: ${error.message}`); }
 }
 
-function flattenTimeline(value) {
-  return Array.isArray(value) ? value.flatMap((page) => Array.isArray(page) ? page : [page]) : [];
+export async function requireReviewModelRunnerSuccess(result, {statusFile = null} = {}) {
+  attachTrustedModelProviderErrorFromCodexJsonl(result);
+  if (result?.code === 0) return result;
+  const trustedProviderError = trustedModelProviderError(result);
+  if (trustedProviderError && statusFile !== null) {
+    if (!path.isAbsolute(statusFile)) throw new Error('model-runner status file must be absolute');
+    await writeFile(statusFile, `${JSON.stringify({
+      schema_version: 1,
+      kind: 'MODEL_PROVIDER_ERROR',
+      [TRUSTED_MODEL_PROVIDER_ERROR_FIELD]: trustedProviderError,
+    })}\n`, {flag: 'wx', mode: 0o600});
+  }
+  const error = new Error(`codex review failed${result?.timedOut ? ' (timeout)' : ''}: ${
+    (result?.stderr || result?.stdout || `exit ${result?.code}`).trim().slice(-2000)}`);
+  if (trustedProviderError) {
+    Object.defineProperty(error, TRUSTED_MODEL_PROVIDER_ERROR_FIELD, {value: trustedProviderError});
+  }
+  throw error;
 }
 
 function escapeRegex(value) {
@@ -155,6 +176,17 @@ export function hardGateReasons({issueData, repoData, exactOpenPrs = []}) {
   if (repoData.isArchived) reasons.push('Repository is archived.');
   if (repoData.isFork) reasons.push('Repository is a fork rather than the canonical project.');
   if (exactOpenPrs.length) reasons.push(`Open implementation PR found: ${exactOpenPrs.map((pr) => pr.url).join(', ')}`);
+  return reasons;
+}
+
+export function evidenceTruncationReasons(evidence) {
+  const reasons = [];
+  if (Number(evidence?.issueMeta?.comments) > 300) {
+    reasons.push(`evidence_truncated_too_active: issue has ${evidence.issueMeta.comments} comments, above the 300-item evidence bound`);
+  }
+  if (evidence?.evidence_bounds?.timeline?.truncated) {
+    reasons.push('evidence_truncated_too_active: issue timeline reached the 300-item evidence bound');
+  }
   return reasons;
 }
 
@@ -375,16 +407,29 @@ async function collectEvidence(issue, deadline) {
   const issueMetaJson = await checked('gh', ['api', `repos/${repoArg}/issues/${issue.number}`], {deadline});
   const repoJson = await checked('gh', ['repo', 'view', repoArg, '--json',
     'nameWithOwner,url,isArchived,isFork,licenseInfo,defaultBranchRef,description'], {deadline});
-  const timelineJson = await checked('gh', ['api', '--paginate', '--slurp',
-    '-H', 'Accept: application/vnd.github+json', `repos/${repoArg}/issues/${issue.number}/timeline`], {deadline});
+  const timelineEvidence = await fetchBoundedGitHubPages(async ({page, perPage}) => parseJson(
+    await checked('gh', ['api', '-H', 'Accept: application/vnd.github+json',
+      `repos/${repoArg}/issues/${issue.number}/timeline?per_page=${perPage}&page=${page}`], {deadline}),
+    `gh timeline page ${page}`,
+  ));
   const allPrJson = await checked('gh', ['pr', 'list', '-R', repoArg, '--state', 'all', '--limit', '100',
     '--json', 'number,title,body,url,headRefName,state,updatedAt,closedAt,mergedAt,author'], {deadline});
 
   const issueData = parseJson(issueJson, 'gh issue view');
   const issueMeta = parseJson(issueMetaJson, 'gh issue metadata');
   const repoData = parseJson(repoJson, 'gh repo view');
-  const timeline = flattenTimeline(parseJson(timelineJson, 'gh timeline'));
+  const timeline = timelineEvidence.items;
   const allPrs = parseJson(allPrJson, 'gh pr list');
+  const evidenceBounds = {
+    comments: {reported_total: Number(issueMeta.comments) || 0, limit: 300,
+      truncated: Number(issueMeta.comments) > 300},
+    timeline: {page_size: timelineEvidence.page_size, pages_fetched: timelineEvidence.pages_fetched,
+      truncated: timelineEvidence.truncated},
+  };
+  if (evidenceTruncationReasons({issueMeta, evidence_bounds: evidenceBounds}).length) {
+    return {issueData, issueMeta, repoData, timeline, evidence_bounds: evidenceBounds,
+      exactOpenPrs: [], candidateRelatedPrs: [], possibleSemanticPrs: []};
+  }
   const openPrs = allPrs.filter((pr) => pr.state === 'OPEN');
   const timelinePrs = timelinePullRequests(timeline);
   const exactOpenPrs = [
@@ -409,7 +454,9 @@ async function collectEvidence(issue, deadline) {
   }));
   const details = new Map(hydrated.map((pr) => [pr.url, pr]));
   const candidateRelatedPrs = relatedPlan.considered.map((pr) => details.get(pr.url) ?? {...pr, hydrated: false});
-  return {issueData, issueMeta, repoData, timeline, exactOpenPrs, candidateRelatedPrs,
+  return {issueData, issueMeta, repoData, timeline,
+    evidence_bounds: evidenceBounds,
+    exactOpenPrs, candidateRelatedPrs,
     possibleSemanticPrs: candidateRelatedPrs.filter((pr) => !exactOpenPrs.some((exact) => exact.url === pr.url))};
 }
 
@@ -684,7 +731,8 @@ export function buildSpecDraft(reviewResult, {
   };
 }
 
-async function review(issue, deadline = createDeadline(REVIEW_BUDGET_MS), requestedProfile = 'node', evidenceBinding = null) {
+async function review(issue, deadline = createDeadline(REVIEW_BUDGET_MS), requestedProfile = 'node',
+  evidenceBinding = null, {modelRunnerStatusFile = null} = {}) {
   const reviewStartedMs = Date.now();
   console.error(`review ${issue.key}: collecting live GitHub evidence…`);
   let evidence;
@@ -693,6 +741,8 @@ async function review(issue, deadline = createDeadline(REVIEW_BUDGET_MS), reques
     if (/plausible related PRs/.test(error.message)) return rejectResult(issue, [error.message]);
     throw error;
   }
+  const truncationReasons = evidenceTruncationReasons(evidence);
+  if (truncationReasons.length) return rejectResult(issue, truncationReasons);
   const hardReasons = hardGateReasons({...evidence});
   if (hardReasons.length && evidenceBinding === null) return rejectResult(issue, hardReasons);
 
@@ -736,7 +786,7 @@ async function review(issue, deadline = createDeadline(REVIEW_BUDGET_MS), reques
     codexHome = await createCodexHome();
 
     console.error(`review ${issue.key}: inspecting source with ${MODEL} (${EFFORT})…`);
-    const codex = await run('codex', ['exec', '--ephemeral', '--ignore-rules', '--sandbox', 'read-only',
+    const codex = await run('codex', ['exec', '--json', '--ephemeral', '--ignore-rules', '--sandbox', 'read-only',
       '--output-schema', schemaFile, '--output-last-message', resultFile, '--color', 'never',
       '--model', MODEL, '-c', `model_reasoning_effort="${EFFORT}"`, '-c', 'service_tier="fast"', '-C', repoDir, '-'], {
       env: codexEnvironment(codexHome, agentHome, agentTemp),
@@ -745,9 +795,7 @@ async function review(issue, deadline = createDeadline(REVIEW_BUDGET_MS), reques
       outputLimitBytes: CODEX_OUTPUT_LIMIT_BYTES,
       terminateOnOutputLimit: false,
     });
-    if (codex.code !== 0) {
-      throw new Error(`codex review failed${codex.timedOut ? ' (timeout)' : ''}: ${(codex.stderr || codex.stdout).trim().slice(-2000)}`);
-    }
+    await requireReviewModelRunnerSuccess(codex, {statusFile: modelRunnerStatusFile});
     const result = parseJson(await readFile(resultFile, 'utf8'), 'codex result');
     let enforced = enforceConservativeVerdict(result, issue, baseCommit, requestedProfile);
     const invitation = enforced.verdict === 'ACCEPT'
@@ -837,6 +885,7 @@ async function main() {
   let expectedEvidenceKey = null;
   let repoPolicySha256 = null;
   let repoPolicyJson = null;
+  const modelRunnerStatusFile = process.env.OSS_MODEL_RUNNER_STATUS_FILE ?? null;
   while (argv.length) {
     const value = argv.shift();
     if (value === '--profile') profile = argv.shift();
@@ -854,6 +903,9 @@ async function main() {
   }
   if (repoPolicyJson !== null && expectedEvidenceKey === null) {
     throw new Error('--repo-policy-json requires an evidence-bound review');
+  }
+  if (modelRunnerStatusFile !== null && !path.isAbsolute(modelRunnerStatusFile)) {
+    throw new Error('OSS_MODEL_RUNNER_STATUS_FILE must be absolute');
   }
   if (expectedEvidenceKey !== null && (!/^sha256:[0-9a-f]{64}$/i.test(expectedEvidenceKey) ||
       !/^sha256:[0-9a-f]{64}$/i.test(repoPolicySha256))) {
@@ -873,7 +925,7 @@ async function main() {
   let result;
   try { result = await review(issue, deadline, profile, expectedEvidenceKey === null ? null : {
     expectedEvidenceKey, repoPolicySha256, repoPolicySnapshot,
-  }); }
+  }, {modelRunnerStatusFile}); }
   catch (error) {
     if (isGhGatewayTerminalError(error)) throw error;
     if (deadline.expired() || /timeout|deadline|output limit/i.test(error.message)) {
