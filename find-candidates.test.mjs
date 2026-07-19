@@ -489,6 +489,7 @@ test('qualify latches only a trusted structured model 429 and stops its remainin
     }),
   });
   assert.equal(negative.state, 'REVIEW_TOOL_ERROR');
+  assert.match(negative.error, /secondary rate limit; honor Retry-After/);
   await assert.rejects(() => readFile(resourceControlFile), {code: 'ENOENT'});
 
   const positiveLake = await openCandidateLake(path.join(root, 'positive.sqlite'));

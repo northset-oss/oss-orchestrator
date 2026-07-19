@@ -2091,6 +2091,7 @@ export async function qualifyQueueRecords(records, {
           if (isTerminalGitHubSubprocessError(detail)) {
             throw new GitHubSubprocessTerminalError(`semantic reviewer hit a terminal GitHub gateway stop: ${detail}`);
           }
+          throw new Error(`semantic reviewer process failed: ${detail}`);
         }
         const review = executed?.verdict ? executed : JSON.parse(executed.stdout);
         const code = executed?.verdict ? (review.verdict === 'ACCEPT' ? 0 : 2) : executed.code;
