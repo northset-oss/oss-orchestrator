@@ -2,14 +2,14 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import test from 'node:test';
 
+import {boardDigest} from './board.mjs';
+import {batchApprovalDigest, canonical, readyItemDigest, sha256} from './db.mjs';
 import {
   PublisherCheckpointError,
   publishBoard,
   reconcileReceipt,
 } from './publisher.mjs';
 
-const BOARD_DIGEST = `sha256:${'b'.repeat(64)}`;
-const APPROVAL_DIGEST = `sha256:${'a'.repeat(64)}`;
 const RECEIPT_PROOF_DIGEST = `sha256:${'c'.repeat(64)}`;
 const RECEIPT_BATCH_OID = 'd'.repeat(40);
 
@@ -23,12 +23,9 @@ function oid(index) {
 
 function mission(index) {
   const id = `M-${String(index).padStart(3, '0')}`;
-  const itemDigest = digest(`item:${id}`);
-  return {
+  const manifest = {
     mission_id: id,
     task_id: `TASK-${String(index).padStart(3, '0')}`,
-    item_digest: itemDigest,
-    manifest_sha256: itemDigest,
     repository: `upstream${index}/project`,
     fork_repository: `northset/project-${index}`,
     repository_path: `/private/factory/M-${String(index).padStart(3, '0')}/repo`,
@@ -41,6 +38,13 @@ function mission(index) {
     pr_body: `## Summary\r\n\r\nBounded correction ${index}.\r\n`,
     receipt_claim: `The declared check for ${id} passed in the clean verifier.`,
     receipt_url: `https://example.test/receipts/${id}/proof.json`,
+  };
+  return {
+    ...manifest,
+    manifest,
+    item_digest: readyItemDigest(manifest),
+    manifest_sha256: sha256(Buffer.from(canonical(manifest), 'utf8')),
+    approval_state: 'APPROVED',
   };
 }
 
@@ -56,23 +60,34 @@ class FakeDb {
       const item = mission(index);
       this.ready.set(item.mission_id, structuredClone(item));
       items.push(structuredClone(item));
-      this.repositoryStates.set(item.repository, {open_northset_prs: 0});
+      this.repositoryStates.set(item.manifest.repository, {open_northset_prs: 0});
     }
-    this.board = {board_digest: BOARD_DIGEST, items};
+    const boardDigestValue = boardDigest(items);
+    const approvedAt = '2026-07-19T11:59:00.000Z';
+    const approvedIds = items.map((item) => item.mission_id);
+    this.board = {board_digest: boardDigestValue, items};
     this.approval = {
-      board_digest: BOARD_DIGEST,
-      approval_digest: APPROVAL_DIGEST,
-      approved_ids: items.map((item) => item.mission_id),
+      board_digest: boardDigestValue,
+      approval_digest: batchApprovalDigest({
+        boardDigest: boardDigestValue,
+        approvedMissionIds: approvedIds,
+        rejectedMissionIds: [],
+        approvedBy: 'internal-user:aeziz',
+        approvedAt,
+      }),
+      approved_ids: approvedIds,
+      rejected_ids: [],
       approved_by: 'internal-user:aeziz',
+      approved_at: approvedAt,
     };
   }
 
   async getBoard(digestValue) {
-    return digestValue === BOARD_DIGEST ? structuredClone(this.board) : null;
+    return digestValue === this.board.board_digest ? structuredClone(this.board) : null;
   }
 
   async getBoardApproval(digestValue) {
-    return digestValue === BOARD_DIGEST ? structuredClone(this.approval) : null;
+    return digestValue === this.board.board_digest ? structuredClone(this.approval) : null;
   }
 
   async getReadyItem(id) {
@@ -104,8 +119,10 @@ class FakeDb {
 
   async replaceReadyManifest(id, manifest) {
     const current = this.ready.get(id);
-    const next = {...current, ...structuredClone(manifest), mission_id: id,
-      approval_state: 'PENDING', manifest_sha256: digest(`refreshed:${id}`)};
+    const nextManifest = {...structuredClone(manifest), mission_id: id};
+    const next = {...current, ...nextManifest, manifest: nextManifest,
+      approval_state: 'PENDING', item_digest: readyItemDigest(nextManifest),
+      manifest_sha256: sha256(Buffer.from(canonical(nextManifest), 'utf8'))};
     this.ready.set(id, next);
     return structuredClone(next);
   }
@@ -231,11 +248,11 @@ test('publisher resumes after seven of twenty branch pushes without duplicates',
   const github = new FakeGitHub();
   db.failCheckpoint = {state: 'BRANCH_PUSHED', id: 'M-007', used: false};
 
-  await assert.rejects(() => publishBoard(BOARD_DIGEST, options(db, github)),
+  await assert.rejects(() => publishBoard(db.board.board_digest, options(db, github)),
     (error) => error instanceof PublisherCheckpointError);
   assert.equal(github.count('push_branch'), 7);
 
-  const resumed = await publishBoard(BOARD_DIGEST, options(db, github));
+  const resumed = await publishBoard(db.board.board_digest, options(db, github));
   assert.equal(resumed.results.filter((item) => item.state === 'SUBMITTED').length, 20);
   assert.equal(github.count('push_branch'), 20);
   assert.equal(new Set(github.events.filter((event) => event.operation === 'push_branch')
@@ -248,7 +265,7 @@ test('publisher adopts seven exact existing PRs after a crash without duplicates
   const github = new FakeGitHub();
   db.failCheckpoint = {state: 'PR_CHECKPOINTED', id: 'M-007', used: false};
 
-  await assert.rejects(() => publishBoard(BOARD_DIGEST, options(db, github)),
+  await assert.rejects(() => publishBoard(db.board.board_digest, options(db, github)),
     (error) => error instanceof PublisherCheckpointError);
   assert.equal(github.count('create_pull_request'), 7);
   for (let index = 1; index <= 7; index += 1) {
@@ -256,7 +273,7 @@ test('publisher adopts seven exact existing PRs after a crash without duplicates
       {open_northset_prs: 1});
   }
 
-  const resumed = await publishBoard(BOARD_DIGEST, options(db, github));
+  const resumed = await publishBoard(db.board.board_digest, options(db, github));
   assert.equal(resumed.results.filter((item) => item.state === 'SUBMITTED').length, 20);
   assert.equal(github.count('create_pull_request'), 20);
   assert.equal(github.pullRequests.size, 20);
@@ -267,7 +284,7 @@ test('publisher adopts seven exact existing PRs after a crash without duplicates
 test('one stale item is removed without stopping clean batch items', async () => {
   const db = new FakeDb(20);
   const github = new FakeGitHub();
-  const result = await publishBoard(BOARD_DIGEST, options(db, github, {
+  const result = await publishBoard(db.board.board_digest, options(db, github, {
     liveRecheck: async (item) => item.mission_id === 'M-008'
       ? {clean: false, reason: 'issue was claimed'} : {clean: true},
   }));
@@ -283,7 +300,7 @@ test('a cleanly refreshed moved-base item keeps its mission ID and returns alone
   const db = new FakeDb(3);
   const github = new FakeGitHub();
   const refreshedBase = 'e'.repeat(40);
-  const result = await publishBoard(BOARD_DIGEST, options(db, github, {
+  const result = await publishBoard(db.board.board_digest, options(db, github, {
     liveRecheck: async (item) => item.mission_id === 'M-002'
       ? {clean: false, refreshable: true, current_base_oid: refreshedBase, reason: 'base moved'}
       : {clean: true},
@@ -305,7 +322,7 @@ test('stored PR body or head mismatch fails only that item', async () => {
   const mismatched = db.ready.get('M-003');
   github.insertPullRequest(mismatched, {body: 'different approved bytes\n'});
 
-  const result = await publishBoard(BOARD_DIGEST, options(db, github));
+  const result = await publishBoard(db.board.board_digest, options(db, github));
   const failed = result.results.find((item) => item.mission_id === 'M-003');
   assert.equal(failed.code, 'STORED_PR_MISMATCH');
   assert.equal(result.results.filter((item) => item.state === 'SUBMITTED').length, 4);
@@ -315,10 +332,63 @@ test('stored PR body or head mismatch fails only that item', async () => {
   assert.equal(github.deleteCount, 0);
 });
 
+test('publisher recomputes immutable board bytes before any outbound action', async () => {
+  const db = new FakeDb(2);
+  const github = new FakeGitHub();
+  db.board.items[0].manifest.pr_title = 'UNAPPROVED TITLE';
+  await assert.rejects(
+    () => publishBoard(db.board.board_digest, options(db, github)),
+    /immutable board bytes do not match stored digests/,
+  );
+  assert.equal(github.events.length, 0);
+});
+
+test('each item gets another final live check immediately before its branch and PR', async () => {
+  const db = new FakeDb(2);
+  const github = new FakeGitHub();
+  const calls = new Map();
+  let receiptsPublished = false;
+  const result = await publishBoard(db.board.board_digest, options(db, github, {
+    liveRecheck: async (plan) => {
+      const count = (calls.get(plan.mission_id) ?? 0) + 1;
+      calls.set(plan.mission_id, count);
+      if (plan.mission_id === 'M-002' && count === 2) {
+        assert.equal(receiptsPublished, true);
+        return {clean: false, reason: 'a competing claim appeared'};
+      }
+      return {clean: true};
+    },
+    receiptPublisher: async (items) => {
+      receiptsPublished = true;
+      return receipts(items);
+    },
+  }));
+  assert.deepEqual([...calls.values()], [2, 2]);
+  assert.equal(result.results.find((item) => item.mission_id === 'M-001').state, 'SUBMITTED');
+  assert.equal(result.results.find((item) => item.mission_id === 'M-002').code, 'STALE_AFTER_RECEIPT');
+  assert.equal(github.count('create_pull_request'), 1);
+});
+
+test('crash recovery adopts an exact PR that closed before its checkpoint retry', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  db.failCheckpoint = {state: 'PR_CHECKPOINTED', id: 'M-001', used: false};
+  await assert.rejects(() => publishBoard(db.board.board_digest, options(db, github)),
+    (error) => error instanceof PublisherCheckpointError);
+  assert.equal(github.count('create_pull_request'), 1);
+  const existing = [...github.pullRequests.values()][0];
+  existing.state = 'CLOSED';
+  const resumed = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(github.count('create_pull_request'), 1);
+  assert.equal(resumed.results[0].state, 'SUBMITTED');
+  assert.equal(resumed.results[0].pr_state, 'CLOSED');
+  assert.equal(db.repositoryStates.get(existing.repository).open_northset_prs, 0);
+});
+
 test('attestation failure leaves the upstream PR open and unique', async () => {
   const db = new FakeDb(1);
   const github = new FakeGitHub();
-  await publishBoard(BOARD_DIGEST, options(db, github));
+  await publishBoard(db.board.board_digest, options(db, github));
   let statusCalls = 0;
   const result = await reconcileReceipt('M-001', {
     db,
@@ -341,7 +411,7 @@ test('attestation failure leaves the upstream PR open and unique', async () => {
 test('final status publication failure leaves a recoverable submitted state', async () => {
   const db = new FakeDb(1);
   const github = new FakeGitHub();
-  await publishBoard(BOARD_DIGEST, options(db, github));
+  await publishBoard(db.board.board_digest, options(db, github));
   const result = await reconcileReceipt('M-001', {
     db,
     attestor: async () => ({attestation_url: 'https://example.test/attestations/M-001'}),

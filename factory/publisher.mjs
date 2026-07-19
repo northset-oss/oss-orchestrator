@@ -1,3 +1,6 @@
+import {boardDigest as computeBoardDigest} from './board.mjs';
+import {batchApprovalDigest, canonical, readyItemDigest, sha256} from './db.mjs';
+
 const FINAL_SUBMISSION = 'final_submission';
 
 export class PublisherCheckpointError extends Error {
@@ -52,6 +55,38 @@ function itemDigest(item) {
 function approvedMissionIds(approval) {
   return jsonList(value(approval?.approved_mission_ids, approval?.approved_ids,
     approval?.approved_ids_json));
+}
+
+function rejectedMissionIds(approval) {
+  return jsonList(value(approval?.rejected_mission_ids, approval?.rejected_ids,
+    approval?.rejected_ids_json));
+}
+
+function manifestDigest(manifest) {
+  return sha256(Buffer.from(canonical(manifest), 'utf8'));
+}
+
+function verifyStoredApproval(board, approval, expectedBoardDigest) {
+  for (const item of boardItems(board)) {
+    const manifest = manifestFor(item);
+    if (manifestDigest(manifest) !== value(item.manifest_sha256, item.manifest_digest) ||
+        readyItemDigest(manifest) !== itemDigest(item)) {
+      throw new Error(`${missionId(item) ?? 'board item'} immutable board bytes do not match stored digests`);
+    }
+  }
+  if (computeBoardDigest(boardItems(board)) !== expectedBoardDigest) {
+    throw new Error('board digest does not match immutable board contents');
+  }
+  const computedApproval = batchApprovalDigest({
+    boardDigest: expectedBoardDigest,
+    approvedMissionIds: approvedMissionIds(approval),
+    rejectedMissionIds: rejectedMissionIds(approval),
+    approvedBy: value(approval.approved_by, approval.approvedBy),
+    approvedAt: value(approval.approved_at, approval.approvedAt),
+  });
+  if (computedApproval !== value(approval.approval_digest, approval.digest)) {
+    throw new Error('approval digest does not match the immutable owner decision');
+  }
 }
 
 function approvalDigestFor(approval, id) {
@@ -156,6 +191,8 @@ function prFields(pr) {
     head_oid: value(pr.head_oid, pr.headRefOid, pr.head?.sha),
     title: pr.title,
     body: typeof pr.body === 'string' ? normalizePrBody(pr.body) : null,
+    state: value(pr.state, pr.status_state),
+    merged: pr.merged === true,
   };
 }
 
@@ -318,6 +355,7 @@ async function publishOne(plan, {db, github, safety, now, repositoryState}) {
       'stored pull request title, body, base, repository, or head does not match the approval');
   }
   const stored = prFields(readback);
+  const closed = String(stored.state ?? '').toUpperCase() === 'CLOSED';
   await checkpoint(db, plan.mission_id, {
     pr_number: stored.number,
     pr_url: stored.url,
@@ -325,12 +363,13 @@ async function publishOne(plan, {db, github, safety, now, repositoryState}) {
     pr_base_branch: stored.base_branch,
     publication_state: 'SUBMITTED',
     attestation_state: 'ATTESTATION_PENDING',
+    status_state: 'PENDING',
     submitted_at: timestamp(now),
     last_error: null,
     last_error_detail: null,
   }, `${plan.mission_id} submission`);
   await db.updateTaskState(plan.task_id, 'PR_OPENED');
-  if (typeof db.setRepositoryState === 'function') {
+  if (!closed && typeof db.setRepositoryState === 'function') {
     const latest = await db.getRepositoryState(plan.repository) ?? {};
     await db.setRepositoryState(plan.repository, {
       open_northset_prs: Number(latest.open_northset_prs ?? 0) + 1,
@@ -338,7 +377,8 @@ async function publishOne(plan, {db, github, safety, now, repositoryState}) {
       last_pr_at: timestamp(now),
     });
   }
-  return {mission_id: plan.mission_id, state: 'SUBMITTED', pr_number: stored.number, pr_url: stored.url};
+  return {mission_id: plan.mission_id, state: 'SUBMITTED', pr_number: stored.number, pr_url: stored.url,
+    pr_state: closed ? (stored.merged ? 'MERGED' : 'CLOSED') : 'OPEN'};
 }
 
 export async function publishBoard(boardDigest, {
@@ -362,6 +402,7 @@ export async function publishBoard(boardDigest, {
   const approval = await db.getBoardApproval(boardDigest);
   if (!approval) throw new Error('board has no owner approval');
   if (value(approval.board_digest, approval.digest) !== boardDigest) throw new Error('approval board digest mismatch');
+  verifyStoredApproval(board, approval, boardDigest);
   const approved = approvedMissionIds(approval);
   if (!approved.length) return {board_digest: boardDigest, results: []};
   const immutableById = new Map(boardItems(board).map((item) => [missionId(item), item]));
@@ -392,6 +433,8 @@ export async function publishBoard(boardDigest, {
     const approvedDigest = approvalDigestFor(approval, id);
     if (!immutableDigest || immutableDigest !== currentDigest ||
         !immutableManifestSha || immutableManifestSha !== currentManifestSha ||
+        readyItemDigest(manifestFor(ready)) !== currentDigest ||
+        manifestDigest(manifestFor(ready)) !== currentManifestSha ||
         (approvedDigest !== null && approvedDigest !== immutableDigest)) {
       results.push(await failItem(db, plan, 'APPROVAL_INVALIDATED',
         'the current READY item no longer matches its immutable approved bytes'));
@@ -483,6 +526,32 @@ export async function publishBoard(boardDigest, {
 
   for (const {plan, repositoryState} of clean) {
     try {
+      const live = await throughSafety(safety, 'read', 'final_live_recheck', {
+        repository: plan.repository,
+      }, () => liveRecheck(plan));
+      if (live?.cooldown && typeof db.setRepositoryState === 'function') {
+        await db.setRepositoryState(plan.repository, {
+          cooldown_reason: live.cooldown.reason,
+          cooldown_until: live.cooldown.until ?? 'manual-release',
+        });
+      }
+      if (!live?.clean) {
+        if (live?.refreshable === true && typeof refreshStale === 'function') {
+          const refreshed = await refreshStale(plan, live);
+          if (!refreshed?.manifest) {
+            results.push({mission_id: plan.mission_id, state: 'READY', code: 'REBASE_FAILED',
+              detail: refreshed?.reason ?? 'stale refresh did not produce a verified manifest'});
+            continue;
+          }
+          const ready = await db.replaceReadyManifest(plan.mission_id, refreshed.manifest);
+          results.push({mission_id: plan.mission_id, state: 'READY', code: 'REAPPROVAL_REQUIRED',
+            manifest_sha256: ready.manifest_sha256});
+          continue;
+        }
+        results.push(await failItem(db, plan, 'STALE_AFTER_RECEIPT',
+          live?.reason ?? 'final live recheck was not clean', 'SUPERSEDED'));
+        continue;
+      }
       results.push(await publishOne(plan, {
         db, github, safety, now,
         repositoryState,

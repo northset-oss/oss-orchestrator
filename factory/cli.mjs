@@ -10,6 +10,7 @@ import {createGitHubSafety, resumeGitHub} from './github-safety.mjs';
 import {publishBoard} from './publisher.mjs';
 import {createReceiptPublisher} from './receipt-publisher.mjs';
 import {createSource} from './source.mjs';
+import {createStaleRefresher} from './stale-refresh.mjs';
 import {createCommandDriver, runFactoryCycle} from './worker.mjs';
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -20,6 +21,7 @@ export const FACTORY_DEFAULTS = Object.freeze({
   lake: path.join(REPO_ROOT, 'candidate_lake.sqlite'),
   pauseFile: path.join(REPO_ROOT, 'runs', 'factory', 'github-pause.json'),
   workRoot: path.join(REPO_ROOT, 'runs', 'factory', 'work'),
+  artifactRoot: path.join(REPO_ROOT, 'runs', 'factory', 'artifacts'),
   workerCommand: path.join(REPO_ROOT, 'factory', 'node-worker.mjs'),
   receiptRemote: 'https://github.com/northset-oss/verification-pilot.git',
 });
@@ -28,12 +30,12 @@ const COMMANDS = new Set(['run', 'board', 'approve', 'publish', 'github-status',
 const COMMON_VALUE_FLAGS = new Set(['--db', '--pause-file', '--gh-bin']);
 const COMMAND_VALUE_FLAGS = Object.freeze({
   run: new Set(['--lake', '--profile', '--workers', '--board-size', '--board-max-age-minutes',
-    '--candidate-limit', '--worker-command', '--work-root', '--poll-ms']),
+    '--candidate-limit', '--worker-command', '--work-root', '--artifact-root', '--poll-ms']),
   board: new Set(),
   approve: new Set(['--board', '--ids', '--reject-ids', '--approved-by']),
-  publish: new Set(['--board', '--receipt-remote']),
+  publish: new Set(['--board', '--receipt-remote', '--artifact-root']),
   'github-status': new Set(),
-  'github-resume': new Set(['--reason', '--cleared-by']),
+  'github-resume': new Set(['--reason', '--cleared-by', '--repository']),
 });
 const COMMAND_BOOLEAN_FLAGS = Object.freeze({
   run: new Set(['--once']),
@@ -145,6 +147,8 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
       workerCommand: parsed.get('--worker-command') ?? env.OSS_FACTORY_WORKER_COMMAND ??
         FACTORY_DEFAULTS.workerCommand,
       workRoot: pathValue(parsed.get('--work-root') ?? env.OSS_FACTORY_WORK_ROOT, FACTORY_DEFAULTS.workRoot),
+      artifactRoot: pathValue(parsed.get('--artifact-root') ?? env.OSS_FACTORY_ARTIFACT_ROOT,
+        FACTORY_DEFAULTS.artifactRoot),
       pollMs: nonnegativeInteger(parsed.get('--poll-ms') ?? '5000', '--poll-ms'),
       once: parsed.get('--once') === true,
     };
@@ -154,8 +158,11 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
     if (!/^sha256:[a-f0-9]{64}$/.test(board ?? '')) {
       throw new Error('--board must be a sha256:<64 lowercase hex> digest');
     }
-    const ids = commaSeparatedIds(parsed.get('--ids'), '--ids', {required: true});
+    const ids = commaSeparatedIds(parsed.get('--ids'), '--ids');
     const rejectedIds = commaSeparatedIds(parsed.get('--reject-ids'), '--reject-ids');
+    if (!ids.length && !rejectedIds.length) {
+      throw new Error('approve requires --ids, --reject-ids, or both');
+    }
     if (ids.some((id) => rejectedIds.includes(id))) {
       throw new Error('a mission cannot appear in both --ids and --reject-ids');
     }
@@ -177,6 +184,8 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
       board,
       receiptRemote: parsed.get('--receipt-remote') ?? env.OSS_FACTORY_RECEIPT_REMOTE ??
         FACTORY_DEFAULTS.receiptRemote,
+      artifactRoot: pathValue(parsed.get('--artifact-root') ?? env.OSS_FACTORY_ARTIFACT_ROOT,
+        FACTORY_DEFAULTS.artifactRoot),
     };
   }
   if (command === 'github-resume') {
@@ -186,6 +195,7 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
       ...common,
       reason: reason.trim(),
       clearedBy: parsed.get('--cleared-by') ?? env.OSS_FACTORY_APPROVED_BY ?? 'internal-user:aeziz',
+      repository: parsed.get('--repository') ?? null,
     };
   }
   return common;
@@ -217,6 +227,15 @@ function sourceSummary(value) {
   };
 }
 
+function recoverableSourceError(error) {
+  if (error?.transient === true) return true;
+  if (Number(error?.httpStatus ?? error?.status) >= 500) return true;
+  return [
+    'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETDOWN', 'ENETUNREACH',
+    'EHOSTUNREACH', 'GH_COMMAND_TIMEOUT', 'GH_OUTPUT_LIMIT', 'SQLITE_BUSY', 'SQLITE_LOCKED',
+  ].includes(String(error?.code ?? '').toUpperCase());
+}
+
 function defaultSleep(milliseconds, signal) {
   if (signal?.aborted || milliseconds === 0) return Promise.resolve();
   return new Promise((resolve) => {
@@ -242,6 +261,7 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
   createTransport: createGhCliTransport,
   createPublisherAdapter: createGhCliPublisherAdapter,
   createReceiptPublisher,
+  createStaleRefresher,
   createSafety: createGitHubSafety,
   resumeGitHub,
 });
@@ -266,6 +286,33 @@ export async function executeFactoryCli(argv, {
     return result;
   }
   if (options.command === 'github-resume') {
+    if (options.repository !== null) {
+      if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(options.repository)) {
+        throw new Error('--repository must be owner/name');
+      }
+      const db = deps.openDb(options.database);
+      try {
+        const current = await db.getRepositoryState(options.repository);
+        if (!current?.cooldown_reason && !current?.cooldown_until) {
+          throw new Error(`${options.repository} has no repository cooldown to clear`);
+        }
+        const cleared = await db.setRepositoryState(options.repository, {
+          cooldown_reason: null,
+          cooldown_until: null,
+        });
+        const result = {
+          repository: options.repository,
+          cooldown_cleared: true,
+          cleared_by: options.clearedBy,
+          clear_reason: options.reason,
+          repository_state: cleared,
+        };
+        printJson(stdout, result);
+        return result;
+      } finally {
+        db.close?.();
+      }
+    }
     const result = await deps.resumeGitHub({
       pauseFile: options.pauseFile,
       reason: options.reason,
@@ -328,6 +375,7 @@ export async function executeFactoryCli(argv, {
       const driver = dependencies.driver ?? deps.createDriver({
         command: options.workerCommand,
         workRoot: options.workRoot,
+        artifactRoot: options.artifactRoot,
         checkoutProvider,
       });
       const recovered = db.recoverWorkingTasks?.() ?? [];
@@ -336,6 +384,8 @@ export async function executeFactoryCli(argv, {
       let iterations = 0;
       let claimed = 0;
       let completed = 0;
+      let sourceFailures = 0;
+      let lastSourceError = null;
       let lastCycle = null;
       while (!signal?.aborted) {
         let filled;
@@ -347,8 +397,15 @@ export async function executeFactoryCli(argv, {
             now: new Date(),
           });
         } catch (error) {
-          if (error?.code !== 'GITHUB_PAUSED') throw error;
-          filled = {candidates: [], results: [], enqueued: [], paused: true};
+          if (error?.code === 'GITHUB_PAUSED') {
+            filled = {candidates: [], results: [], enqueued: [], paused: true};
+          } else if (recoverableSourceError(error)) {
+            sourceFailures += 1;
+            lastSourceError = error.message;
+            filled = {candidates: [], results: [], enqueued: [], source_error: true};
+          } else {
+            throw error;
+          }
         }
         const summary = sourceSummary(filled);
         for (const key of ['selected', 'go', 'skipped', 'escalated', 'enqueued']) {
@@ -379,6 +436,8 @@ export async function executeFactoryCli(argv, {
         claimed,
         completed,
         stopped: signal?.aborted === true,
+        source_failures: sourceFailures,
+        last_source_error: lastSourceError,
         last_cycle: lastCycle,
         stats: db.stats?.() ?? null,
       };
@@ -421,12 +480,31 @@ export async function executeFactoryCli(argv, {
       const receiptPublisher = dependencies.receiptPublisher ?? deps.createReceiptPublisher({
         remoteUrl: options.receiptRemote,
       });
+      const refreshStale = dependencies.refreshStale ?? deps.createStaleRefresher({
+        artifactRoot: options.artifactRoot,
+        fetchBase: async (plan, live, context) => {
+          await safety.request({
+            priority: 'final_submission',
+            kind: 'read',
+            operation: 'refresh_base_fetch',
+            repository: plan.repository,
+            execute: () => transport({
+              operation: 'git_fetch',
+              repository_path: context.repository_path,
+              remote: `https://github.com/${plan.repository}.git`,
+              refspec: `+refs/heads/${plan.base_branch}:refs/remotes/northset-refresh/${plan.base_branch}`,
+            }),
+          });
+          return {base_oid: context.expected_oid ?? live.current_base_oid};
+        },
+      });
       const result = await deps.publishBoard(options.board, {
         db,
         github,
         safety,
         liveRecheck,
         receiptPublisher,
+        refreshStale,
       });
       printJson(stdout, result);
       return result;

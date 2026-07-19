@@ -237,16 +237,50 @@ test('enqueue sends only GO tasks and never allocates a public mission ID', asyn
 
 test('createSource fills from lake through one preflight and injected enqueue seam', async () => {
   let enqueued = 0;
+  let recorded = 0;
   const source = createSource({
     query: async () => [row(1)],
     github: {graphql: async () => ({data: {c0: graphRepository(1), n0: {issueCount: 0}}})},
-    db: {enqueueTasks: async (tasks) => { enqueued += tasks.length; return tasks.length; }},
+    db: {
+      enqueueTasks: async (tasks) => { enqueued += tasks.length; return tasks.length; },
+      recordPreflightOutcomes: async (results) => { recorded += results.length; },
+    },
   });
   const result = await source.fill({workers: 1, now: NOW});
   assert.equal(result.candidates.length, 1);
   assert.equal(result.results[0].outcome, 'GO');
   assert.equal(result.enqueued, 1);
   assert.equal(enqueued, 1);
+  assert.equal(recorded, 1);
+});
+
+test('skipped preflights are recorded so the continuous source does not retry them forever', async () => {
+  const known = [];
+  let githubCalls = 0;
+  const source = createSource({
+    query: async () => [row(1)],
+    github: {graphql: async () => {
+      githubCalls += 1;
+      const repository = graphRepository(1);
+      repository.issue.state = 'CLOSED';
+      return {data: {c0: repository, n0: {issueCount: 0}}};
+    }},
+    db: {
+      listTasks: () => known,
+      recordPreflightOutcomes: (results) => {
+        known.push(...results.map((result) => ({
+          candidate: result.candidate.candidate,
+          state: 'SKIPPED',
+        })));
+      },
+      enqueueTasks: async (tasks) => tasks,
+    },
+  });
+  const first = await source.fill({workers: 1, now: NOW});
+  assert.equal(first.results[0].outcome, 'SKIP');
+  const second = await source.fill({workers: 1, now: NOW});
+  assert.equal(second.candidates.length, 0);
+  assert.equal(githubCalls, 1);
 });
 
 test('source does not call GitHub when queued and working tasks already fill the target depth', async () => {

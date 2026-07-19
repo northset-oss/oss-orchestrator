@@ -3,8 +3,6 @@
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {
-  access,
-  copyFile,
   mkdir,
   mkdtemp,
   readFile,
@@ -184,15 +182,18 @@ async function resolveNodeCommands(checkout, scout = {}) {
 
 async function prepareCodexHome(root, sourceHome = process.env.CODEX_HOME ??
   path.join(process.env.HOME ?? '', '.codex')) {
-  const authSource = path.join(sourceHome, 'auth.json');
-  await access(authSource);
   const codexHome = path.join(root, 'codex-home');
   await mkdir(codexHome, {recursive: true, mode: 0o700});
-  await copyFile(authSource, path.join(codexHome, 'auth.json'));
   await writeFile(path.join(codexHome, 'config.toml'), [
     'approval_policy = "never"',
+    'sandbox_mode = "workspace-write"',
     '[history]',
     'persistence = "none"',
+    '[shell_environment_policy]',
+    'inherit = "core"',
+    'exclude = ["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"]',
+    '[sandbox_workspace_write]',
+    'network_access = false',
     '[features]',
     'apps = false',
     'memories = false',
@@ -200,6 +201,19 @@ async function prepareCodexHome(root, sourceHome = process.env.CODEX_HOME ??
     '',
   ].join('\n'), {mode: 0o600});
   return codexHome;
+}
+
+async function loadCodexAccessToken(sourceHome = process.env.CODEX_HOME ??
+  path.join(process.env.HOME ?? '', '.codex')) {
+  if (typeof process.env.CODEX_ACCESS_TOKEN === 'string' && process.env.CODEX_ACCESS_TOKEN) {
+    return process.env.CODEX_ACCESS_TOKEN;
+  }
+  const auth = JSON.parse(await readFile(path.join(sourceHome, 'auth.json'), 'utf8'));
+  const token = auth?.tokens?.access_token ?? auth?.access_token;
+  if (typeof token !== 'string' || !token) {
+    throw new Error('Codex access token is unavailable; refresh the host Codex login');
+  }
+  return token;
 }
 
 export function codexDockerArgs({
@@ -221,10 +235,10 @@ export function codexDockerArgs({
     '--mount', `type=bind,src=${checkout},dst=/workspace${workspaceSuffix}`,
     '--mount', `type=bind,src=${path.join(checkout, '.git')},dst=/workspace/.git,readonly`,
     '--mount', `type=bind,src=${codexHome},dst=/codex-home`,
-    '--mount', `type=bind,src=${path.join(codexHome, 'auth.json')},dst=/codex-home/auth.json,readonly`,
     '--mount', `type=bind,src=${outputRoot},dst=/northset-output`,
     '--workdir', '/workspace', '--env', 'HOME=/tmp', '--env', 'CI=true',
-    '--env', 'CODEX_HOME=/codex-home', '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=1g',
+    '--env', 'CODEX_HOME=/codex-home', '--env', 'CODEX_ACCESS_TOKEN',
+    '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=1g',
   ];
   if (readOnly) args.push('--read-only');
   for (const mount of dependencyMaterial?.mounts ?? []) {
@@ -232,8 +246,8 @@ export function codexDockerArgs({
     args.push('--mount', `type=volume,src=${mount.source},dst=${mount.target},readonly`);
   }
   args.push('--entrypoint', 'codex', image,
-    'exec', '--json', '--ephemeral', '--dangerously-bypass-approvals-and-sandbox',
-    '--skip-git-repo-check', '--output-schema', `/northset-output/${path.basename(schemaFile)}`,
+    'exec', '--json', '--ephemeral', '--sandbox', 'workspace-write', '--ignore-user-config',
+    '--ignore-rules', '--skip-git-repo-check', '--output-schema', `/northset-output/${path.basename(schemaFile)}`,
     '--output-last-message', `/northset-output/${path.basename(outputFile)}`,
     '--color', 'never', '--model', model,
     '-c', `model_reasoning_effort="${effort}"`, '-c', 'service_tier="fast"', '-C', '/workspace', '-');
@@ -256,6 +270,7 @@ async function defaultCodexRunner({
   const root = await mkdtemp(path.join(os.tmpdir(), 'northset-factory-codex-'));
   try {
     const codexHome = await prepareCodexHome(root, codexHomeSource);
+    const accessToken = await loadCodexAccessToken(codexHomeSource);
     const outputRoot = path.join(root, 'output');
     await mkdir(outputRoot, {mode: 0o700});
     const schemaFile = path.join(outputRoot, 'schema.json');
@@ -267,6 +282,7 @@ async function defaultCodexRunner({
     });
     await mustRun(run, 'docker', args, {
       input: prompt,
+      env: {...process.env, CODEX_ACCESS_TOKEN: accessToken},
       timeoutMs,
       maxOutputBytes: OUTPUT_LIMIT,
     }, 'Codex container');
@@ -553,7 +569,7 @@ export function createNodeWorker({
         const marker = await run('docker', [
           'run', '--rm', '--network=none',
           '--mount', `type=volume,src=${volume},dst=/deps,readonly`,
-          image, 'test', '-f', '/deps/.northset-ready',
+          imageDigest, 'test', '-f', '/deps/.northset-ready',
         ], {timeoutMs: 30_000});
         reused = marker.code === 0;
         if (reused) return;
@@ -562,7 +578,7 @@ export function createNodeWorker({
           await mustRun(run, 'docker', bootstrapDockerArgs({
             checkout: payload.checkout,
             volume,
-            image,
+            image: imageDigest,
             installCommand: commands.installCommand,
           }), {timeoutMs: INSTALL_TIMEOUT_MS, maxOutputBytes: OUTPUT_LIMIT}, 'dependency bootstrap');
         } catch (error) {
@@ -572,7 +588,7 @@ export function createNodeWorker({
       });
       return {
         cache_key: cacheKey,
-        image,
+        image: imageDigest,
         image_digest: imageDigest,
         install_command: commands.installCommand,
         test_command: commands.testCommand,
@@ -589,7 +605,7 @@ export function createNodeWorker({
       checkout: payload.checkout,
       schema: AUTHOR_SCHEMA,
       prompt: authorPrompt(payload.task, payload.scout, payload),
-      image,
+      image: payload.dependencyMaterial?.image_digest ?? payload.dependencyMaterial?.image ?? image,
       model,
       effort: payload.effort ?? 'high',
       readOnly: false,
@@ -656,7 +672,7 @@ export function createNodeWorker({
       const runContainer = async (plan) => run('docker', runtimeDockerArgs({
         checkout: plan.checkout,
         volume,
-        image: dependency.image ?? image,
+        image: dependency.image_digest ?? dependency.image ?? image,
         command: plan.command,
       }), {timeoutMs: VERIFY_TIMEOUT_MS, maxOutputBytes: OUTPUT_LIMIT});
       const result = await verifier({

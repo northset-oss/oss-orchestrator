@@ -1,4 +1,4 @@
-import {mkdir, readFile, rename, writeFile} from 'node:fs/promises';
+import {mkdir, readFile, rename, rm, stat, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 
@@ -186,6 +186,59 @@ async function writePause(pauseFile, value) {
   return value;
 }
 
+async function readJsonFile(file, fallback) {
+  try {
+    const value = JSON.parse(await readFile(file, 'utf8'));
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : fallback;
+  } catch (error) {
+    if (error.code === 'ENOENT') return fallback;
+    throw error;
+  }
+}
+
+async function writeJsonFile(file, value) {
+  await mkdir(path.dirname(file), {recursive: true});
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {mode: 0o600});
+  await rename(temporary, file);
+  return value;
+}
+
+function emptyGovernor() {
+  return {
+    schema_version: 1,
+    last_mutation_start: null,
+    last_search_start: null,
+    publications: [],
+    open_repositories: {},
+  };
+}
+
+async function acquireLease(lockDirectory, {staleMs = 5 * 60_000} = {}) {
+  while (true) {
+    try {
+      await mkdir(lockDirectory, {mode: 0o700});
+      await writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
+        pid: process.pid, acquired_at: new Date().toISOString(),
+      })}\n`, {mode: 0o600});
+      return async () => rm(lockDirectory, {recursive: true, force: true});
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      try {
+        const info = await stat(lockDirectory);
+        if (Date.now() - info.mtimeMs > staleMs) {
+          await rm(lockDirectory, {recursive: true, force: true});
+          continue;
+        }
+      } catch (inspectError) {
+        if (inspectError.code === 'ENOENT') continue;
+        throw inspectError;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+}
+
 function pauseFromInspection(inspection, now) {
   const observedAt = iso(now);
   return {
@@ -254,6 +307,7 @@ function activeCooldown(state, nowMs) {
 
 export function createGitHubSafety({
   pauseFile,
+  governorFile = `${pauseFile}.governor.json`,
   transport,
   now = () => Date.now(),
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
@@ -262,6 +316,7 @@ export function createGitHubSafety({
   repositoryState = null,
 } = {}) {
   if (typeof pauseFile !== 'string' || !pauseFile) throw new TypeError('pauseFile is required');
+  if (typeof governorFile !== 'string' || !governorFile) throw new TypeError('governorFile is required');
   if (typeof transport !== 'function') throw new TypeError('transport is required');
   if (![mutationSpacingMs, searchSpacingMs].every((value) => Number.isFinite(value) && value >= 0)) {
     throw new TypeError('GitHub spacing values must be non-negative numbers');
@@ -276,12 +331,13 @@ export function createGitHubSafety({
   let lastMutationStart = null;
   let lastSearchStart = null;
   let primaryWaitUntil = null;
+  const leaseDirectory = `${governorFile}.lock`;
 
   const rejectQueued = (pause) => {
     while (queue.length) queue.shift().reject(new GitHubPausedError(pause));
   };
 
-  const assertPublicAction = async ({repository, owner} = {}) => {
+  const assertPublicAction = async ({repository, owner} = {}, governor = emptyGovernor()) => {
     if (typeof repository !== 'string' || !repository.includes('/')) {
       throw new TypeError('PR creation requires repository owner/name');
     }
@@ -293,44 +349,67 @@ export function createGitHubSafety({
     const today = new Date(nowMs).toISOString().slice(0, 10);
     const recent = sessionPublications.filter((item) => item.at > nowMs - 60 * 60 * 1_000);
     const sessionToday = sessionPublications.filter((item) => item.day === today);
+    const durable = (governor.publications ?? []).filter((item) => Number(item.at) > nowMs - 48 * 60 * 60_000);
+    const durableRecent = durable.filter((item) => Number(item.at) > nowMs - 60 * 60_000);
+    const durableToday = durable.filter((item) => item.day === today);
     const repoOpen = numberField(state, ['open_northset_prs', 'openNorthsetPrs']);
     const sessionRepoOpen = sessionPublications.some((item) =>
       item.repository.toLowerCase() === repository.toLowerCase());
-    if (repoOpen >= PUBLIC_LIMITS.repositoryOpen || sessionRepoOpen) {
+    const durableRepoOpen = Object.keys(governor.open_repositories ?? {})
+      .some((item) => item.toLowerCase() === repository.toLowerCase());
+    if (repoOpen >= PUBLIC_LIMITS.repositoryOpen || sessionRepoOpen || durableRepoOpen) {
       throw new GitHubPublicLimitError(`one-open-PR cap reached for ${repository}`);
     }
     const ownerToday = Math.max(
       numberField(state, ['owner_prs_today', 'ownerPrsToday', 'owner_new_prs_today']),
       sessionToday.filter((item) => item.owner.toLowerCase() === effectiveOwner.toLowerCase()).length,
+      durableToday.filter((item) => item.owner.toLowerCase() === effectiveOwner.toLowerCase()).length,
     );
     if (ownerToday >= PUBLIC_LIMITS.ownerPerDay) {
       throw new GitHubPublicLimitError(`owner/day cap reached for ${effectiveOwner}`);
     }
-    const hourCount = Math.max(numberField(state, ['prs_last_hour', 'prsLastHour', 'new_prs_last_hour']), recent.length);
+    const hourCount = Math.max(numberField(state, ['prs_last_hour', 'prsLastHour', 'new_prs_last_hour']),
+      recent.length, durableRecent.length);
     if (hourCount >= PUBLIC_LIMITS.perHour) throw new GitHubPublicLimitError('hourly PR cap reached');
-    const dayCount = Math.max(numberField(state, ['prs_today', 'prsToday', 'new_prs_today']), sessionToday.length);
+    const dayCount = Math.max(numberField(state, ['prs_today', 'prsToday', 'new_prs_today']),
+      sessionToday.length, durableToday.length);
     if (dayCount >= PUBLIC_LIMITS.perDay) throw new GitHubPublicLimitError('daily PR cap reached');
     return true;
   };
 
-  const waitForSpacing = async (request) => {
+  const waitForSpacing = async (request, governor) => {
     const current = timeMs(now);
-    const previous = request.kind === 'search' ? lastSearchStart
-      : isMutation(request.kind) ? lastMutationStart : null;
+    const previous = request.kind === 'search'
+      ? Math.max(lastSearchStart ?? 0, Number(governor.last_search_start ?? 0)) || null
+      : isMutation(request.kind)
+        ? Math.max(lastMutationStart ?? 0, Number(governor.last_mutation_start ?? 0)) || null
+        : null;
     const spacing = request.kind === 'search' ? searchSpacingMs
       : isMutation(request.kind) ? mutationSpacingMs : 0;
     if (previous !== null && current < previous + spacing) await sleep(previous + spacing - current);
     const started = timeMs(now);
-    if (request.kind === 'search') lastSearchStart = started;
-    if (isMutation(request.kind)) lastMutationStart = started;
+    if (request.kind === 'search') {
+      lastSearchStart = started;
+      governor.last_search_start = started;
+    }
+    if (isMutation(request.kind)) {
+      lastMutationStart = started;
+      governor.last_mutation_start = started;
+    }
+    if (request.kind === 'search' || isMutation(request.kind)) await writeJsonFile(governorFile, governor);
   };
 
   const execute = async (request) => {
-    if (request.kind === 'pr_create') await assertPublicAction(request);
-    let transientRetried = false;
-    const handledPrimaryResets = new Set();
-    while (true) {
-      await waitForSpacing(request);
+    const release = await acquireLease(leaseDirectory);
+    try {
+      const pause = await readPause(pauseFile);
+      if (pause?.paused) throw new GitHubPausedError(pause);
+      const governor = await readJsonFile(governorFile, emptyGovernor());
+      if (request.kind === 'pr_create') await assertPublicAction(request, governor);
+      let transientRetried = false;
+      const handledPrimaryResets = new Set();
+      while (true) {
+        await waitForSpacing(request, governor);
       let result;
       try {
         result = await transport(request);
@@ -345,7 +424,7 @@ export function createGitHubSafety({
           transientRetried = true;
           continue;
         }
-        throw error;
+          throw error;
       }
       const inspection = inspectResult(result, timeMs(now));
       if (inspection.secondary || inspection.platformRestriction) {
@@ -374,8 +453,20 @@ export function createGitHubSafety({
           at,
           day: new Date(at).toISOString().slice(0, 10),
         });
+        governor.publications = [...(governor.publications ?? []).filter((item) =>
+          Number(item.at) > at - 48 * 60 * 60_000), {
+          repository: request.repository,
+          owner: request.owner ?? request.repository.split('/')[0],
+          at,
+          day: new Date(at).toISOString().slice(0, 10),
+        }];
+        governor.open_repositories = {...(governor.open_repositories ?? {}), [request.repository]: at};
+        await writeJsonFile(governorFile, governor);
       }
       return result;
+      }
+    } finally {
+      await release();
     }
   };
 
@@ -428,6 +519,7 @@ export function createGitHubSafety({
 
   const status = async () => {
     const pause = await readPause(pauseFile);
+    const governor = await readJsonFile(governorFile, emptyGovernor());
     return {
       paused: pause?.paused === true,
       pause,
@@ -435,10 +527,27 @@ export function createGitHubSafety({
       active,
       primary_wait_until: primaryWaitUntil === null ? null : new Date(primaryWaitUntil).toISOString(),
       limits: {...PUBLIC_LIMITS},
+      governor,
     };
   };
 
-  return {request, status, assertPublicAction};
+  const releaseRepository = async (repository) => {
+    if (typeof repository !== 'string' || !repository.includes('/')) {
+      throw new TypeError('repository release requires owner/name');
+    }
+    const release = await acquireLease(leaseDirectory);
+    try {
+      const governor = await readJsonFile(governorFile, emptyGovernor());
+      governor.open_repositories = Object.fromEntries(Object.entries(governor.open_repositories ?? {})
+        .filter(([name]) => name.toLowerCase() !== repository.toLowerCase()));
+      await writeJsonFile(governorFile, governor);
+      return governor;
+    } finally {
+      await release();
+    }
+  };
+
+  return {request, status, assertPublicAction, releaseRepository};
 }
 
 export async function resumeGitHub({

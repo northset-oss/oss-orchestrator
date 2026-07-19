@@ -4,6 +4,7 @@ import {fileURLToPath} from 'node:url';
 
 import {buildProof} from './verifier.mjs';
 import {runBounded} from './node-worker.mjs';
+import {receiptUrlFor} from './receipt-publisher.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BUNDLED_WORKER = path.join(HERE, 'node-worker.mjs');
@@ -63,6 +64,12 @@ function replacementManifest(plan, manifest, artifact, refreshed) {
   const missionId = plan.mission_id ?? manifest.mission_id;
   if (typeof missionId !== 'string' || !missionId) throw new Error('stale refresh requires mission_id');
   if (!refreshed?.verification?.ok) throw new Error('stale refresh worker did not return verified bytes');
+  const receiptUrl = receiptUrlFor(missionId, refreshed.commit_oid);
+  const previousReceiptUrl = String(manifest.receipt_url ?? '');
+  const prBody = String(manifest.pr_body ?? '');
+  if (!previousReceiptUrl || !prBody.includes(previousReceiptUrl)) {
+    throw new Error('stale refresh requires the approved PR body receipt binding');
+  }
   const next = {
     ...manifest,
     mission_id: missionId,
@@ -76,6 +83,9 @@ function replacementManifest(plan, manifest, artifact, refreshed) {
     verification: refreshed.verification,
     changed_files: refreshed.verification.changed_files,
     changed_lines: refreshed.verification.changed_lines,
+    branch: `northset/${missionId.toLowerCase()}-r-${refreshed.commit_oid.slice(0, 12)}`,
+    receipt_url: receiptUrl,
+    pr_body: prBody.replaceAll(previousReceiptUrl, receiptUrl),
   };
   const task = taskFor(plan, next, refreshed.base_oid);
   next.proof = buildProof({task, verification: refreshed.verification, manifest: next});

@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {createNodeWorker, runBounded} from './node-worker.mjs';
+import {receiptUrlFor} from './receipt-publisher.mjs';
 import {createStaleRefresher} from './stale-refresh.mjs';
 
 const IMAGE = 'northset-oss-author:test';
@@ -166,8 +167,11 @@ test('S1 clean moved-base refresh keeps the mission and approved artifact while 
   assert.equal(next.patch_sha256, next.verification.patch_sha256);
   assert.equal(next.tested_tree_oid, next.verification.tested_tree_oid);
   assert.equal(next.changed_lines, next.verification.changed_lines);
-  assert.equal(next.pr_body, fixture.manifest.pr_body);
-  assert.equal(next.receipt_url, fixture.manifest.receipt_url);
+  assert.equal(next.receipt_url, receiptUrlFor('M-1200', next.commit_oid));
+  assert.equal(next.pr_body, fixture.manifest.pr_body.replaceAll(
+    fixture.manifest.receipt_url, next.receipt_url));
+  assert.notEqual(next.branch, fixture.manifest.branch);
+  assert.match(next.branch, /^northset\/m-1200-r-[a-f0-9]{12}$/);
   assert.equal(next.proof.base_oid, fixture.cleanBase);
   assert.equal(next.proof.commit_oid, next.commit_oid);
   assert.equal(next.proof.batch_approval_digest, null);

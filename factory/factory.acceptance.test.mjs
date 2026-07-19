@@ -144,6 +144,69 @@ test('owner approves a subset and changing one item invalidates only its approva
   assert.equal(db.getTask(db.getReadyItem(selected[1]).task_id).state, 'APPROVED');
 });
 
+test('only one immutable board remains open while later READY work accumulates', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(20));
+  await runUntilIdle({
+    db,
+    workers: 8,
+    driver: verifiedDriver({verified: 20}),
+    boardPolicy: {minSize: 10, maximum: 10},
+  });
+  assert.equal(db.connection.prepare("SELECT count(*) AS count FROM boards WHERE state='OPEN'").get().count, 1);
+  assert.equal(db.getCurrentBoard().items.length, 10);
+  assert.equal(db.listReady({unboarded: true, states: ['PENDING'], limit: 30}).length, 10);
+});
+
+test('a mutation before approval invalidates only that selection and clean items still approve', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(10));
+  await runUntilIdle({
+    db,
+    workers: 5,
+    driver: verifiedDriver({verified: 10}),
+    boardPolicy: {minSize: 10, maximum: 30},
+  });
+  const board = db.getCurrentBoard();
+  const changedId = board.items[0].mission_id;
+  const cleanId = board.items[1].mission_id;
+  const changed = db.getReadyItem(changedId);
+  db.replaceReadyManifest(changedId, {...changed.manifest, summary: 'Bytes changed before approval'});
+  const approval = approveBoard(db, {
+    board: board.board_digest,
+    ids: [changedId, cleanId],
+    approvedBy: 'internal-user:aeziz',
+  });
+  assert.deepEqual(approval.approved_mission_ids, [cleanId]);
+  assert.deepEqual(approval.invalidated_mission_ids, [changedId]);
+  assert.equal(db.getReadyItem(changedId).approval_state, 'PENDING');
+  assert.equal(db.getTask(changed.task_id).state, 'READY');
+  assert.equal(db.getReadyItem(cleanId).approval_state, 'APPROVED');
+});
+
+test('owner can reject an entire board without approving any mission', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(10));
+  await runUntilIdle({
+    db,
+    workers: 5,
+    driver: verifiedDriver({verified: 10}),
+    boardPolicy: {minSize: 10, maximum: 30},
+  });
+  const board = db.getCurrentBoard();
+  const rejected = board.items.map((item) => item.mission_id);
+  const approval = approveBoard(db, {
+    board: board.board_digest,
+    ids: [],
+    rejectedIds: rejected,
+    approvedBy: 'internal-user:aeziz',
+  });
+  assert.deepEqual(approval.approved_mission_ids, []);
+  assert.deepEqual(approval.rejected_mission_ids, rejected.sort());
+  assert.equal(db.getCurrentBoard(), null);
+  assert.equal(db.listTasks({state: 'REJECTED_BY_OWNER', limit: 20}).length, 10);
+});
+
 test('one infrastructure retry stays within the same attempt record', async (t) => {
   const {db} = await makeFactory(t);
   db.enqueueTasks(candidates(1));
@@ -210,6 +273,28 @@ test('one transient verifier startup retry does not consume the second author at
   assert.equal(authors, 1);
   assert.equal(verifications, 2);
   assert.equal(db.stats().ready_items, 1);
+});
+
+test('a GO scout that classifies Red is skipped before bootstrap and never receives a mission ID', async (t) => {
+  const {db} = await makeFactory(t, {missionStart: 1000});
+  db.enqueueTasks(candidates(1));
+  const driver = verifiedDriver({verified: 1});
+  let bootstraps = 0;
+  let authors = 0;
+  driver.scout = async () => ({
+    decision: 'GO', reason: 'security-sensitive change', test_command: 'node --test',
+    target_files: ['src/security.mjs'], estimated_risk: 'RED',
+  });
+  driver.bootstrap = async () => { bootstraps += 1; return {}; };
+  driver.author = async () => { authors += 1; return {}; };
+  const result = await runFactoryCycle({db, workers: 1, driver});
+  assert.equal(result.results[0].state, 'SKIPPED');
+  assert.equal(result.results[0].reason, 'RED');
+  assert.equal(bootstraps, 0);
+  assert.equal(authors, 0);
+  assert.equal(db.stats().ready_items, 0);
+  assert.equal(db.connection.prepare("SELECT value FROM factory_meta WHERE key='next_mission_number'").get().value,
+    '1000');
 });
 
 test('local factory work continues without consulting a paused GitHub publisher', async (t) => {

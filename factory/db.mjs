@@ -72,6 +72,23 @@ export function readyItemDigest(manifest) {
   return sha256(Buffer.from(`northset-factory-ready-v1\0${canonical(subject)}`, 'utf8'));
 }
 
+export function batchApprovalDigest({
+  boardDigest,
+  approvedMissionIds,
+  rejectedMissionIds,
+  approvedBy,
+  approvedAt,
+}) {
+  return sha256(Buffer.from(canonical({
+    domain: 'northset-factory-batch-approval-v1',
+    board_digest: boardDigest,
+    approved_mission_ids: [...approvedMissionIds].sort(),
+    rejected_mission_ids: [...rejectedMissionIds].sort(),
+    approved_by: approvedBy,
+    approved_at: iso(approvedAt),
+  }), 'utf8'));
+}
+
 export function normalizePrBody(body) {
   return `${String(body ?? '').replace(/\s+$/u, '')}\n`;
 }
@@ -428,6 +445,25 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     }));
   }
 
+  function recordPreflightOutcomes(records, {now = new Date()} = {}) {
+    const skipped = records.filter((record) => record?.outcome !== 'GO').map((record) => {
+      const candidate = record.candidate;
+      const live = record.liveState;
+      return {
+        candidate: candidate.candidate,
+        repository: live?.repository?.nameWithOwner ?? candidate.repository,
+        issue_number: live?.issue?.number ?? candidate.issueNumber,
+        profile: 'node',
+        priority: candidate.priority,
+        state: 'SKIPPED',
+        base_oid: live?.repository?.defaultOid ?? null,
+        live_state: live ?? {},
+        issue_snapshot: live?.issue ?? {},
+      };
+    });
+    return skipped.length ? enqueueTasks(skipped, {now}) : [];
+  }
+
   function getTask(taskId) {
     return mapTask(connection.prepare('SELECT * FROM tasks WHERE task_id=?').get(taskId));
   }
@@ -650,6 +686,12 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     return {...row, items};
   }
 
+  function getCurrentBoard() {
+    const row = connection.prepare("SELECT board_digest FROM boards WHERE state='OPEN' ORDER BY created_at,board_id LIMIT 1")
+      .get();
+    return row ? getBoard(row.board_digest) : null;
+  }
+
   function approveBoard(boardDigest, approvedIds, {
     rejectedIds = [], approvedBy = 'internal-user:aeziz', now = new Date(), approvalDigest = null,
   } = {}) {
@@ -657,19 +699,47 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       const board = getBoard(boardDigest);
       if (!board || board.state !== 'OPEN') throw new Error('board is missing or no longer open');
       const available = new Set(board.items.map((item) => item.mission_id));
-      const approved = [...new Set(approvedIds)].sort();
-      const rejected = [...new Set(rejectedIds)].sort();
-      if (!approved.length) throw new Error('at least one mission must be approved');
-      if (approved.some((id) => !available.has(id)) || rejected.some((id) => !available.has(id))) {
+      const requestedApproved = [...new Set(approvedIds)].sort();
+      const requestedRejected = [...new Set(rejectedIds)].sort();
+      if (!requestedApproved.length && !requestedRejected.length) {
+        throw new Error('at least one mission must be approved or rejected');
+      }
+      if (requestedApproved.some((id) => !available.has(id)) || requestedRejected.some((id) => !available.has(id))) {
         throw new Error('approval references a mission outside the board');
       }
-      if (approved.some((id) => rejected.includes(id))) throw new Error('mission cannot be both approved and rejected');
+      if (requestedApproved.some((id) => requestedRejected.includes(id))) {
+        throw new Error('mission cannot be both approved and rejected');
+      }
+      const boardById = new Map(board.items.map((item) => [item.mission_id, item]));
+      const invalidated = [];
+      const currentAndBound = (id) => {
+        const current = getReadyItem(id);
+        const frozen = boardById.get(id);
+        const valid = current && current.board_id === board.board_id &&
+          current.approval_state === 'PENDING' && current.item_digest === frozen.item_digest &&
+          current.manifest_sha256 === frozen.manifest_sha256 &&
+          readyItemDigest(current.manifest) === current.item_digest &&
+          sha256(Buffer.from(canonical(current.manifest), 'utf8')) === current.manifest_sha256;
+        if (!valid) invalidated.push(id);
+        return valid;
+      };
+      const approved = requestedApproved.filter(currentAndBound);
+      const rejected = requestedRejected.filter(currentAndBound);
+      if (!approved.length && !rejected.length) {
+        throw new Error(`all selected missions were invalidated: ${invalidated.join(', ')}`);
+      }
       const approvedAt = iso(now);
-      const digest = approvalDigest ?? sha256(Buffer.from(canonical({
-        domain: 'northset-factory-batch-approval-v1', board_digest: boardDigest,
-        approved_mission_ids: approved, rejected_mission_ids: rejected,
-        approved_by: approvedBy, approved_at: approvedAt,
-      }), 'utf8'));
+      const computedDigest = batchApprovalDigest({
+        boardDigest,
+        approvedMissionIds: approved,
+        rejectedMissionIds: rejected,
+        approvedBy,
+        approvedAt,
+      });
+      if (approvalDigest !== null && approvalDigest !== computedDigest) {
+        throw new Error('supplied approval digest does not match the selected immutable board bytes');
+      }
+      const digest = computedDigest;
       connection.prepare(`INSERT INTO board_approvals(
         board_digest,approval_digest,approved_ids_json,rejected_ids_json,approved_by,approved_at
       ) VALUES(?,?,?,?,?,?)`).run(boardDigest, digest, json(approved), json(rejected), approvedBy, approvedAt);
@@ -690,7 +760,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
         }
       }
       connection.prepare("UPDATE boards SET state='APPROVED',approved_at=? WHERE board_id=?").run(approvedAt, board.board_id);
-      return getBoardApproval(boardDigest);
+      return {...getBoardApproval(boardDigest), invalidated_mission_ids: [...new Set(invalidated)].sort()};
     });
   }
 
@@ -774,6 +844,16 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
 
   function getPublication(missionId) {
     return mapPublication(connection.prepare('SELECT * FROM publications WHERE mission_id=?').get(missionId));
+  }
+
+  function listPublications({states = ['SUBMITTED'], limit = 30} = {}) {
+    if (!Array.isArray(states) || !states.length) throw new Error('publication states are required');
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      throw new Error('publication limit must be an integer from 1 through 1000');
+    }
+    const placeholders = states.map(() => '?').join(',');
+    return connection.prepare(`SELECT * FROM publications WHERE publication_state IN (${placeholders})
+      ORDER BY updated_at,mission_id LIMIT ?`).all(...states, limit).map(mapPublication);
   }
 
   function updateTaskState(taskId, state, detail = null, {now = new Date()} = {}) {
@@ -865,6 +945,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     connection,
     close: () => connection.close(),
     enqueueTasks,
+    recordPreflightOutcomes,
     getTask,
     listTasks,
     claimNextTask,
@@ -877,11 +958,13 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     listReady,
     insertBoard,
     getBoard,
+    getCurrentBoard,
     approveBoard,
     getBoardApproval,
     replaceReadyManifest,
     savePublication,
     getPublication,
+    listPublications,
     updateTaskState,
     getRepositoryState,
     getPublicActionState,

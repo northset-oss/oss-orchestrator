@@ -392,6 +392,7 @@ export function createSource({lakePath = 'candidate_lake.sqlite', query, db, git
         excludeCandidates: known.map((task) => task.candidate),
       });
       const results = await this.preflight(candidates, options);
+      await db?.recordPreflightOutcomes?.(results, {now: options.now});
       const enqueued = await this.enqueue(results);
       return {candidates, results, enqueued};
     },

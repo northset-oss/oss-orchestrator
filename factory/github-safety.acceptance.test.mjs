@@ -231,6 +231,37 @@ test('public governor applies owner/day cap across successful PR creations', asy
   assert.deepEqual(calls, ['org/one', 'org/two']);
 });
 
+test('independent CLI governors share pacing, open-repository reservations, and owner caps', async (t) => {
+  const clock = await fixture(t, 'factory-github-cross-process');
+  const starts = [];
+  const make = () => createGitHubSafety({
+    ...clock,
+    mutationSpacingMs: 25,
+    repositoryState: () => ({}),
+    transport: async (request) => {
+      starts.push({repository: request.repository, at: clock.now()});
+      return {status: 201, body: {url: `https://github.com/${request.repository}/pull/1`}};
+    },
+  });
+  const governors = [make(), make(), make()];
+  const results = await Promise.allSettled(governors.map((governor, index) => governor.request({
+    priority: 'final_submission', kind: 'pr_create', operation: 'create',
+    repository: `shared/repo-${index + 1}`,
+  })));
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 2);
+  assert.equal(results.filter((result) => result.status === 'rejected' &&
+    result.reason instanceof GitHubPublicLimitError && /owner\/day/.test(result.reason.reason)).length, 1);
+  assert.equal(starts.length, 2);
+  assert.ok(starts[1].at - starts[0].at >= 25);
+
+  const firstRepository = starts[0].repository;
+  await assert.rejects(() => make().request({
+    priority: 'final_submission', kind: 'pr_create', operation: 'create', repository: firstRepository,
+  }), (error) => error instanceof GitHubPublicLimitError && /one-open-PR/.test(error.reason));
+  await governors[0].releaseRepository(firstRepository);
+  assert.equal((await governors[0].status()).governor.open_repositories[firstRepository], undefined);
+});
+
 test('transient network and 5xx failures get one retry, not an unbounded loop', async (t) => {
   const clock = await fixture(t, 'factory-github-retry');
   let networkCalls = 0;

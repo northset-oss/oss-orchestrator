@@ -46,12 +46,14 @@ test('parser provides stable paths and strictly validates command-specific argum
     lake: parsed.lake,
     pauseFile: parsed.pauseFile,
     workRoot: parsed.workRoot,
+    artifactRoot: parsed.artifactRoot,
     workerCommand: parsed.workerCommand,
   }, {
     database: FACTORY_DEFAULTS.database,
     lake: FACTORY_DEFAULTS.lake,
     pauseFile: FACTORY_DEFAULTS.pauseFile,
     workRoot: FACTORY_DEFAULTS.workRoot,
+    artifactRoot: FACTORY_DEFAULTS.artifactRoot,
     workerCommand: FACTORY_DEFAULTS.workerCommand,
   });
   assert.equal(parsed.profile, 'node');
@@ -64,6 +66,11 @@ test('parser provides stable paths and strictly validates command-specific argum
   assert.deepEqual(parseFactoryCliArgs([
     'approve', '--board', BOARD, '--ids', 'M-001,M-204', '--reject-ids', 'M-009',
   ], {env: {}}).ids, ['M-001', 'M-204']);
+  assert.deepEqual(parseFactoryCliArgs([
+    'approve', '--board', BOARD, '--reject-ids', 'M-009',
+  ], {env: {}}).ids, []);
+  assert.throws(() => parseFactoryCliArgs(['approve', '--board', BOARD], {env: {}}),
+    /requires --ids, --reject-ids/);
   assert.throws(() => parseFactoryCliArgs(['run', '--profile', 'python'], {env: {}}), /Node-only/);
   assert.throws(() => parseFactoryCliArgs(['board', '--workers', '4'], {env: {}}), /unknown argument/);
   assert.throws(() => parseFactoryCliArgs(['approve', '--board', BOARD, '--ids', 'M-001,M-001'], {env: {}}),
@@ -144,6 +151,7 @@ test('run uses the production Node worker by default', async () => {
     }),
   });
   assert.equal(driverOptions.command, FACTORY_DEFAULTS.workerCommand);
+  assert.equal(driverOptions.artifactRoot, FACTORY_DEFAULTS.artifactRoot);
   assert.equal(db.closed, true);
 });
 
@@ -260,6 +268,40 @@ test('a publication pause skips new preflight but still drains already queued lo
   assert.equal(db.closed, true);
 });
 
+test('a transient preflight failure still drains queued work and retries on the next iteration', async () => {
+  const controller = new AbortController();
+  const db = fakeDb({stats: () => ({ready_items: 1})});
+  let fills = 0;
+  let cycles = 0;
+  const transient = new Error('temporary GitHub preflight timeout');
+  transient.code = 'ETIMEDOUT';
+  const result = await executeFactoryCli(['run', '--poll-ms', '0'], {
+    env: {},
+    signal: controller.signal,
+    stdout: output().stream,
+    dependencies: baseDependencies(db, {
+      driver: {},
+      source: {fill: async () => {
+        fills += 1;
+        if (fills === 1) throw transient;
+        return {candidates: [], results: [], enqueued: []};
+      }},
+      createBoard: () => null,
+      runCycle: async () => {
+        cycles += 1;
+        if (cycles === 2) controller.abort();
+        return {claimed: cycles === 1 ? 1 : 0, results: []};
+      },
+      sleep: async () => {},
+    }),
+  });
+  assert.equal(fills, 2);
+  assert.equal(cycles, 2);
+  assert.equal(result.claimed, 1);
+  assert.equal(result.source_failures, 1);
+  assert.match(result.last_source_error, /temporary GitHub preflight timeout/);
+});
+
 test('board displays the current immutable board or creates one from READY items', async () => {
   const board = {board_digest: BOARD, items: [{mission_id: 'M-001'}]};
   const db = fakeDb({getCurrentBoard: async () => board});
@@ -374,6 +416,7 @@ test('publish routes the final recheck through safety and uses the injected rece
 test('publish uses the production receipt prepublication adapter by default', async () => {
   const db = fakeDb();
   let receiptOptions;
+  let staleOptions;
   let publicationOptions;
   const receiptPublisher = async () => ({commit_oid: '1'.repeat(40)});
   await executeFactoryCli(['publish', '--board', BOARD], {
@@ -386,6 +429,10 @@ test('publish uses the production receipt prepublication adapter by default', as
         receiptOptions = options;
         return receiptPublisher;
       },
+      createStaleRefresher: (options) => {
+        staleOptions = options;
+        return async () => ({reason: 'not exercised'});
+      },
       publishBoard: async (_board, options) => {
         publicationOptions = options;
         return {results: []};
@@ -394,6 +441,8 @@ test('publish uses the production receipt prepublication adapter by default', as
   });
   assert.deepEqual(receiptOptions, {remoteUrl: FACTORY_DEFAULTS.receiptRemote});
   assert.equal(publicationOptions.receiptPublisher, receiptPublisher);
+  assert.equal(typeof publicationOptions.refreshStale, 'function');
+  assert.equal(staleOptions.artifactRoot, FACTORY_DEFAULTS.artifactRoot);
   assert.equal(db.closed, true);
 });
 
@@ -435,6 +484,27 @@ test('github-status is read-only and github-resume performs one injected probe p
   assert.equal(resumeOptions.clearedBy, 'internal-user:owner');
   assert.equal(typeof resumeOptions.transport, 'function');
   assert.equal(resumeResult.paused, false);
+
+  const repositoryDb = fakeDb({
+    getRepositoryState: () => ({
+      repository: 'owner/repo', cooldown_reason: 'maintainer opt-out reviewed',
+      cooldown_until: 'manual-release',
+    }),
+    setRepositoryState: (_repository, patch) => ({repository: 'owner/repo', ...patch}),
+  });
+  const repositoryResult = await executeFactoryCli([
+    'github-resume', '--reason', 'founder cleared the reviewed repository cooldown',
+    '--repository', 'owner/repo',
+  ], {
+    env: {}, stdout: output().stream,
+    dependencies: {
+      openDb: () => repositoryDb,
+      transport: async () => assert.fail('repository cooldown release must not call GitHub'),
+    },
+  });
+  assert.equal(repositoryResult.cooldown_cleared, true);
+  assert.equal(repositoryResult.repository_state.cooldown_reason, null);
+  assert.equal(repositoryDb.closed, true);
 });
 
 test('environment paths and command adapters are resolved without shell parsing', () => {
@@ -444,10 +514,12 @@ test('environment paths and command adapters are resolved without shell parsing'
       OSS_FACTORY_LAKE: './tmp/lake.sqlite',
       OSS_FACTORY_PAUSE_FILE: './tmp/pause.json',
       OSS_FACTORY_WORKER_COMMAND: '/opt/northset/worker',
+      OSS_FACTORY_ARTIFACT_ROOT: './tmp/artifacts',
     },
   });
   assert.equal(parsed.database, path.resolve('./tmp/factory.sqlite'));
   assert.equal(parsed.lake, path.resolve('./tmp/lake.sqlite'));
   assert.equal(parsed.pauseFile, path.resolve('./tmp/pause.json'));
   assert.equal(parsed.workerCommand, '/opt/northset/worker');
+  assert.equal(parsed.artifactRoot, path.resolve('./tmp/artifacts'));
 });

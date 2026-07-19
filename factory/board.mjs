@@ -51,6 +51,8 @@ export function createBoardIfDue(db, {
   if (!Number.isInteger(minSize) || minSize < 1 || minSize > maximum) throw new Error('board minSize is invalid');
   if (!Number.isInteger(maximum) || maximum < 1 || maximum > 30) throw new Error('board maximum must be 1..30');
   if (!Number.isFinite(maxAgeMinutes) || maxAgeMinutes < 0) throw new Error('board max age is invalid');
+  const current = db.getCurrentBoard?.();
+  if (current) return current;
   const ready = db.listReady({unboarded: true, states: ['PENDING'], limit: maximum});
   if (!ready.length) return null;
   const dueByAge = ageMs(ready[0].ready_at, now) >= maxAgeMinutes * 60_000;

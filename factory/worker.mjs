@@ -172,6 +172,14 @@ async function processClaim(claim, {
       });
       return {task_id: task.task_id, state: 'SKIPPED', reason: scout?.reason ?? null};
     }
+    if (scout.estimated_risk === 'RED') {
+      db.finishAttempt(attempt.attempt_id, {
+        outcome: 'SKIPPED', failureClass: 'risk',
+        durationMs: now().getTime() - began,
+        error: 'Scout classified the task as Red; Red work is outside the scaled lane', now: now(),
+      });
+      return {task_id: task.task_id, state: 'SKIPPED', reason: 'RED'};
+    }
     const dependencyMaterial = await semaphores.bootstrap.run(() => oneInfrastructureRetry(
       () => driver.bootstrap(task, checkout, scout, attempt),
     ));
@@ -213,7 +221,7 @@ async function processClaim(claim, {
         };
         const riskTier = classifyRisk({
           ...publishable,
-          risk_tier: undefined,
+          risk_tier: scout.estimated_risk ?? publishable.risk_tier,
           changed_files: verification.changed_files,
           changed_lines: verification.changed_lines,
         });

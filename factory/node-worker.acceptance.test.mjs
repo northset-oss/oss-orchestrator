@@ -80,7 +80,7 @@ test('N1 scout uses the bounded structured read-only contract', async (t) => {
   assert.deepEqual(result.target_files, ['src/value.mjs', 'test/value.test.mjs']);
 });
 
-test('N2 Docker plans isolate git and credentials and freeze dependency material after bootstrap', async () => {
+test('N2 Docker plans isolate git, omit reusable auth files, and freeze dependency material', async () => {
   const checkout = '/private/factory/repository';
   const codexHome = '/private/factory/codex-home';
   const outputRoot = '/private/factory/output';
@@ -92,7 +92,10 @@ test('N2 Docker plans isolate git and credentials and freeze dependency material
   });
   const joinedAuthor = author.join('\n');
   assert.match(joinedAuthor, /src=\/private\/factory\/repository\/.git,dst=\/workspace\/.git,readonly/);
-  assert.match(joinedAuthor, /src=\/private\/factory\/codex-home\/auth.json,dst=\/codex-home\/auth.json,readonly/);
+  assert.doesNotMatch(joinedAuthor, /auth\.json/);
+  assert.match(joinedAuthor, /CODEX_ACCESS_TOKEN/);
+  assert.match(joinedAuthor, /--sandbox\nworkspace-write/);
+  assert.doesNotMatch(joinedAuthor, /dangerously-bypass-approvals-and-sandbox/);
   assert.match(joinedAuthor, /src=northset-deps-abc,dst=\/workspace\/node_modules,readonly/);
   assert.match(joinedAuthor, /--output-schema/);
   assert.match(joinedAuthor, /--output-last-message/);
@@ -148,6 +151,7 @@ test('N3 bootstrap creates one content-keyed volume and then reuses its frozen m
   const install = calls.find((call) => call.args[0] === 'run' &&
     call.args.some((arg) => String(arg).includes('npm ci')));
   assert.ok(install);
+  assert.equal(install.args.at(-4), IMAGE_DIGEST);
   assert.match(install.args.join('\n'), /dst=\/workspace\/node_modules(?:\n|$)/);
   assert.doesNotMatch(install.args.join('\n'), /dst=\/workspace\/node_modules,readonly/);
 });
@@ -226,6 +230,7 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
   assert.equal(authorInvocation.readOnly, false);
   assert.equal(authorInvocation.timeoutMs, 10 * 60_000);
   assert.equal(authorInvocation.dependencyMaterial, dependencyMaterial);
+  assert.equal(authorInvocation.image, IMAGE_DIGEST);
   assert.equal(await git(['-C', checkout, 'rev-parse', 'HEAD^']), baseOid);
   assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');
   const identity = await git(['-C', checkout, 'show', '-s', '--format=%an%n%ae%n%ce%n%B', 'HEAD']);
@@ -257,6 +262,7 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
     const joined = call.args.join('\n');
     assert.match(joined, /--network=none/);
     assert.match(joined, /src=northset-deps-fixture,dst=\/workspace\/node_modules,readonly/);
+    assert.equal(call.args.at(-4), IMAGE_DIGEST);
   }
 
   await worker.handle({action: 'reset', task, checkout, authored});

@@ -400,6 +400,7 @@ function pullRequest(value, repository) {
     draft: Boolean(value.draft),
     mergeable: value.mergeable ?? null,
     mergeable_state: value.mergeable_state ?? null,
+    merged: Boolean(value.merged ?? value.merged_at),
   };
 }
 
@@ -521,7 +522,7 @@ export function createGhCliPublisherAdapter({
   const findPullRequests = async ({repository, fork_repository: forkRepository, branch, base_branch: baseBranch}) => {
     const forkOwner = repositoryParts(forkRepository).owner;
     validRepository(repository);
-    const query = new URLSearchParams({state: 'open', head: `${forkOwner}:${requiredString(branch, 'branch')}`,
+    const query = new URLSearchParams({state: 'all', head: `${forkOwner}:${requiredString(branch, 'branch')}`,
       base: requiredString(baseBranch, 'base_branch'), per_page: '100'});
     const result = await transport.rest({method: 'GET', path: `${apiPath(repository, 'pulls')}?${query}`});
     ensureSuccess(result, 'find pull requests');

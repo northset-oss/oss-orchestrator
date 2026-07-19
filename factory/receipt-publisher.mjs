@@ -177,6 +177,10 @@ function proofPath(missionId, commitOid) {
   return `receipts/${validMissionId(missionId)}/${validOid(commitOid, 'commit_oid')}/proof.json`;
 }
 
+function publicationPath(missionId, commitOid) {
+  return `receipts/${validMissionId(missionId)}/${validOid(commitOid, 'commit_oid')}/publication.json`;
+}
+
 export function receiptUrlFor(missionId, commitOid) {
   return `${DEFAULT_WEB_URL}/blob/${RECEIPTS_BRANCH}/${proofPath(missionId, commitOid)}`;
 }
@@ -433,6 +437,136 @@ export function createReceiptPublisher({
         operation: 'non-force receipt batch push',
       });
       return resultsFor(proofs, batchCommitOid);
+    } finally {
+      await rm(workspace, {recursive: true, force: true});
+    }
+  };
+}
+
+function statusFor(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    throw new TypeError('receipt status item must be an object');
+  }
+  const missionId = validMissionId(item.mission_id);
+  const commitOid = validOid(item.commit_oid, `${missionId} commit_oid`);
+  const prNumber = Number(item.pr_number);
+  if (!Number.isInteger(prNumber) || prNumber < 1) throw new TypeError(`${missionId} pr_number must be positive`);
+  for (const field of ['receipt_url', 'pr_url', 'pr_state', 'attestation_state']) {
+    if (typeof item[field] !== 'string' || !item[field]) throw new TypeError(`${missionId} ${field} is required`);
+  }
+  const status = {
+    schema_version: 1,
+    mission_id: missionId,
+    contribution_commit_oid: commitOid,
+    receipt_url: item.receipt_url,
+    pr_url: item.pr_url,
+    pr_number: prNumber,
+    pr_state: item.pr_state,
+    merged: item.merged === true,
+    ci_state: item.ci_state ?? null,
+    attestation_state: item.attestation_state,
+    attestation_url: item.attestation_url ?? null,
+    observed_at: item.observed_at ?? null,
+  };
+  assertJson(status, `${missionId} publication status`);
+  return {missionId, commitOid, status, bytes: Buffer.from(`${canonical(status)}\n`, 'utf8')};
+}
+
+async function latestPathCommit(git, checkout, relativePath) {
+  const result = await git(['-C', checkout, 'log', '-1', '--format=%H', 'HEAD', '--', relativePath], {
+    operation: `locate latest status commit for ${relativePath}`,
+  });
+  return validOid(result.stdout.trim(), 'status_commit_oid');
+}
+
+/** Publish mutable factual PR/attestation envelopes after upstream submission. */
+export function createReceiptStatusPublisher({
+  remoteUrl = DEFAULT_REMOTE_URL,
+  gitExecutable = 'git',
+  run,
+  spawnImpl = spawn,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
+  tempRoot = os.tmpdir(),
+  authorName = 'Northset Receipt Publisher',
+  authorEmail = 'receipts@northset.ai',
+  now = () => new Date(),
+} = {}) {
+  if (typeof remoteUrl !== 'string' || !remoteUrl) throw new TypeError('remoteUrl is required');
+  const git = commandRunner({run, spawnImpl, timeoutMs, maxOutputBytes, gitExecutable});
+  return async function publishReceiptStatuses(items) {
+    if (!Array.isArray(items) || !items.length) return {};
+    const statuses = items.map(statusFor).sort((left, right) => left.missionId.localeCompare(right.missionId));
+    if (new Set(statuses.map((item) => item.missionId)).size !== statuses.length) {
+      throw new ReceiptPublisherError('status batch contains duplicate mission IDs', 'DUPLICATE_STATUS_MISSION');
+    }
+    const workspace = await mkdtemp(path.join(tempRoot, 'northset-receipt-status-'));
+    const checkout = path.join(workspace, 'ledger');
+    try {
+      await git(['clone', '--no-checkout', '--origin', 'origin', '--', remoteUrl, checkout], {
+        operation: 'clone isolated receipt status repository',
+      });
+      await git(['-C', checkout, 'checkout', '--detach', `refs/remotes/origin/${RECEIPTS_BRANCH}`], {
+        operation: 'checkout remote receipts branch for status',
+      });
+      const changed = [];
+      for (const entry of statuses) {
+        const proof = proofPath(entry.missionId, entry.commitOid);
+        const proofExists = await git(['-C', checkout, 'cat-file', '-e', `HEAD:${proof}`], {
+          allow: [0, 128], operation: `verify immutable proof for ${entry.missionId}`,
+        });
+        if (proofExists.code !== 0) {
+          throw new ReceiptPublisherError(`${entry.missionId} immutable proof is missing`,
+            'RECEIPT_STATUS_WITHOUT_PROOF');
+        }
+        const relativePath = publicationPath(entry.missionId, entry.commitOid);
+        const existing = await existingProof(git, checkout, relativePath);
+        if (existing?.equals(entry.bytes)) continue;
+        const file = path.join(checkout, ...relativePath.split('/'));
+        await mkdir(path.dirname(file), {recursive: true});
+        await writeFile(file, entry.bytes);
+        await exactFileReadback(file, entry.bytes, `${entry.missionId} status`);
+        changed.push({...entry, relativePath});
+      }
+      if (changed.length) {
+        await git(['-C', checkout, 'add', '--', ...changed.map((entry) => entry.relativePath)], {
+          operation: 'stage receipt status batch',
+        });
+        const timestamp = now();
+        const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+        if (!Number.isFinite(date.getTime())) throw new TypeError('now() must return a valid time');
+        await git(['-C', checkout,
+          '-c', `user.name=${authorName}`,
+          '-c', `user.email=${authorEmail}`,
+          '-c', 'core.hooksPath=/dev/null',
+          'commit', '-m', `Reconcile receipt status: ${changed.map((entry) => entry.missionId).join(', ')}`], {
+          operation: 'commit receipt status batch',
+          cwd: checkout,
+          env: {GIT_AUTHOR_DATE: date.toISOString(), GIT_COMMITTER_DATE: date.toISOString()},
+        });
+        const head = (await git(['-C', checkout, 'rev-parse', 'HEAD'], {
+          operation: 'read receipt status commit',
+        })).stdout.trim();
+        for (const entry of changed) {
+          await committedReadback(git, checkout, entry.relativePath, entry.bytes, head,
+            `${entry.missionId} status`);
+        }
+        await git(['-C', checkout, '-c', 'core.hooksPath=/dev/null', 'push', '--porcelain',
+          'origin', `HEAD:refs/heads/${RECEIPTS_BRANCH}`], {
+          operation: 'non-force receipt status push',
+        });
+      }
+      const results = {};
+      for (const entry of statuses) {
+        const relativePath = publicationPath(entry.missionId, entry.commitOid);
+        const commitOid = await latestPathCommit(git, checkout, relativePath);
+        results[entry.missionId] = {
+          mission_id: entry.missionId,
+          status_url: `${DEFAULT_WEB_URL}/blob/${RECEIPTS_BRANCH}/${relativePath}`,
+          status_commit_oid: commitOid,
+        };
+      }
+      return results;
     } finally {
       await rm(workspace, {recursive: true, force: true});
     }
