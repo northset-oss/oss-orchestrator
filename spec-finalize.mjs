@@ -21,6 +21,7 @@ function nonEmptyObject(value, label) {
 export function finalizeSpec(draftValue, {
   missionId,
   attemptSequence,
+  calibrationOrdinal,
   repoPolicySnapshot,
   authoringMode,
 } = {}) {
@@ -41,6 +42,7 @@ export function finalizeSpec(draftValue, {
   spec.mission_id = missionId;
   spec.task_id = taskIdForCandidate(spec.candidate);
   spec.attempt_sequence = attemptSequence;
+  if (calibrationOrdinal !== undefined) spec.calibration_ordinal = calibrationOrdinal;
   spec.authoring_mode = authoringMode ?? spec.authoring_mode ?? 'test_only_then_fix';
   spec.allow_modified_existing_tests ??= false;
   spec.non_goals ??= [...(spec.qualification?.acceptance_contract?.non_goals ?? [])];
@@ -68,11 +70,13 @@ export function finalizeSpec(draftValue, {
 function parseArgs(argv) {
   const input = argv.shift();
   if (!input || ['-h', '--help'].includes(input)) return {help: true};
-  const options = {input: path.resolve(input), output: null, missionId: null, attemptSequence: null, policyFile: null, authoringMode: null};
+  const options = {input: path.resolve(input), output: null, missionId: null, attemptSequence: null,
+    calibrationOrdinal: undefined, policyFile: null, authoringMode: null};
   while (argv.length) {
     const value = argv.shift();
     if (value === '--mission-id') options.missionId = argv.shift();
     else if (value === '--attempt-sequence') options.attemptSequence = Number(argv.shift());
+    else if (value === '--calibration-ordinal') options.calibrationOrdinal = Number(argv.shift());
     else if (value === '--repo-policy-snapshot') options.policyFile = path.resolve(argv.shift());
     else if (value === '--authoring-mode') options.authoringMode = argv.shift();
     else if (value === '--output') options.output = path.resolve(argv.shift());
@@ -87,7 +91,7 @@ function parseArgs(argv) {
 async function main(argv) {
   const options = parseArgs(argv);
   if (options.help) {
-    process.stdout.write('usage: node spec-finalize.mjs draft.json --mission-id M-100 --attempt-sequence 1 --repo-policy-snapshot policy.json [--output spec.json]\n');
+    process.stdout.write('usage: node spec-finalize.mjs draft.json --mission-id M-100 --attempt-sequence 1 --repo-policy-snapshot policy.json [--calibration-ordinal 1] [--output spec.json]\n');
     return;
   }
   const [draft, policy] = await Promise.all([
@@ -97,6 +101,7 @@ async function main(argv) {
   const spec = finalizeSpec(draft, {
     missionId: options.missionId,
     attemptSequence: options.attemptSequence,
+    calibrationOrdinal: options.calibrationOrdinal,
     repoPolicySnapshot: policy,
     authoringMode: options.authoringMode,
   });

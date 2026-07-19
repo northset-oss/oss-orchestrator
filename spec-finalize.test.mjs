@@ -49,18 +49,26 @@ test('spec finalization binds mission sequence, policy bytes and registry image 
     checked_at: '2026-07-15T12:00:00Z', ai_policy_summary: 'Contributions are invited.',
     content_sha256: digest('3'),
   };
-  const first = finalizeSpec(draft, {missionId: 'M-100', attemptSequence: 2, repoPolicySnapshot: policy});
-  const second = finalizeSpec(draft, {missionId: 'M-100', attemptSequence: 2, repoPolicySnapshot: policy});
+  const first = finalizeSpec(draft, {
+    missionId: 'M-100', attemptSequence: 2, calibrationOrdinal: 1, repoPolicySnapshot: policy,
+  });
+  const second = finalizeSpec(draft, {
+    missionId: 'M-100', attemptSequence: 2, calibrationOrdinal: 1, repoPolicySnapshot: policy,
+  });
   assert.deepEqual(first, second);
   assert.equal(first.executor.image, 'python:3.14.5-bookworm');
   assert.equal(first.executor.profile_status, 'pilot');
   assert.equal(first.executor.profile_production_proven, false);
   assert.deepEqual(first.receipt.repo_policy_snapshot, policy);
   assert.equal(first.authoring_mode, 'test_only_then_fix');
+  assert.equal(first.calibration_ordinal, 1);
   assert.equal(first.qualification.review_prompt_version, REVIEW_PROMPT_VERSION);
   assert.doesNotThrow(() => validateSpec(first));
   assert.throws(() => validateSpec({...first, executor: {...first.executor, profile_production_proven: true}}), /production proof/i);
   assert.throws(() => finalizeSpec(draft, {missionId: 'bad', attemptSequence: 1, repoPolicySnapshot: policy}), /mission/i);
+  assert.throws(() => finalizeSpec(draft, {
+    missionId: 'M-100', attemptSequence: 1, calibrationOrdinal: 21, repoPolicySnapshot: policy,
+  }), /calibration_ordinal/i);
 });
 
 test('current reviewer drafts finalize while retained prompt-version 2 qualifications remain compatible', () => {
