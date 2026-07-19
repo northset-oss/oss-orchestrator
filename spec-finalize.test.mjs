@@ -60,7 +60,7 @@ test('spec finalization binds mission sequence, policy bytes and registry image 
   assert.equal(first.executor.profile_status, 'pilot');
   assert.equal(first.executor.profile_production_proven, false);
   assert.deepEqual(first.receipt.repo_policy_snapshot, policy);
-  assert.equal(first.authoring_mode, 'test_only_then_fix');
+  assert.equal(first.authoring_mode, 'direct_fix');
   assert.equal(first.calibration_ordinal, 1);
   assert.equal(first.qualification.review_prompt_version, REVIEW_PROMPT_VERSION);
   assert.doesNotThrow(() => validateSpec(first));

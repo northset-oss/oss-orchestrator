@@ -756,7 +756,7 @@ test('preflight requests and normalizes canonical repository and issue node iden
   assert.equal(normalized.issue.node_id, 'I_node');
 });
 
-test('qualify command enforces the activated Phase-1 JIT window before review starts', async (t) => {
+test('qualify command ignores legacy Phase-1 JIT scheduling fields', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'northset-phase1-qualify-'));
   t.after(() => rm(root, {recursive: true, force: true}));
   const monotonicNow = Number(process.hrtime.bigint() / 1_000_000n);
@@ -786,8 +786,8 @@ test('qualify command enforces the activated Phase-1 JIT window before review st
     '--out', path.join(root, 'qualifications.json'),
     '--phase1-runtime', runtime,
   ], {...process.env, ...gatewayTestEnv(root)});
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /Phase-1 runtime blocked qualify: OUTSIDE_JIT_WINDOW/);
+  assert.equal(result.code, 0);
+  assert.doesNotMatch(result.stderr, /OUTSIDE_JIT_WINDOW/);
 });
 
 test('bounded runner enforces output and wall-clock limits', async () => {

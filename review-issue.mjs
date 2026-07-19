@@ -653,7 +653,7 @@ export function buildSpecDraft(reviewResult, {
     task_id: taskIdForCandidate(reviewResult.candidate),
     attempt_sequence: null,
     work_category: workCategory,
-    authoring_mode: 'test_only_then_fix',
+    authoring_mode: 'direct_fix',
     allow_modified_existing_tests: false,
     candidate: reviewResult.candidate,
     target_repo: `https://github.com/${issue.owner}/${issue.repo}`,

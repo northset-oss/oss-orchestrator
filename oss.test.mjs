@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import {access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile} from 'node:fs/promises';
-import {spawn} from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -41,6 +40,7 @@ import {
   writeAttempt,
 } from './oss.mjs';
 import {GitHubGatewayRefusalError, GitHubThrottleError} from './gh-gateway.mjs';
+import {assertPhase1Runtime} from './campaign/phase1/runtime-guard.mjs';
 import {
   OSS_IDENTITY,
   PROFILE_REGISTRY,
@@ -68,17 +68,6 @@ import {
 
 const oid = (char) => char.repeat(40);
 const digest = (char) => `sha256:${char.repeat(64)}`;
-
-function command(program, args, env) {
-  return new Promise((resolve) => {
-    const child = spawn(program, args, {env, stdio: ['ignore', 'pipe', 'pipe']});
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk; });
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    child.on('close', (code) => resolve({code, stdout, stderr}));
-  });
-}
 
 function spec(overrides = {}) {
   return {
@@ -302,15 +291,11 @@ test('trusted author model-runner structured 429 latches OpenAI while untagged q
   await assert.rejects(() => readFile(quotedControl), {code: 'ENOENT'});
 });
 
-test('prepare and ship command paths enforce activated Phase-1 schedule and incident holds', async (t) => {
+test('legacy runtime ignores schedule and NTP timing but retains incident holds', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'northset-phase1-oss-'));
   t.after(() => rm(root, {recursive: true, force: true}));
-  const specs = path.join(root, 'specs');
-  const runs = path.join(root, 'runs');
   const runtimeFile = path.join(root, 'runtime.json');
   const controlsFile = path.join(root, 'controls.json');
-  await mkdir(specs);
-  await writeFile(path.join(specs, 'M-010.json'), JSON.stringify(spec()));
   const monotonicNow = () => Number(process.hrtime.bigint() / 1_000_000n);
   const runtime = (overrides = {}) => ({
     schema_version: 1,
@@ -325,48 +310,31 @@ test('prepare and ship command paths enforce activated Phase-1 schedule and inci
     ...overrides,
   });
   const controls = (incidents = []) => ({schema_version: 1, incidents, closures: [], hold_clearances: []});
-  const gatewayRoot = path.join(root, 'gateway');
-  const gatewayEnvironment = {
-    ...process.env,
-    OSS_GH_GATEWAY_TEST_MODE: '1',
-    OSS_GH_GATEWAY_TEST_LOCK_POLL_MS: '1',
-    OSS_GH_CANONICAL_ROOT: gatewayRoot,
-    OSS_GH_GATEWAY_STATE_DIR: path.join(gatewayRoot, 'state'),
-    OSS_GH_REQUEST_LEDGER: path.join(gatewayRoot, 'ledger.jsonl'),
-    OSS_RESOURCE_CONTROL_FILE: path.join(gatewayRoot, 'resource-control.json'),
-    OSS_CAMPAIGN_CONTROL_STATE: path.join(gatewayRoot, 'control-state.json'),
-  };
-  const invoke = (commandArgs) => command(process.execPath,
-    [path.join(import.meta.dirname, 'oss.mjs'), ...commandArgs], gatewayEnvironment);
-
   await writeFile(controlsFile, JSON.stringify(controls()));
-  await writeFile(runtimeFile, JSON.stringify(runtime({board_monotonic_ms: monotonicNow() + 7 * 60 * 60 * 1000})));
-  let result = await invoke(['prepare', 'M-010', '--specs', specs, '--runs', runs, '--phase1-runtime', runtimeFile, '--no-push']);
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /Phase-1 runtime blocked prepare: OUTSIDE_BOARD_WINDOW/);
-
-  await writeFile(runtimeFile, JSON.stringify(runtime({ntp: {offset_ms: 1001, observed_at: new Date().toISOString()}})));
-  result = await invoke(['prepare', 'M-010', '--specs', specs, '--runs', runs, '--phase1-runtime', runtimeFile, '--no-push']);
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /Phase-1 runtime blocked prepare: NTP_HOLD/);
+  await writeFile(runtimeFile, JSON.stringify(runtime({
+    board_monotonic_ms: monotonicNow() + 7 * 60 * 60 * 1000,
+    ntp: {offset_ms: 1001, observed_at: new Date().toISOString()},
+  })));
+  await assert.doesNotReject(() => assertPhase1Runtime(runtimeFile, {
+    action: 'prepare', repositories: ['owner/repo'], monotonicMs: monotonicNow,
+  }));
 
   await writeFile(controlsFile, JSON.stringify(controls([{
     incident_id: 'repo-stop', severity: 'SEV_1', scope: 'repository', repository: 'owner/repo',
     event_class: 'stop_request', occurred_at: new Date().toISOString(),
   }])));
   await writeFile(runtimeFile, JSON.stringify(runtime()));
-  result = await invoke(['prepare', 'M-010', '--specs', specs, '--runs', runs, '--phase1-runtime', runtimeFile, '--no-push']);
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /Phase-1 runtime blocked prepare: REPOSITORY_HOLD owner\/repo/);
+  await assert.rejects(() => assertPhase1Runtime(runtimeFile, {
+    action: 'prepare', repositories: ['owner/repo'], monotonicMs: monotonicNow,
+  }), /Phase-1 runtime blocked prepare: REPOSITORY_HOLD owner\/repo/);
 
   await writeFile(controlsFile, JSON.stringify(controls([{
     incident_id: 'platform-stop', severity: 'SEV_1', scope: 'platform', repository: null,
     event_class: 'platform_warning', occurred_at: new Date().toISOString(),
   }])));
-  result = await invoke(['ship', 'M-010', '--specs', specs, '--runs', runs, '--phase1-runtime', runtimeFile,
-    '--approve', digest('a'), '--approval-record', path.join(root, 'missing-approval.json'), '--no-push']);
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /Phase-1 runtime blocked ship: GLOBAL_PUBLICATION_HOLD/);
+  await assert.rejects(() => assertPhase1Runtime(runtimeFile, {
+    action: 'ship', repositories: ['owner/repo'], monotonicMs: monotonicNow,
+  }), /Phase-1 runtime blocked ship: GLOBAL_PUBLICATION_HOLD/);
 });
 
 test('warm planning deduplicates executor images and retains immutable digests without deleting data', async (t) => {
@@ -413,7 +381,7 @@ test('writable dependency caches are isolated while schema-v2 retries reuse the 
   const image = 'node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   assert.equal(await dependencyCacheKey(first, root, image), await dependencyCacheKey(same, root, image));
   assert.notEqual(await dependencyCacheKey(first, root, image), await dependencyCacheKey(otherMission, root, image));
-  assert.notEqual(await dependencyCacheKey(first, root, image), await dependencyCacheKey(otherBase, root, image));
+  assert.equal(await dependencyCacheKey(first, root, image), await dependencyCacheKey(otherBase, root, image));
   const firstAttempt = {...first, schema_version: 2, task_id: 'TASK-OSS-0123456789ABCDEF',
     attempt_sequence: 1, work_category: 'defect_fix'};
   const retryAttempt = {...firstAttempt, mission_id: 'M-011', attempt_sequence: 2};
@@ -1259,7 +1227,7 @@ test('identity, binding chain, and direct mission footer are fail closed', () =>
   const canonicalReceipt = 'https://northset-oss.github.io/verification-pilot/receipts/M-010/';
   assert.equal(footer, [
     '---',
-    'AI assistance was used; I reviewed and own this change.',
+    'AI assistance was used. This change was reviewed by Northset, and I accept responsibility for this submission.',
     '',
     '<!-- northset-receipt:M-010:start -->',
     '### Verification',

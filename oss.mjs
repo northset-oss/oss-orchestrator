@@ -317,8 +317,8 @@ export async function dependencyCacheKey(spec, repo, image, {
 } = {}) {
   if (!['authored', 'foreign'].includes(trustDomain)) throw new Error('cache trust domain must be authored or foreign');
   const names = {
-    node: ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock'],
-    python: ['pyproject.toml', 'requirements.txt', 'requirements-dev.txt', 'poetry.lock', 'uv.lock'],
+    node: ['package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock'],
+    python: ['pyproject.toml', 'requirements.txt', 'requirements-dev.txt', 'requirements-test.txt', 'poetry.lock', 'uv.lock'],
     go: ['go.mod', 'go.sum'],
     rust: ['Cargo.toml', 'Cargo.lock'],
   }[spec.executor.profile] ?? [];
@@ -333,9 +333,6 @@ export async function dependencyCacheKey(spec, repo, image, {
   return sha256(Buffer.from(canonical({
     repository: `${candidate.owner}/${candidate.repo}`.toLowerCase(),
     repository_node_id: repositoryNodeId ?? `legacy:${candidate.owner}/${candidate.repo}`.toLowerCase(),
-    candidate: spec.candidate.toLowerCase(),
-    mission_id: spec.task_id ?? spec.mission_id,
-    base_commit: spec.base_commit.toLowerCase(),
     profile: spec.executor.profile,
     image_digest: image,
     architecture,

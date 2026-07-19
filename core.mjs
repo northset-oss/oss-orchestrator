@@ -319,7 +319,7 @@ export function receiptFooter(missionId, commitOid) {
   const receiptUrl = `https://northset-oss.github.io/verification-pilot/receipts/${missionId}/`;
   return [
     '---',
-    'AI assistance was used; I reviewed and own this change.',
+    'AI assistance was used. This change was reviewed by Northset, and I accept responsibility for this submission.',
     '',
     `<!-- northset-receipt:${missionId}:start -->`,
     '### Verification',

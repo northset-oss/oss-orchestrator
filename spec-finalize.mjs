@@ -43,7 +43,7 @@ export function finalizeSpec(draftValue, {
   spec.task_id = taskIdForCandidate(spec.candidate);
   spec.attempt_sequence = attemptSequence;
   if (calibrationOrdinal !== undefined) spec.calibration_ordinal = calibrationOrdinal;
-  spec.authoring_mode = authoringMode ?? spec.authoring_mode ?? 'test_only_then_fix';
+  spec.authoring_mode = authoringMode ?? spec.authoring_mode ?? 'direct_fix';
   spec.allow_modified_existing_tests ??= false;
   spec.non_goals ??= [...(spec.qualification?.acceptance_contract?.non_goals ?? [])];
   spec.source_evidence ??= [...(spec.qualification?.source_evidence ?? [])];
