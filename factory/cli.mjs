@@ -8,7 +8,10 @@ import {openFactoryDb} from './db.mjs';
 import {createGhCliPublisherAdapter, createGhCliTransport} from './gh-cli.mjs';
 import {createGitHubSafety, resumeGitHub} from './github-safety.mjs';
 import {publishBoard} from './publisher.mjs';
-import {createReceiptPublisher, createReceiptStatusPublisher} from './receipt-publisher.mjs';
+import {
+  createReceiptPublisher,
+  createReceiptStatusPublisher,
+} from './receipt-publisher.mjs';
 import {reconcilePublicationBatch} from './reconciler.mjs';
 import {createSource} from './source.mjs';
 import {createStaleRefresher} from './stale-refresh.mjs';

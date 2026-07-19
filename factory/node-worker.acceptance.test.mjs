@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdtemp, readFile, rm, writeFile, mkdir} from 'node:fs/promises';
+import {lstat, mkdtemp, readFile, rm, writeFile, mkdir} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,6 +11,7 @@ import {
   codexHostArgs,
   codexProcessEnvironment,
   createNodeWorker,
+  prepareCodexHome,
   runBounded,
   runtimeDockerArgs,
 } from './node-worker.mjs';
@@ -77,11 +78,39 @@ test('N1 scout uses the bounded structured read-only contract', async (t) => {
   assert.equal(invocation.effort, 'medium');
   assert.equal(invocation.timeoutMs, 90_000);
   assert.match(invocation.prompt, /Inspect this checkout read-only/);
+  assert.match(invocation.prompt, /empty install_command/);
   assert.match(invocation.prompt, /Never call GitHub|Do not call GitHub/);
+  assert.deepEqual(new Set(SCOUT_SCHEMA.required), new Set(Object.keys(SCOUT_SCHEMA.properties)));
   assert.deepEqual(result.target_files, ['src/value.mjs', 'test/value.test.mjs']);
 });
 
-test('N2 the authenticated model client stays host-side and Docker plans remain credential-free', async () => {
+test('N1b scout rejects workspace and PnP layouts before model or bootstrap work', async (t) => {
+  const {checkout, task} = await repository(t);
+  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => assert.fail('no model call')});
+  await writeFile(path.join(checkout, 'package.json'), JSON.stringify({
+    name: 'worker-fixture', private: true, workspaces: ['packages/*'],
+  }));
+  const workspace = await worker.handle({action: 'scout', task, checkout});
+  assert.equal(workspace.decision, 'SKIP');
+  assert.match(workspace.reason, /multi-package workspaces/);
+
+  await writeFile(path.join(checkout, 'package.json'), JSON.stringify({
+    name: 'worker-fixture', private: true, packageManager: 'yarn@4.9.2',
+  }));
+  const pnp = await worker.handle({action: 'scout', task, checkout});
+  assert.equal(pnp.decision, 'SKIP');
+  assert.match(pnp.reason, /Yarn Berry/);
+
+  await writeFile(path.join(checkout, 'package.json'), JSON.stringify({
+    name: 'worker-fixture', private: true,
+  }));
+  await writeFile(path.join(checkout, '.yarnrc.yml'), 'nodeLinker: node-modules\n');
+  const yarnRc = await worker.handle({action: 'scout', task, checkout});
+  assert.equal(yarnRc.decision, 'SKIP');
+  assert.match(yarnRc.reason, /Yarn Berry/);
+});
+
+test('N2 the authenticated model client stays host-side and Docker plans remain credential-free', async (t) => {
   const checkout = '/private/factory/repository';
   const codexHome = '/private/factory/codex-home';
   const outputRoot = '/private/factory/output';
@@ -93,14 +122,16 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
   const joinedAuthor = author.join('\n');
   assert.equal(author[0], 'exec');
   assert.match(joinedAuthor, /-C\n\/private\/factory\/repository/);
-  assert.match(joinedAuthor, /--sandbox\nworkspace-write/);
+  assert.match(joinedAuthor, /default_permissions="factory_workspace"/);
+  assert.doesNotMatch(joinedAuthor, /--sandbox/);
+  assert.doesNotMatch(joinedAuthor, /--ignore-user-config/);
   assert.doesNotMatch(joinedAuthor, /dangerously-bypass-approvals-and-sandbox/);
   assert.doesNotMatch(joinedAuthor, /docker|--mount|auth\.json/);
   assert.match(joinedAuthor, /--output-schema/);
   assert.match(joinedAuthor, /--output-last-message/);
   assert.match(joinedAuthor, /shell_environment_policy\.exclude/);
-  const clientEnvironment = codexProcessEnvironment({codexHome, accessToken: 'short-lived-model-token'});
-  assert.equal(clientEnvironment.CODEX_ACCESS_TOKEN, 'short-lived-model-token');
+  const clientEnvironment = codexProcessEnvironment({codexHome});
+  assert.equal(clientEnvironment.CODEX_ACCESS_TOKEN, undefined);
   assert.equal(clientEnvironment.CODEX_HOME, codexHome);
   assert.equal(clientEnvironment.GITHUB_TOKEN, undefined);
   assert.equal(clientEnvironment.GH_TOKEN, undefined);
@@ -111,13 +142,15 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
     schemaFile: `${outputRoot}/schema.json`, outputFile: `${outputRoot}/result.json`,
     model: 'test-model', effort: 'medium', readOnly: true,
   }).join('\n');
-  assert.match(scout, /--sandbox\nread-only/);
+  assert.match(scout, /default_permissions="factory_readonly"/);
 
   const bootstrap = bootstrapDockerArgs({
     checkout, volume: 'northset-deps-abc', image: IMAGE,
     installCommand: 'npm ci --no-audit --no-fund',
   }).join('\n');
-  assert.match(bootstrap, /src=\/private\/factory\/repository,dst=\/workspace,readonly/);
+  assert.match(bootstrap, /src=\/private\/factory\/repository,dst=\/source,readonly/);
+  assert.match(bootstrap, /\/workspace:rw,exec,nosuid,nodev,size=2g/);
+  assert.match(bootstrap, /tar -C \/source/);
   assert.match(bootstrap, /src=northset-deps-abc,dst=\/workspace\/node_modules$/m);
   assert.doesNotMatch(bootstrap, /dst=\/workspace\/node_modules,readonly/);
   assert.doesNotMatch(bootstrap, /auth\.json|CODEX_HOME|GITHUB_TOKEN|GH_TOKEN/);
@@ -128,6 +161,36 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
   assert.match(runtime, /--network=none/);
   assert.match(runtime, /src=northset-deps-abc,dst=\/workspace\/node_modules,readonly/);
   assert.match(runtime, /src=\/private\/factory\/repository,dst=\/workspace,readonly/);
+
+  const authRoot = await temporary(t, 'factory-codex-auth');
+  const sourceHome = path.join(authRoot, 'source-home');
+  await mkdir(sourceHome, {recursive: true});
+  await writeFile(path.join(sourceHome, 'auth.json'), JSON.stringify({
+    auth_mode: 'chatgpt',
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: 'host-id-token',
+      access_token: 'host-access-token',
+      refresh_token: 'host-refresh-token',
+      account_id: 'host-account-id',
+    },
+    last_refresh: '2026-07-19T00:00:00Z',
+  }));
+  const isolatedHome = await prepareCodexHome(authRoot, sourceHome);
+  const isolatedConfig = await readFile(path.join(isolatedHome, 'config.toml'), 'utf8');
+  const isolatedAuth = JSON.parse(await readFile(path.join(isolatedHome, 'auth.json'), 'utf8'));
+  assert.deepEqual(isolatedAuth.tokens, {
+    id_token: 'host-id-token',
+    access_token: 'host-access-token',
+    refresh_token: '',
+    account_id: 'host-account-id',
+  });
+  assert.equal(isolatedAuth.auth_mode, 'chatgpt');
+  assert.match(isolatedConfig, /default_permissions = "factory_readonly"/);
+  assert.match(isolatedConfig, /\[permissions\.factory_readonly\.filesystem\]/);
+  assert.match(isolatedConfig, /\[permissions\.factory_workspace\.filesystem\]/);
+  assert.match(isolatedConfig, new RegExp(`${sourceHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" = "deny"`));
+  assert.match(isolatedConfig, new RegExp(`${isolatedHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" = "deny"`));
 });
 
 test('N3 bootstrap creates one content-keyed volume and then reuses its frozen marker', async (t) => {
@@ -164,8 +227,10 @@ test('N3 bootstrap creates one content-keyed volume and then reuses its frozen m
     call.args.some((arg) => String(arg).includes('npm ci')));
   assert.ok(install);
   assert.equal(install.args.at(-4), IMAGE_DIGEST);
+  assert.match(install.args.join('\n'), /dst=\/source,readonly/);
   assert.match(install.args.join('\n'), /dst=\/workspace\/node_modules(?:\n|$)/);
   assert.doesNotMatch(install.args.join('\n'), /dst=\/workspace\/node_modules,readonly/);
+  await assert.rejects(() => lstat(path.join(checkout, 'node_modules')), {code: 'ENOENT'});
 });
 
 test('N4 only recognizable Docker or registry bootstrap failures are retryable', async (t) => {

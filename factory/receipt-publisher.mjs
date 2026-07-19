@@ -7,11 +7,12 @@ import path from 'node:path';
 const RECEIPTS_BRANCH = 'receipts';
 const DEFAULT_REMOTE_URL = 'https://github.com/northset-oss/verification-pilot.git';
 const DEFAULT_WEB_URL = 'https://github.com/northset-oss/verification-pilot';
+const DEFAULT_RECEIPT_URL = 'https://northset-oss.github.io/verification-pilot/receipts';
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const OID_PATTERN = /^[a-f0-9]{40}$/;
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
-const MISSION_PATTERN = /^M-[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const MISSION_PATTERN = /^M-(?:\d{3,}|E2[a-c])$/;
 
 export class ReceiptPublisherError extends Error {
   constructor(message, code, detail = {}) {
@@ -115,6 +116,114 @@ function assertExistingProofField(existing, key, expected, missionId) {
   }
 }
 
+function nonblank(value) {
+  return typeof value === 'string' && Boolean(value.trim());
+}
+
+function exactKeys(value, required) {
+  return value && typeof value === 'object' && !Array.isArray(value) &&
+    required.every((key) => Object.hasOwn(value, key)) &&
+    Object.keys(value).every((key) => required.includes(key));
+}
+
+function validTime(value, label) {
+  if (!nonblank(value) || !Number.isFinite(Date.parse(value))) {
+    throw new TypeError(`${label} must be an ISO-8601 time`);
+  }
+  return value;
+}
+
+function validHttpsUrl(value, label, {nullable = false} = {}) {
+  if (nullable && value === null) return null;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:') throw new Error('not HTTPS');
+    return parsed.href;
+  } catch {
+    throw new TypeError(`${label} must be an HTTPS URL${nullable ? ' or null' : ''}`);
+  }
+}
+
+function validProofCommand(value) {
+  return nonblank(value) || (Array.isArray(value) && value.length > 0 && value.every(nonblank));
+}
+
+function assertV2ProofEvidence(proof, missionId) {
+  if (proof.schema_version !== 2) return;
+  const proofFields = [
+    'schema_version', 'mission_id', 'task_id', 'repository', 'issue_number', 'candidate',
+    'base_oid', 'patch_sha256', 'commit_oid', 'tested_tree_oid', 'checks', 'claim',
+    'batch_approval_digest', 'environment', 'base_observation', 'patched_observation',
+    'executed_commands', 'checks_not_run', 'limitations', 'verification_started_at',
+    'verification_finished_at',
+  ];
+  if (!exactKeys(proof, proofFields) || !nonblank(proof.task_id) || !nonblank(proof.repository) ||
+      !Number.isInteger(proof.issue_number) || proof.issue_number < 1 || !nonblank(proof.candidate) ||
+      !proof.claim || typeof proof.claim !== 'object' || Array.isArray(proof.claim) ||
+      !proof.environment || typeof proof.environment !== 'object' || Array.isArray(proof.environment) ||
+      !proof.base_observation || typeof proof.base_observation !== 'object' ||
+      !proof.patched_observation || typeof proof.patched_observation !== 'object') {
+    throw new TypeError(`${missionId} proof v2 has an invalid shape`);
+  }
+  const commands = proof.executed_commands;
+  if (!Array.isArray(commands) || commands.length !== 2) {
+    throw new TypeError(`${missionId} proof v2 must contain base and patched executed_commands`);
+  }
+  const expectedPhases = ['base_observation', 'patched_observation'];
+  const commandFields = [
+    'phase', 'command', 'network', 'expected_result', 'result', 'expectation_met',
+    'started_at', 'finished_at', 'duration_ms', 'exit_code', 'stdout_sha256',
+    'stderr_sha256', 'output_sha256',
+  ];
+  for (const [index, command] of commands.entries()) {
+    const label = `${missionId} proof v2 executed_commands[${index}]`;
+    if (!exactKeys(command, commandFields) ||
+        command.phase !== expectedPhases[index] || !validProofCommand(command.command) ||
+        command.network !== 'none' || !['success', 'failure'].includes(command.expected_result) ||
+        !['PASS', 'FAIL'].includes(command.result) || typeof command.expectation_met !== 'boolean' ||
+        !Number.isInteger(command.exit_code) || !Number.isFinite(command.duration_ms) ||
+        command.duration_ms < 0) {
+      throw new TypeError(`${label} is malformed`);
+    }
+    validTime(command.started_at, `${label}.started_at`);
+    validTime(command.finished_at, `${label}.finished_at`);
+    if (Date.parse(command.finished_at) < Date.parse(command.started_at)) {
+      throw new TypeError(`${label} timestamps are reversed`);
+    }
+    for (const field of ['stdout_sha256', 'stderr_sha256', 'output_sha256']) {
+      validDigest(command[field], `${label} ${field}`);
+    }
+    if ((command.exit_code === 0) !== (command.result === 'PASS') ||
+        command.expectation_met !== (command.expected_result === 'success'
+          ? command.exit_code === 0 : command.exit_code !== 0)) {
+      throw new TypeError(`${label} result does not match its exit code and expectation`);
+    }
+  }
+  if (commands[1].exit_code !== 0 || commands[1].expectation_met !== true) {
+    throw new TypeError(`${missionId} proof v2 patched command must be a successful expected pass`);
+  }
+  if (canonical(proof.base_observation) !== canonical(commands[0]) ||
+      canonical(proof.patched_observation) !== canonical(commands[1])) {
+    throw new TypeError(`${missionId} proof v2 observations contradict executed_commands`);
+  }
+  validTime(proof.verification_started_at, `${missionId} proof v2 verification_started_at`);
+  validTime(proof.verification_finished_at, `${missionId} proof v2 verification_finished_at`);
+  if (Date.parse(proof.verification_finished_at) < Date.parse(proof.verification_started_at)) {
+    throw new TypeError(`${missionId} proof v2 verification timestamps are reversed`);
+  }
+  if (!nonblank(proof.environment.image)) {
+    throw new TypeError(`${missionId} proof v2 requires verification timing and executor image identity`);
+  }
+  if (!Array.isArray(proof.checks_not_run) || proof.checks_not_run.some((entry) =>
+    !exactKeys(entry, ['check', 'reason']) ||
+    !nonblank(entry.check) || !nonblank(entry.reason))) {
+    throw new TypeError(`${missionId} proof v2 checks_not_run must contain nonblank check and reason strings`);
+  }
+  if (!Array.isArray(proof.limitations) || proof.limitations.some((entry) => !nonblank(entry))) {
+    throw new TypeError(`${missionId} proof v2 limitations must contain only nonblank strings`);
+  }
+}
+
 function proofFor(item) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) throw new TypeError('receipt item must be an object');
   const manifest = item.manifest && typeof item.manifest === 'object' && !Array.isArray(item.manifest)
@@ -169,6 +278,7 @@ function proofFor(item) {
     batch_approval_digest: approvalDigest,
   };
   assertJson(proof, `${missionId} proof`);
+  assertV2ProofEvidence(proof, missionId);
   const bytes = Buffer.from(`${canonical(proof)}\n`, 'utf8');
   return {missionId, commitOid, approvalDigest, proof, bytes, proofSha256: digest(bytes)};
 }
@@ -181,8 +291,23 @@ function publicationPath(missionId, commitOid) {
   return `receipts/${validMissionId(missionId)}/${validOid(commitOid, 'commit_oid')}/publication.json`;
 }
 
+function currentPath(missionId) {
+  return `receipts/${validMissionId(missionId)}/current.json`;
+}
+
 export function receiptUrlFor(missionId, commitOid) {
-  return `${DEFAULT_WEB_URL}/blob/${RECEIPTS_BRANCH}/${proofPath(missionId, commitOid)}`;
+  validOid(commitOid, 'commit_oid');
+  return `${DEFAULT_RECEIPT_URL}/${validMissionId(missionId)}/`;
+}
+
+function pointerFor(entry) {
+  const value = {
+    schema_version: 1,
+    mission_id: entry.missionId,
+    contribution_commit_oid: entry.commitOid,
+    proof_sha256: entry.proofSha256,
+  };
+  return {relativePath: currentPath(entry.missionId), bytes: Buffer.from(`${canonical(value)}\n`, 'utf8')};
 }
 
 export function runBounded(command, args, {
@@ -381,6 +506,7 @@ export function createReceiptPublisher({
       }
 
       const additions = [];
+      const pointers = [];
       for (const entry of proofs) {
         const relativePath = proofPath(entry.missionId, entry.commitOid);
         const existing = branch.code === 0 ? await existingProof(git, checkout, relativePath) : null;
@@ -399,7 +525,24 @@ export function createReceiptPublisher({
         additions.push({...entry, relativePath});
       }
 
-      if (additions.length === 0) {
+      if (additions.length !== 0 && additions.length !== proofs.length) {
+        throw new ReceiptPublisherError(
+          'receipt batch is only partially present; refusing to assign one commit to mixed provenance',
+          'RECEIPT_PARTIAL_BATCH',
+        );
+      }
+      for (const entry of proofs) {
+        const pointer = pointerFor(entry);
+        const existing = branch.code === 0 ? await existingProof(git, checkout, pointer.relativePath) : null;
+        if (existing?.equals(pointer.bytes)) continue;
+        const file = path.join(checkout, ...pointer.relativePath.split('/'));
+        await mkdir(path.dirname(file), {recursive: true});
+        await writeFile(file, pointer.bytes);
+        await exactFileReadback(file, pointer.bytes, `${entry.missionId} current pointer`);
+        pointers.push({...entry, ...pointer});
+      }
+
+      if (additions.length === 0 && pointers.length === 0) {
         const commits = new Set();
         for (const entry of proofs) {
           commits.add(await introductionCommit(git, checkout, proofPath(entry.missionId, entry.commitOid)));
@@ -411,7 +554,9 @@ export function createReceiptPublisher({
         return resultsFor(proofs, [...commits][0]);
       }
 
-      await git(['-C', checkout, 'add', '--', ...additions.map((entry) => entry.relativePath)], {
+      await git(['-C', checkout, 'add', '--',
+        ...additions.map((entry) => entry.relativePath),
+        ...pointers.map((entry) => entry.relativePath)], {
         operation: 'stage receipt batch',
       });
       const timestamp = now();
@@ -422,21 +567,36 @@ export function createReceiptPublisher({
         '-c', `user.name=${authorName}`,
         '-c', `user.email=${authorEmail}`,
         '-c', 'core.hooksPath=/dev/null',
-        'commit', '-m', `Publish receipt batch: ${additions.map((entry) => entry.missionId).join(', ')}`], {
+        'commit', '-m', additions.length
+          ? `Publish receipt batch: ${additions.map((entry) => entry.missionId).join(', ')}`
+          : `Publish receipt pointers: ${pointers.map((entry) => entry.missionId).join(', ')}`], {
         operation: 'commit receipt batch',
         cwd: checkout,
         env: {GIT_AUTHOR_DATE: commitEnvDate, GIT_COMMITTER_DATE: commitEnvDate},
       });
       const oidResult = await git(['-C', checkout, 'rev-parse', 'HEAD'], {operation: 'read receipt batch commit'});
-      const batchCommitOid = validOid(oidResult.stdout.trim(), 'batch_commit_oid');
+      const commitOid = validOid(oidResult.stdout.trim(), 'receipt_commit_oid');
       for (const entry of additions) {
-        await committedReadback(git, checkout, entry.relativePath, entry.bytes, batchCommitOid, entry.missionId);
+        await committedReadback(git, checkout, entry.relativePath, entry.bytes, commitOid, entry.missionId);
+      }
+      for (const entry of pointers) {
+        await committedReadback(git, checkout, entry.relativePath, entry.bytes, commitOid,
+          `${entry.missionId} current pointer`);
       }
       await git(['-C', checkout, '-c', 'core.hooksPath=/dev/null', 'push', '--porcelain',
         'origin', `HEAD:refs/heads/${RECEIPTS_BRANCH}`], {
         operation: 'non-force receipt batch push',
       });
-      return resultsFor(proofs, batchCommitOid);
+      if (additions.length) return resultsFor(proofs, commitOid);
+      const introductionCommits = new Set();
+      for (const entry of proofs) {
+        introductionCommits.add(await introductionCommit(git, checkout, proofPath(entry.missionId, entry.commitOid)));
+      }
+      if (introductionCommits.size !== 1) {
+        throw new ReceiptPublisherError('existing proofs were not introduced by one batch commit',
+          'RECEIPT_ADOPTION_BATCH_MISMATCH');
+      }
+      return resultsFor(proofs, [...introductionCommits][0]);
     } finally {
       await rm(workspace, {recursive: true, force: true});
     }
@@ -452,8 +612,24 @@ function statusFor(item) {
   const prNumber = Number(item.pr_number);
   if (!Number.isInteger(prNumber) || prNumber < 1) throw new TypeError(`${missionId} pr_number must be positive`);
   for (const field of ['receipt_url', 'pr_url', 'pr_state', 'attestation_state']) {
-    if (typeof item[field] !== 'string' || !item[field]) throw new TypeError(`${missionId} ${field} is required`);
+    if (!nonblank(item[field])) throw new TypeError(`${missionId} ${field} is required`);
   }
+  if (item.receipt_url !== receiptUrlFor(missionId, commitOid)) {
+    throw new TypeError(`${missionId} receipt_url must be the canonical public ledger URL`);
+  }
+  validHttpsUrl(item.pr_url, `${missionId} pr_url`);
+  if (!['OPEN', 'CLOSED', 'MERGED'].includes(item.pr_state)) {
+    throw new TypeError(`${missionId} pr_state is invalid`);
+  }
+  const merged = item.merged === true;
+  if (merged !== (item.pr_state === 'MERGED')) {
+    throw new TypeError(`${missionId} merged state is inconsistent`);
+  }
+  const ciState = item.ci_state ?? null;
+  if (ciState !== null && !nonblank(ciState)) throw new TypeError(`${missionId} ci_state is invalid`);
+  const attestationUrl = item.attestation_url ?? null;
+  validHttpsUrl(attestationUrl, `${missionId} attestation_url`, {nullable: true});
+  validTime(item.observed_at, `${missionId} observed_at`);
   const status = {
     schema_version: 1,
     mission_id: missionId,
@@ -462,11 +638,11 @@ function statusFor(item) {
     pr_url: item.pr_url,
     pr_number: prNumber,
     pr_state: item.pr_state,
-    merged: item.merged === true,
-    ci_state: item.ci_state ?? null,
+    merged,
+    ci_state: ciState,
     attestation_state: item.attestation_state,
-    attestation_url: item.attestation_url ?? null,
-    observed_at: item.observed_at ?? null,
+    attestation_url: attestationUrl,
+    observed_at: item.observed_at,
   };
   assertJson(status, `${missionId} publication status`);
   return {missionId, commitOid, status, bytes: Buffer.from(`${canonical(status)}\n`, 'utf8')};

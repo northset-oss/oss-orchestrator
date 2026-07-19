@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdtemp, readFile, rm} from 'node:fs/promises';
+import {mkdtemp, readFile, rm, stat} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -297,6 +297,7 @@ test('a live cross-process lease is never stolen merely because one request runs
   releaseFirst();
   await Promise.all([first, second]);
   assert.deepEqual(starts, ['first', 'second']);
+  await assert.rejects(() => stat(`${clock.pauseFile}.governor.json.lock`), {code: 'ENOENT'});
 });
 
 test('transient network and 5xx failures get one retry, not an unbounded loop', async (t) => {

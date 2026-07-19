@@ -1118,10 +1118,16 @@ push once:
   one batch push
 
 receipt URL:
-  immediate GitHub blob/raw URL or stable receipt endpoint
+  canonical public ledger endpoint
 ```
 
-Each receipt has:
+The receipts branch remains the immutable evidence source, but it is not the contributor-facing
+receipt URL. GitHub Pages validates and projects the current digest-bound proof at
+`https://northset-oss.github.io/verification-pilot/receipts/<MISSION>/`. Immutable proof publication
+provides that stable URL immediately. Pages rendering, machine-readable receipt projection,
+attestation, and outcome updates reconcile asynchronously and never block an approved upstream PR.
+
+Each proof has:
 
 ```text
 proof.json

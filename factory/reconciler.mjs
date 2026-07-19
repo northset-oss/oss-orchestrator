@@ -1,3 +1,5 @@
+import {receiptUrlFor} from './receipt-publisher.mjs';
+
 const RECONCILIATION_PRIORITY = 'reconciliation';
 const DEFAULT_ATTESTATION_REPOSITORY = 'northset-oss/verification-pilot';
 
@@ -54,11 +56,12 @@ async function saveFailure(db, missionId, code, error, now) {
 }
 
 function statusItem(publication, observed) {
+  const commitOid = publication.pushed_oid ?? publication.pr_head_oid;
   return {
     mission_id: publication.mission_id,
-    commit_oid: publication.pushed_oid ?? publication.pr_head_oid,
+    commit_oid: commitOid,
     pr_number: publication.pr_number,
-    receipt_url: publication.receipt_url,
+    receipt_url: receiptUrlFor(publication.mission_id, commitOid),
     pr_url: publication.pr_url,
     pr_state: publication.pr_state,
     merged: publication.merged === true,

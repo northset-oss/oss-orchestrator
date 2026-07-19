@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {approveBoard} from './board.mjs';
 import {openFactoryDb} from './db.mjs';
-import {createStageSemaphores, runFactoryCycle, runUntilIdle} from './worker.mjs';
+import {createStageSemaphores, removeWorkTree, runFactoryCycle, runUntilIdle} from './worker.mjs';
 
 async function makeFactory(t, {missionStart = 1000} = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'oss-factory-'));
@@ -50,21 +50,61 @@ function verifiedDriver({verified = 10, startHook = null} = {}) {
       changed_lines: 3,
       risk_tier: 'GREEN',
     }),
-    verify: async (task) => ({
-      ok: true,
-      claim_type: 'regression_fix',
-      dco_verified: true,
-      changed_files: [{path: 'src/a.mjs', status: 'M', class: 'production', lines: 3}],
-      changed_lines: 3,
-      patch_sha256: `sha256:${String((task.issue_number % 9) + 1).repeat(64)}`,
-      tested_tree_oid: 'b'.repeat(40),
-      commit_oid: `${String((task.issue_number % 8) + 1)}`.repeat(40),
-      base_observation: {exit_code: 1, output_sha256: `sha256:${'c'.repeat(64)}`},
-      patched_observation: {exit_code: 0, output_sha256: `sha256:${'d'.repeat(64)}`},
-    }),
+    verify: async (task) => {
+      const timestamp = '2026-07-19T12:00:00.000Z';
+      const baseObservation = {
+        phase: 'base_observation', command: 'node --test', network: 'none',
+        expected_result: 'failure', result: 'FAIL', expectation_met: true,
+        started_at: timestamp, finished_at: timestamp, duration_ms: 0,
+        exit_code: 1, output_sha256: `sha256:${'c'.repeat(64)}`,
+      };
+      const patchedObservation = {
+        phase: 'patched_observation', command: 'node --test', network: 'none',
+        expected_result: 'success', result: 'PASS', expectation_met: true,
+        started_at: timestamp, finished_at: timestamp, duration_ms: 0,
+        exit_code: 0, output_sha256: `sha256:${'d'.repeat(64)}`,
+      };
+      return {
+        ok: true,
+        claim_type: 'regression_fix',
+        dco_verified: true,
+        changed_files: [{path: 'src/a.mjs', status: 'M', class: 'production', lines: 3}],
+        changed_lines: 3,
+        patch_sha256: `sha256:${String((task.issue_number % 9) + 1).repeat(64)}`,
+        tested_tree_oid: 'b'.repeat(40),
+        commit_oid: `${String((task.issue_number % 8) + 1)}`.repeat(40),
+        verification_started_at: timestamp,
+        verification_finished_at: timestamp,
+        executed_commands: [baseObservation, patchedObservation],
+        base_observation: baseObservation,
+        patched_observation: patchedObservation,
+        environment: {
+          profile: 'node', image: `sha256:${'e'.repeat(64)}`, architecture: 'arm64', network: 'none',
+        },
+      };
+    },
     cleanup: async () => {},
   };
 }
+
+test('work-tree cleanup bounds filesystem retries and defers only busy-directory races', async () => {
+  let options = null;
+  const removed = await removeWorkTree('/private/factory-work', {
+    remove: async (_root, supplied) => { options = supplied; },
+  });
+  assert.equal(removed, true);
+  assert.deepEqual(options, {recursive: true, force: true, maxRetries: 5, retryDelay: 100});
+
+  const busy = new Error('directory not empty');
+  busy.code = 'ENOTEMPTY';
+  assert.equal(await removeWorkTree('/private/factory-work', {
+    remove: async () => { throw busy; },
+    tolerateBusy: true,
+  }), false);
+  await assert.rejects(removeWorkTree('/private/factory-work', {
+    remove: async () => { throw busy; },
+  }), busy);
+});
 
 test('fifty lake candidates enter the continuous queue without shift or board schedule fields', async (t) => {
   const {db} = await makeFactory(t);

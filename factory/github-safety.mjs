@@ -236,14 +236,31 @@ async function acquireLease(lockDirectory, {
       await mkdir(lockDirectory, {mode: 0o700});
       const token = randomUUID();
       const acquiredAt = new Date().toISOString();
-      const writeOwner = () => writeFile(ownerFile, `${JSON.stringify({
-        pid: process.pid, token, acquired_at: acquiredAt, heartbeat_at: new Date().toISOString(),
-      })}\n`, {mode: 0o600});
+      const writeOwner = async () => {
+        const temporary = `${ownerFile}.${process.pid}.${token}.${randomUUID()}.tmp`;
+        try {
+          await writeFile(temporary, `${JSON.stringify({
+            pid: process.pid, token, acquired_at: acquiredAt, heartbeat_at: new Date().toISOString(),
+          })}\n`, {mode: 0o600});
+          await rename(temporary, ownerFile);
+        } catch (error) {
+          await rm(temporary, {force: true}).catch(() => {});
+          throw error;
+        }
+      };
       await writeOwner();
-      const heartbeat = setInterval(() => { writeOwner().catch(() => {}); }, heartbeatMs);
+      let releasing = false;
+      let pendingHeartbeat = Promise.resolve();
+      const heartbeat = setInterval(() => {
+        pendingHeartbeat = pendingHeartbeat
+          .then(() => releasing ? undefined : writeOwner())
+          .catch(() => {});
+      }, heartbeatMs);
       heartbeat.unref?.();
       return async () => {
+        releasing = true;
         clearInterval(heartbeat);
+        await pendingHeartbeat;
         const owner = await readJsonFile(ownerFile, null);
         if (owner?.token === token) await rm(lockDirectory, {recursive: true, force: true});
       };

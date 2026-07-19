@@ -94,7 +94,11 @@ Provide one base observation and one clean patched observation.
 - Represent dependency material as a content-keyed volume writable only during
   bootstrap and read-only during author/verifier use.
 - Build compact immutable `proof.json` bytes containing exact observations,
-  environment, output hashes, claim, and approval binding.
+  structured executed-command timing and results, checks not run, limitations,
+  environment and image identity, output hashes, claim, and approval binding.
+- Publish a digest-bound `current.json` pointer for the ledger projection, use the canonical
+  Pages receipt URL in approved PR bytes, and reconcile the public HTML and JSON projection
+  asynchronously without delaying an approved upstream branch or PR.
 
 ### `factory/board.mjs`
 

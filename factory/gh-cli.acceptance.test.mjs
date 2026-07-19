@@ -163,6 +163,10 @@ test('H4 semantic REST adapter preserves exact OIDs, title, body, head, and requ
   const transport = fakeTransport({
     rest: async (request) => {
       requests.push(request);
+      if (request.path === '/repos/northset/project') {
+        return structured({full_name: 'northset/project', fork: true,
+          parent: {full_name: 'upstream/project'}});
+      }
       if (request.path.includes('/git/ref/heads/')) {
         return structured({object: {sha: 'B'.repeat(40)}});
       }
@@ -175,6 +179,11 @@ test('H4 semantic REST adapter preserves exact OIDs, title, body, head, and requ
     git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
   });
   const github = createGhCliPublisherAdapter({transport});
+  assert.deepEqual(await github.getFork({repository: 'northset/project',
+    upstream_repository: 'upstream/project'}), {
+    status: 200, headers: {'x-ratelimit-remaining': '4999'}, found: true,
+    repository: 'northset/project', upstream_repository: 'upstream/project',
+  });
   assert.deepEqual(await github.getBranch({repository: 'northset/project', branch: 'northset/m-1001'}), {
     status: 200,
     headers: {'x-ratelimit-remaining': '4999'},
@@ -199,6 +208,25 @@ test('H4 semantic REST adapter preserves exact OIDs, title, body, head, and requ
   assert.equal(readback.repository, 'upstream/project');
   assert.equal(readback.head_branch, 'northset/m-1001');
   assert.equal(readback.head_oid, 'a'.repeat(40));
+});
+
+test('publisher adapter creates only the declared fork and rejects an unrelated repository', async () => {
+  const requests = [];
+  let response = {full_name: 'AysajanE/youtube', fork: true,
+    parent: {full_name: 'code-charity/youtube'}};
+  const transport = fakeTransport({
+    rest: async (request) => { requests.push(request); return structured(response, {status: 202}); },
+    graphql: async () => structured({data: {}}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  const created = await github.createFork({repository: 'AysajanE/youtube',
+    upstream_repository: 'code-charity/youtube'});
+  assert.equal(created.repository, 'AysajanE/youtube');
+  assert.deepEqual(requests[0], {method: 'POST', path: '/repos/code-charity/youtube/forks', body: null});
+  response = {full_name: 'AysajanE/youtube', fork: false};
+  await assert.rejects(() => github.getFork({repository: 'AysajanE/youtube',
+    upstream_repository: 'code-charity/youtube'}), (error) => error.code === 'FORK_REPOSITORY_MISMATCH');
 });
 
 test('H5 push verifies exact local commit and uses a non-force exact refspec', async () => {
@@ -317,24 +345,48 @@ test('H7 deep overlap resolves closed history and rejects an open referenced PR'
   const transport = fakeTransport({
     rest: async () => structured({}),
     graphql: async ({query}) => {
-      assert.match(query, /p0: pullRequest\(number: 12\)/);
+      assert.match(query, /p0: issueOrPullRequest\(number: 7\)/);
+      assert.match(query, /p1: issueOrPullRequest\(number: 12\)/);
       return structured({data: {repository: {
         issue: {timelineItems: {pageInfo: {hasNextPage: false}, nodes: [
           {source: {__typename: 'PullRequest', number: 8, state: 'CLOSED', url: 'closed'}},
         ]}},
-        p0: {number: 12, state: open ? 'OPEN' : 'MERGED', url: 'https://github.com/upstream/project/pull/12'},
+        p0: {__typename: 'Issue'},
+        p1: {__typename: 'PullRequest', number: 12, state: open ? 'OPEN' : 'MERGED',
+          url: 'https://github.com/upstream/project/pull/12'},
       }}});
     },
     git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
   });
   const github = createGhCliPublisherAdapter({transport});
   const live = {repository: {nameWithOwner: 'upstream/project'}, issue: {number: 9,
-    title: 'Follow PR #12', body: ''}};
+    title: 'Follow issue #7 and PR #12', body: ''}};
   assert.deepEqual(await github.deepOverlap(live), {clean: true, reason: null});
   open = true;
   const blocked = await github.deepOverlap(live);
   assert.equal(blocked.clean, false);
   assert.match(blocked.reason, /pull\/12/);
+});
+
+test('H7b deep overlap tolerates only missing textual issue or PR references', async () => {
+  const body = {data: {repository: {
+    issue: {timelineItems: {pageInfo: {hasNextPage: false}, nodes: []}},
+    p0: null,
+  }}, errors: [{
+    type: 'NOT_FOUND',
+    path: ['repository', 'p0'],
+    message: 'Could not resolve to an issue or pull request with the number of 1791.',
+  }]};
+  const transport = fakeTransport({
+    rest: async () => structured({}),
+    graphql: async () => ({...structured(body), code: 1,
+      stderr: 'gh: Could not resolve to an issue or pull request with the number of 1791.\n'}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  const live = {repository: {nameWithOwner: 'upstream/project'}, issue: {number: 9,
+    title: 'Follow up on #1791', body: ''}};
+  assert.deepEqual(await github.deepOverlap(live), {clean: true, reason: null});
 });
 
 test('H8 safety governor wraps semantic actions and recognizes structured CLI throttles', async (t) => {

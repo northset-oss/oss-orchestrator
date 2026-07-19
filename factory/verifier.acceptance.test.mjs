@@ -8,6 +8,7 @@ import test from 'node:test';
 import {
   assertPatchCommitBinding,
   bootstrapDependencies,
+  buildProof,
   dependencyCacheKey,
   verifyContribution,
 } from './verifier.mjs';
@@ -78,6 +79,54 @@ test('V1 regression fix records base red and patched green', async (t) => {
   assert.equal(result.patched_observation.exit_code, 0);
   assert.equal(result.claim_type, 'regression_fix');
   assert.equal(result.tested_tree_oid, fixture.commitTreeOid);
+  assert.deepEqual(result.executed_commands.map((command) => ({
+    phase: command.phase,
+    command: command.command,
+    result: command.result,
+    expected_result: command.expected_result,
+    expectation_met: command.expectation_met,
+  })), [{
+    phase: 'base_observation', command: 'node --test', result: 'FAIL',
+    expected_result: 'failure', expectation_met: true,
+  }, {
+    phase: 'patched_observation', command: 'node --test', result: 'PASS',
+    expected_result: 'success', expectation_met: true,
+  }]);
+  assert.match(result.verification_started_at, /^\d{4}-\d{2}-\d{2}T/);
+  assert.match(result.verification_finished_at, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('V1b proof v2 separates executed evidence from declared checks that were not run', async (t) => {
+  const fixture = await makeGitFixture(t);
+  const verification = await verifyContribution(input(fixture, 'regression_fix'), {
+    runContainer: fakeRunner(),
+    now: () => new Date('2026-07-19T12:00:00.000Z'),
+  });
+  const proof = buildProof({
+    task: {task_id: 'TASK-1', candidate: 'owner/repo#1', repository: 'owner/repo', issue_number: 1},
+    verification,
+    manifest: {
+      base_oid: fixture.baseOid,
+      checks: [
+        'node --test',
+        {command: 'npm test', status: 'BLOCKED'},
+        {kind: 'manual', note: 'browser interaction was not checked'},
+      ],
+      limitations: ['The full npm test suite was not executed.'],
+      receipt_claim: {type: 'regression_fix', statement: 'Focused regression evidence only.'},
+    },
+  });
+  assert.equal(proof.schema_version, 2);
+  assert.equal(proof.executed_commands.length, 2);
+  assert.deepEqual(proof.checks_not_run, [{
+    check: 'npm test',
+    reason: 'not executed by the clean verifier',
+  }, {
+    check: '{"kind":"manual","note":"browser interaction was not checked"}',
+    reason: 'not executed by the clean verifier',
+  }]);
+  assert.deepEqual(proof.limitations, ['The full npm test suite was not executed.']);
+  assert.equal(proof.executed_commands.some((command) => /npm test/.test(command.command)), false);
 });
 
 test('V2 existing check repair records an existing failure and patched success', async (t) => {

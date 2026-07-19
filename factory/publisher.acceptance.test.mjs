@@ -130,6 +130,7 @@ class FakeDb {
 
 class FakeGitHub {
   constructor() {
+    this.forks = new Map();
     this.branches = new Map();
     this.pullRequests = new Map();
     this.events = [];
@@ -140,6 +141,20 @@ class FakeGitHub {
 
   branchKey(repository, branch) {
     return `${repository}:${branch}`;
+  }
+
+  async getFork({repository, upstream_repository: upstreamRepository}) {
+    this.events.push({operation: 'get_fork', repository, upstream_repository: upstreamRepository});
+    const parent = this.forks.get(repository);
+    return parent ? {status: 200, found: true, repository, upstream_repository: parent}
+      : {status: 404, found: false};
+  }
+
+  async createFork({repository, upstream_repository: upstreamRepository}) {
+    this.events.push({operation: 'create_fork', repository, upstream_repository: upstreamRepository});
+    assert.equal(this.forks.has(repository), false, `duplicate fork creation for ${repository}`);
+    this.forks.set(repository, upstreamRepository);
+    return {status: 202, found: true, repository, upstream_repository: upstreamRepository};
   }
 
   async getBranch({repository, branch}) {
@@ -259,6 +274,25 @@ test('publisher resumes after seven of twenty branch pushes without duplicates',
   assert.equal(new Set(github.events.filter((event) => event.operation === 'push_branch')
     .map((event) => `${event.repository}:${event.branch}`)).size, 20);
   assert.equal(github.count('create_pull_request'), 20);
+  assert.equal(github.count('create_fork'), 20);
+});
+
+test('publisher creates a missing fork once, validates it through safety, and adopts it on retry', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  db.failCheckpoint = {state: 'BRANCH_PUSHED', id: 'M-001', used: false};
+  const requests = [];
+  const publicationOptions = options(db, github, {
+    safety: {request: async (request) => { requests.push({kind: request.kind, operation: request.operation});
+      return request.execute(); }},
+  });
+  await assert.rejects(() => publishBoard(db.board.board_digest, publicationOptions),
+    (error) => error instanceof PublisherCheckpointError);
+  const resumed = await publishBoard(db.board.board_digest, publicationOptions);
+  assert.equal(resumed.results[0].state, 'SUBMITTED');
+  assert.equal(github.count('create_fork'), 1);
+  assert.equal(requests.filter((item) => item.operation === 'create_fork').length, 1);
+  assert.equal(requests.find((item) => item.operation === 'create_fork').kind, 'mutation');
 });
 
 test('publisher adopts seven exact existing PRs after a crash without duplicates', async () => {
@@ -380,6 +414,15 @@ test('each item gets another final live check immediately before its branch and 
   assert.equal(github.count('create_pull_request'), 1);
 });
 
+test('canonical Pages availability does not gate an approved upstream PR', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  const result = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(result.results[0].state, 'SUBMITTED');
+  assert.equal(github.count('push_branch'), 1);
+  assert.equal(github.count('create_pull_request'), 1);
+});
+
 test('crash recovery adopts an exact PR that closed before its checkpoint retry', async () => {
   const db = new FakeDb(1);
   const github = new FakeGitHub();
@@ -441,4 +484,29 @@ test('final status publication failure leaves a recoverable submitted state', as
   assert.equal(github.count('create_pull_request'), 1);
   assert.equal(github.closeCount, 0);
   assert.equal(github.deleteCount, 0);
+});
+
+test('rerunning a submitted board adopts the PR without double-counting repository state', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  await publishBoard(db.board.board_digest, options(db, github));
+  const first = await db.getRepositoryState('upstream1/project');
+  const repeated = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(repeated.results[0].state, 'SUBMITTED');
+  assert.equal(github.count('create_pull_request'), 1);
+  assert.deepEqual(await db.getRepositoryState('upstream1/project'), first);
+});
+
+test('a superseded mission cannot be resurrected under its previous approval', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  const stale = await publishBoard(db.board.board_digest, options(db, github, {
+    liveRecheck: async () => ({clean: false, reason: 'issue was claimed'}),
+  }));
+  assert.equal(stale.results[0].state, 'SUPERSEDED');
+  const repeated = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(repeated.results[0].state, 'SUPERSEDED');
+  assert.equal(repeated.results[0].code, 'APPROVAL_TERMINAL');
+  assert.equal(github.count('create_fork'), 0);
+  assert.equal(github.count('create_pull_request'), 0);
 });

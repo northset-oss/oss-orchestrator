@@ -176,6 +176,33 @@ function foundBranch(result) {
   return typeof oid === 'string' && oid ? {...result, oid} : null;
 }
 
+function foundFork(result) {
+  return Boolean(result && result.found !== false && result.exists !== false);
+}
+
+async function ensureFork(plan, {github, safety, sleep, forkPollAttempts, forkPollIntervalMs}) {
+  let fork = await remoteRequest(safety, github, 'read', 'get_fork', 'getFork', {
+    repository: plan.fork_repository,
+    upstream_repository: plan.repository,
+  });
+  if (foundFork(fork)) return fork;
+  await remoteRequest(safety, github, 'mutation', 'create_fork', 'createFork', {
+    repository: plan.fork_repository,
+    upstream_repository: plan.repository,
+  });
+  for (let attempt = 1; attempt <= forkPollAttempts; attempt += 1) {
+    fork = await remoteRequest(safety, github, 'read', 'get_fork', 'getFork', {
+      repository: plan.fork_repository,
+      upstream_repository: plan.repository,
+    });
+    if (foundFork(fork)) return fork;
+    if (attempt < forkPollAttempts) await sleep(forkPollIntervalMs);
+  }
+  const error = new Error(`fork ${plan.fork_repository} was not readable after creation`);
+  error.code = 'FORK_NOT_READY';
+  throw error;
+}
+
 function pullRequests(result) {
   if (Array.isArray(result)) return result;
   return value(result?.pull_requests, result?.pullRequests, result?.prs, []);
@@ -271,7 +298,11 @@ function timestamp(now) {
   return date.toISOString();
 }
 
-async function publishOne(plan, {db, github, safety, now, repositoryState}) {
+async function publishOne(plan, {
+  db, github, safety, now, repositoryState, sleep, forkPollAttempts, forkPollIntervalMs,
+}) {
+  const priorPublication = await db.getPublication(plan.mission_id);
+  await ensureFork(plan, {github, safety, sleep, forkPollAttempts, forkPollIntervalMs});
   const branchResult = await remoteRequest(safety, github, 'read', 'get_branch', 'getBranch', {
     repository: plan.fork_repository,
     upstream_repository: plan.repository,
@@ -358,6 +389,8 @@ async function publishOne(plan, {db, github, safety, now, repositoryState}) {
   const stored = prFields(readback);
   const closed = String(stored.state ?? '').toUpperCase() === 'CLOSED';
   const observedAt = timestamp(now);
+  const alreadyCounted = priorPublication?.publication_state === 'SUBMITTED' &&
+    Number(priorPublication.pr_number) === stored.number && priorPublication.pr_url === stored.url;
   await checkpoint(db, plan.mission_id, {
     pr_number: stored.number,
     pr_url: stored.url,
@@ -374,7 +407,7 @@ async function publishOne(plan, {db, github, safety, now, repositoryState}) {
     last_error_detail: null,
   }, `${plan.mission_id} submission`);
   await db.updateTaskState(plan.task_id, 'PR_OPENED');
-  if (!closed && typeof db.setRepositoryState === 'function') {
+  if (!closed && !alreadyCounted && typeof db.setRepositoryState === 'function') {
     const latest = await db.getRepositoryState(plan.repository) ?? {};
     await db.setRepositoryState(plan.repository, {
       open_northset_prs: Number(latest.open_northset_prs ?? 0) + 1,
@@ -395,12 +428,22 @@ export async function publishBoard(boardDigest, {
   refreshStale = null,
   artifactVerifier = verifyReadyArtifacts,
   now = () => new Date(),
+  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  forkPollAttempts = 15,
+  forkPollIntervalMs = 1_000,
 } = {}) {
   if (!db) throw new TypeError('db is required');
   if (!github) throw new TypeError('github is required');
   if (!safety || typeof safety.request !== 'function') throw new TypeError('GitHub safety queue is required');
   if (typeof liveRecheck !== 'function') throw new TypeError('liveRecheck is required');
   if (typeof receiptPublisher !== 'function') throw new TypeError('receiptPublisher is required');
+  if (typeof sleep !== 'function') throw new TypeError('sleep is required');
+  if (!Number.isInteger(forkPollAttempts) || forkPollAttempts < 1) {
+    throw new TypeError('forkPollAttempts must be a positive integer');
+  }
+  if (!Number.isFinite(forkPollIntervalMs) || forkPollIntervalMs < 0) {
+    throw new TypeError('forkPollIntervalMs must be a non-negative number');
+  }
   const board = await db.getBoard(boardDigest);
   if (!board) throw new Error(`unknown board ${boardDigest}`);
   const actualDigest = value(board.board_digest, board.digest);
@@ -420,6 +463,12 @@ export async function publishBoard(boardDigest, {
     const ready = await db.getReadyItem(id);
     if (!immutable || !ready) {
       results.push({mission_id: id, state: 'FAILED', code: 'APPROVED_ITEM_MISSING'});
+      continue;
+    }
+    const priorPublication = await db.getPublication(id);
+    if (priorPublication?.publication_state === 'SUPERSEDED') {
+      results.push({mission_id: id, state: 'SUPERSEDED', code: 'APPROVAL_TERMINAL',
+        detail: 'a superseded mission cannot be published under its previous approval'});
       continue;
     }
     if (value(ready.approval_state, 'APPROVED') !== 'APPROVED') {
@@ -567,6 +616,9 @@ export async function publishBoard(boardDigest, {
       results.push(await publishOne(plan, {
         db, github, safety, now,
         repositoryState,
+        sleep,
+        forkPollAttempts,
+        forkPollIntervalMs,
       }));
     } catch (error) {
       if (isPaused(error)) throw error;

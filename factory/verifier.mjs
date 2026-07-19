@@ -13,9 +13,35 @@ export const CLAIM_TYPES = Object.freeze([
 ]);
 export const OSS_COMMIT_IDENTITY = Object.freeze({name: 'Aysajan Eziz', email: 'aeziz@northset.ai'});
 
-function commandResult(result) {
+function isoTime(value, label) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) throw new Error(`${label} must be a valid timestamp`);
+  return date.toISOString();
+}
+
+function commandValue(command) {
+  return Array.isArray(command) ? command.map(String) : String(command ?? '');
+}
+
+function commandResult(result, {
+  phase,
+  command,
+  expectedResult,
+  startedAt,
+  finishedAt,
+}) {
+  const exitCode = Number(result.code ?? result.exit_code);
   return {
-    exit_code: Number(result.code ?? result.exit_code),
+    phase,
+    command: commandValue(command),
+    network: 'none',
+    expected_result: expectedResult,
+    result: exitCode === 0 ? 'PASS' : 'FAIL',
+    expectation_met: expectedResult === 'success' ? exitCode === 0 : exitCode !== 0,
+    started_at: startedAt,
+    finished_at: finishedAt,
+    duration_ms: Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)),
+    exit_code: exitCode,
     stdout_sha256: sha256(Buffer.from(String(result.stdout ?? ''))),
     stderr_sha256: sha256(Buffer.from(String(result.stderr ?? ''))),
     output_sha256: sha256(Buffer.from(`${result.stdout ?? ''}\0${result.stderr ?? ''}`, 'utf8')),
@@ -240,14 +266,19 @@ export async function verifyContribution(input, {
   if (mounts.some((mount) => mount.readOnly !== true)) throw new Error('verification dependency material must be read-only');
   const before = await inspectTree(input.patchedCheckout);
   if (before.status) throw new Error('patched verifier checkout is not clean before verification');
+  const verificationStartedAt = isoTime(now(), 'verification start');
+  const baseStartedAt = isoTime(now(), 'base observation start');
+  const baseCommand = input.baseCommand ?? input.testCommand;
   const baseResult = await runContainer({
     phase: 'base_observation',
     checkout: input.baseCheckout,
-    command: input.baseCommand ?? input.testCommand,
+    command: baseCommand,
     network: false,
     mounts,
     claimType: input.claimType,
   });
+  const baseFinishedAt = isoTime(now(), 'base observation finish');
+  const patchedStartedAt = isoTime(now(), 'patched observation start');
   const patchedResult = await runContainer({
     phase: 'patched_observation',
     checkout: input.patchedCheckout,
@@ -256,8 +287,21 @@ export async function verifyContribution(input, {
     mounts,
     claimType: input.claimType,
   });
-  const baseObservation = commandResult(baseResult);
-  const patchedObservation = commandResult(patchedResult);
+  const patchedFinishedAt = isoTime(now(), 'patched observation finish');
+  const baseObservation = commandResult(baseResult, {
+    phase: 'base_observation',
+    command: baseCommand,
+    expectedResult: input.claimType === 'coverage_addition' ? 'success' : 'failure',
+    startedAt: baseStartedAt,
+    finishedAt: baseFinishedAt,
+  });
+  const patchedObservation = commandResult(patchedResult, {
+    phase: 'patched_observation',
+    command: input.testCommand,
+    expectedResult: 'success',
+    startedAt: patchedStartedAt,
+    finishedAt: patchedFinishedAt,
+  });
   assertClaimObservations(input.claimType, baseObservation, patchedObservation);
   if (input.claimType === 'regression_fix') {
     if (typeof input.baseFailureContains !== 'string' || !input.baseFailureContains.trim()) {
@@ -284,10 +328,14 @@ export async function verifyContribution(input, {
   await verifyDco(input.patchedCheckout, input.commitOid, input.dcoIdentity ?? OSS_COMMIT_IDENTITY);
   const changes = await inspectChanges(input.patchedCheckout, input.baseOid, input.commitOid);
   const patchBytes = await readFile(input.patchFile);
+  const verificationFinishedAt = isoTime(now(), 'verification finish');
   return {
     ok: true,
     claim_type: input.claimType,
-    verified_at: now().toISOString(),
+    verification_started_at: verificationStartedAt,
+    verification_finished_at: verificationFinishedAt,
+    verified_at: verificationFinishedAt,
+    executed_commands: [baseObservation, patchedObservation],
     base_observation: baseObservation,
     patched_observation: patchedObservation,
     patch_sha256: sha256(patchBytes),
@@ -301,10 +349,55 @@ export async function verifyContribution(input, {
   };
 }
 
+function checkCommand(check) {
+  if (typeof check === 'string') return check.trim();
+  if (check && typeof check === 'object' && !Array.isArray(check)) {
+    return typeof check.command === 'string' ? check.command.trim() : '';
+  }
+  return '';
+}
+
+function readableCheck(check) {
+  const command = checkCommand(check);
+  if (command) return command;
+  if (typeof check === 'string') throw new Error('declared check must be nonblank');
+  const rendered = canonical(check);
+  if (typeof rendered !== 'string' || !rendered.trim()) {
+    throw new Error('declared check must be representable as nonblank canonical JSON');
+  }
+  return rendered;
+}
+
+function proofChecksNotRun(manifest, verification) {
+  const executed = new Set((verification.executed_commands ?? []).map((entry) =>
+    canonical(commandValue(entry.command))));
+  const explicit = Array.isArray(manifest.checks_not_run) ? manifest.checks_not_run : [];
+  const inferred = (Array.isArray(manifest.checks) ? manifest.checks : [])
+    .filter((check) => {
+      const command = checkCommand(check);
+      return !command || !executed.has(canonical(commandValue(command)));
+    })
+    .map((check) => ({check: readableCheck(check), reason: 'not executed by the clean verifier'}));
+  const seen = new Set();
+  return [...explicit, ...inferred].filter((entry) => {
+    const key = canonical(entry);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 export function buildProof({task, verification, approvalDigest = null, manifest}) {
   if (!verification?.ok) throw new Error('proof requires successful verification');
+  if (!Array.isArray(verification.executed_commands) || verification.executed_commands.length !== 2) {
+    throw new Error('proof requires structured base and patched command evidence');
+  }
+  const limitations = [
+    ...(Array.isArray(verification.limitations) ? verification.limitations : []),
+    ...(Array.isArray(manifest.limitations) ? manifest.limitations : []),
+  ];
   const proof = {
-    schema_version: 1,
+    schema_version: 2,
     task_id: task.task_id,
     candidate: task.candidate,
     repository: task.repository,
@@ -314,6 +407,11 @@ export function buildProof({task, verification, approvalDigest = null, manifest}
     tested_tree_oid: verification.tested_tree_oid,
     commit_oid: verification.commit_oid,
     checks: manifest.checks,
+    executed_commands: verification.executed_commands,
+    checks_not_run: proofChecksNotRun(manifest, verification),
+    limitations,
+    verification_started_at: verification.verification_started_at,
+    verification_finished_at: verification.verification_finished_at,
     environment: verification.environment,
     base_observation: verification.base_observation,
     patched_observation: verification.patched_observation,

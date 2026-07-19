@@ -5,6 +5,7 @@ import {createHash} from 'node:crypto';
 import {
   mkdir,
   mkdtemp,
+  lstat,
   readFile,
   rm,
   stat,
@@ -33,7 +34,7 @@ const VERIFY_TIMEOUT_MS = 10 * 60_000;
 export const SCOUT_SCHEMA = Object.freeze({
   type: 'object',
   additionalProperties: false,
-  required: ['decision', 'reason', 'test_command', 'target_files', 'estimated_risk'],
+  required: ['decision', 'reason', 'test_command', 'install_command', 'target_files', 'estimated_risk'],
   properties: {
     decision: {type: 'string', enum: ['GO', 'SKIP']},
     reason: {type: 'string'},
@@ -157,6 +158,50 @@ async function isFile(file) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
+async function unsupportedNodeLayout(checkout) {
+  let packageJson;
+  try { packageJson = JSON.parse(await readFile(path.join(checkout, 'package.json'), 'utf8')); }
+  catch (error) { throw new Error(`cannot parse package.json: ${error.message}`); }
+  const workspaces = packageJson.workspaces;
+  if ((Array.isArray(workspaces) && workspaces.length) ||
+      (workspaces && typeof workspaces === 'object' && Object.keys(workspaces).length)) {
+    return 'multi-package workspaces are outside the single-package Node lane';
+  }
+  if (await isFile(path.join(checkout, 'pnpm-workspace.yaml')) ||
+      await isFile(path.join(checkout, 'pnpm-workspace.yml')) ||
+      await isFile(path.join(checkout, 'lerna.json'))) {
+    return 'multi-package workspaces are outside the single-package Node lane';
+  }
+  if (await isFile(path.join(checkout, '.pnp.cjs')) || await isFile(path.join(checkout, '.pnp.js'))) {
+    return 'Yarn Plug and Play is outside the node_modules dependency lane';
+  }
+  if (/^yarn@(?:[2-9]|[1-9][0-9]+)(?:\.|$)/i.test(String(packageJson.packageManager ?? '')) ||
+      await isFile(path.join(checkout, '.yarnrc.yml'))) {
+    return 'Yarn Berry and Plug and Play are outside the node_modules dependency lane';
+  }
+  if (await isFile(path.join(checkout, 'yarn.lock'))) {
+    const yarnLock = await readFile(path.join(checkout, 'yarn.lock'), 'utf8');
+    if (/^__metadata:\s*$/m.test(yarnLock)) {
+      return 'Yarn Berry and Plug and Play are outside the node_modules dependency lane';
+    }
+  }
+  return null;
+}
+
+async function ensureDependencyMountpoint(checkout) {
+  const target = path.join(checkout, 'node_modules');
+  try {
+    const info = await lstat(target);
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error('node_modules mountpoint must be a real directory');
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    await mkdir(target, {mode: 0o700});
+  }
+  return target;
+}
+
 async function resolveNodeCommands(checkout, scout = {}) {
   if (!await isFile(path.join(checkout, 'package.json'))) {
     throw new Error('Node worker requires a root package.json');
@@ -164,6 +209,8 @@ async function resolveNodeCommands(checkout, scout = {}) {
   let packageJson;
   try { packageJson = JSON.parse(await readFile(path.join(checkout, 'package.json'), 'utf8')); }
   catch (error) { throw new Error(`cannot parse package.json: ${error.message}`); }
+  const unsupportedLayout = await unsupportedNodeLayout(checkout);
+  if (unsupportedLayout) throw new Error(unsupportedLayout);
   let installCommand = String(scout.install_command ?? '').trim();
   if (!installCommand) {
     if (await isFile(path.join(checkout, 'pnpm-lock.yaml'))) installCommand = 'corepack pnpm install --frozen-lockfile';
@@ -180,40 +227,54 @@ async function resolveNodeCommands(checkout, scout = {}) {
   return {installCommand, testCommand};
 }
 
-async function prepareCodexHome(root, sourceHome = process.env.CODEX_HOME ??
+export async function prepareCodexHome(root, sourceHome = process.env.CODEX_HOME ??
   path.join(process.env.HOME ?? '', '.codex')) {
   const codexHome = path.join(root, 'codex-home');
   await mkdir(codexHome, {recursive: true, mode: 0o700});
+  const sourceAuth = JSON.parse(await readFile(path.join(sourceHome, 'auth.json'), 'utf8'));
+  const {id_token: idToken, access_token: accessToken, account_id: accountId} = sourceAuth?.tokens ?? {};
+  if (sourceAuth?.auth_mode !== 'chatgpt' ||
+      ![idToken, accessToken, accountId].every((value) => typeof value === 'string' && value)) {
+    throw new Error('Codex ChatGPT auth is unavailable; refresh the host Codex login');
+  }
+  const deniedPaths = [...new Set([codexHome, path.resolve(sourceHome)])];
+  const filesystemProfile = (workspaceAccess) => [
+    '":minimal" = "read"',
+    '":tmpdir" = "write"',
+    ...deniedPaths.map((deniedPath) => `${JSON.stringify(deniedPath)} = "deny"`),
+    '',
+    `\":workspace_roots\" = { \".\" = \"${workspaceAccess}\" }`,
+  ];
   await writeFile(path.join(codexHome, 'config.toml'), [
     'approval_policy = "never"',
-    'sandbox_mode = "workspace-write"',
+    'default_permissions = "factory_readonly"',
     '[history]',
     'persistence = "none"',
     '[shell_environment_policy]',
     'inherit = "core"',
     'exclude = ["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"]',
-    '[sandbox_workspace_write]',
-    'network_access = false',
+    '[permissions.factory_readonly.filesystem]',
+    ...filesystemProfile('read'),
+    '[permissions.factory_workspace.filesystem]',
+    ...filesystemProfile('write'),
     '[features]',
     'apps = false',
     'memories = false',
     'multi_agent = false',
     '',
   ].join('\n'), {mode: 0o600});
+  await writeFile(path.join(codexHome, 'auth.json'), JSON.stringify({
+    auth_mode: 'chatgpt',
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: idToken,
+      access_token: accessToken,
+      refresh_token: '',
+      account_id: accountId,
+    },
+    last_refresh: sourceAuth.last_refresh ?? null,
+  }), {mode: 0o600});
   return codexHome;
-}
-
-async function loadCodexAccessToken(sourceHome = process.env.CODEX_HOME ??
-  path.join(process.env.HOME ?? '', '.codex')) {
-  if (typeof process.env.CODEX_ACCESS_TOKEN === 'string' && process.env.CODEX_ACCESS_TOKEN) {
-    return process.env.CODEX_ACCESS_TOKEN;
-  }
-  const auth = JSON.parse(await readFile(path.join(sourceHome, 'auth.json'), 'utf8'));
-  const token = auth?.tokens?.access_token ?? auth?.access_token;
-  if (typeof token !== 'string' || !token) {
-    throw new Error('Codex access token is unavailable; refresh the host Codex login');
-  }
-  return token;
 }
 
 export function codexHostArgs({
@@ -228,16 +289,15 @@ export function codexHostArgs({
     throw new TypeError('host Codex paths must be absolute');
   }
   return [
-    'exec', '--json', '--ephemeral', '--sandbox', readOnly ? 'read-only' : 'workspace-write',
-    '--ignore-user-config', '--ignore-rules', '--skip-git-repo-check', '--output-schema', schemaFile,
+    'exec', '--json', '--ephemeral', '--ignore-rules', '--skip-git-repo-check', '--output-schema', schemaFile,
     '--output-last-message', outputFile,
     '--color', 'never', '--model', model,
     '-c', 'approval_policy="never"',
+    '-c', `default_permissions="${readOnly ? 'factory_readonly' : 'factory_workspace'}"`,
     '-c', `model_reasoning_effort="${effort}"`,
     '-c', 'service_tier="fast"',
     '-c', 'shell_environment_policy.inherit="core"',
     '-c', 'shell_environment_policy.exclude=["CODEX_ACCESS_TOKEN","CODEX_API_KEY","OPENAI_API_KEY","GH_TOKEN","GITHUB_TOKEN"]',
-    '-c', 'sandbox_workspace_write.network_access=false',
     '-c', 'features.apps=false',
     '-c', 'features.memories=false',
     '-c', 'features.multi_agent=false',
@@ -245,7 +305,7 @@ export function codexHostArgs({
   ];
 }
 
-export function codexProcessEnvironment({codexHome, accessToken}) {
+export function codexProcessEnvironment({codexHome}) {
   const allowed = [
     'PATH', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'TERM',
     'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
@@ -255,7 +315,6 @@ export function codexProcessEnvironment({codexHome, accessToken}) {
       .map((name) => [name, process.env[name]])),
     HOME: codexHome,
     CODEX_HOME: codexHome,
-    CODEX_ACCESS_TOKEN: accessToken,
     CI: 'true',
   };
 }
@@ -276,7 +335,6 @@ async function defaultCodexRunner({
   const root = await mkdtemp(path.join(os.tmpdir(), 'northset-factory-codex-'));
   try {
     const codexHome = await prepareCodexHome(root, codexHomeSource);
-    const accessToken = await loadCodexAccessToken(codexHomeSource);
     const outputRoot = path.join(root, 'output');
     await mkdir(outputRoot, {mode: 0o700});
     const schemaFile = path.join(outputRoot, 'schema.json');
@@ -286,7 +344,7 @@ async function defaultCodexRunner({
     await mustRun(run, process.env.CODEX_BIN ?? 'codex', args, {
       input: prompt,
       cwd: checkout,
-      env: codexProcessEnvironment({codexHome, accessToken}),
+      env: codexProcessEnvironment({codexHome}),
       timeoutMs,
       maxOutputBytes: OUTPUT_LIMIT,
     }, 'host Codex sandbox');
@@ -314,7 +372,8 @@ function scoutPrompt(task) {
 
 Inspect this checkout read-only. Decide whether this is a small, testable Node contribution suitable
 for the standard lane. Select one exact focused test command and likely target files. Do not change
-files. SKIP if the issue is unclear, too broad, needs secrets/services, or is Red risk. Return only
+files. Return an empty install_command to use the lockfile-based default. SKIP if the issue is unclear,
+too broad, needs secrets/services, or is Red risk. Return only
 the requested structured result. Do not call GitHub or any network service other than the model API.`;
 }
 
@@ -405,12 +464,17 @@ export function bootstrapDockerArgs({checkout, volume, image, installCommand}) {
   return [
     'run', '--rm', '--cap-drop=ALL', '--security-opt=no-new-privileges',
     '--pids-limit=512', '--memory=8g', '--cpus=4',
-    '--mount', `type=bind,src=${checkout},dst=/workspace,readonly`,
-    '--mount', `type=bind,src=${path.join(checkout, '.git')},dst=/workspace/.git,readonly`,
+    '--mount', `type=bind,src=${checkout},dst=/source,readonly`,
     '--mount', `type=volume,src=${volume},dst=/workspace/node_modules`,
     '--workdir', '/workspace', '--env', 'HOME=/tmp', '--env', 'CI=true',
-    '--env', 'npm_config_cache=/tmp/npm', '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=2g',
-    image, 'sh', '-lc', `${installCommand} && touch /workspace/node_modules/.northset-ready`,
+    '--env', 'npm_config_cache=/tmp/npm',
+    '--tmpfs', '/workspace:rw,exec,nosuid,nodev,size=2g',
+    '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=2g',
+    image, 'sh', '-lc', [
+      "tar -C /source --exclude='./.git' --exclude='./node_modules' --exclude='*/node_modules' -cf - . | tar -C /workspace -xf -",
+      installCommand,
+      'touch /workspace/node_modules/.northset-ready',
+    ].join(' && '),
   ];
 }
 
@@ -538,6 +602,17 @@ export function createNodeWorker({
   codexHomeSource,
 } = {}) {
   async function scout(payload) {
+    const unsupportedLayout = await unsupportedNodeLayout(payload.checkout);
+    if (unsupportedLayout) {
+      return {
+        decision: 'SKIP',
+        reason: unsupportedLayout,
+        test_command: '',
+        install_command: '',
+        target_files: [],
+        estimated_risk: 'GREEN',
+      };
+    }
     const result = await codexRunner({
       checkout: payload.checkout,
       schema: SCOUT_SCHEMA,
@@ -673,6 +748,10 @@ export function createNodeWorker({
       }
       const volume = dependency.mounts[0]?.source;
       if (!volume) throw new Error('verifier requires dependency material');
+      await Promise.all([
+        ensureDependencyMountpoint(base.target),
+        ensureDependencyMountpoint(payload.checkout),
+      ]);
       const runContainer = async (plan) => run('docker', runtimeDockerArgs({
         checkout: plan.checkout,
         volume,

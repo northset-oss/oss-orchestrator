@@ -493,6 +493,41 @@ export function createGhCliPublisherAdapter({
   }
   if (typeof northsetLogin !== 'string' || !northsetLogin) throw new TypeError('northsetLogin is required');
 
+  const forkRepository = (result, repository, upstreamRepository, operation) => {
+    const body = bodyObject(result, operation);
+    const actual = requiredString(body.full_name, `${operation} full_name`);
+    const parent = body.parent?.full_name ?? body.source?.full_name ?? null;
+    if (actual.toLowerCase() !== validRepository(repository).toLowerCase() || body.fork !== true ||
+        typeof parent !== 'string' || parent.toLowerCase() !== validRepository(upstreamRepository).toLowerCase()) {
+      throw new GhCliError(
+        `${operation} returned ${actual} with parent ${String(parent)}, expected fork ${repository} of ${upstreamRepository}`,
+        'FORK_REPOSITORY_MISMATCH', result,
+      );
+    }
+    return {status: result.httpStatus, headers: result.headers, found: true,
+      repository: actual, upstream_repository: parent};
+  };
+
+  const getFork = async ({repository, upstream_repository: upstreamRepository}) => {
+    validRepository(repository);
+    validRepository(upstreamRepository);
+    const result = await transport.rest({method: 'GET', path: `/repos/${validRepository(repository)}`});
+    if (result.httpStatus === 404) return {status: 404, headers: result.headers, found: false};
+    return forkRepository(result, repository, upstreamRepository, 'get fork');
+  };
+
+  const createFork = async ({repository, upstream_repository: upstreamRepository}) => {
+    const fork = repositoryParts(repository);
+    const upstream = repositoryParts(upstreamRepository);
+    if (fork.name.toLowerCase() !== upstream.name.toLowerCase()) {
+      throw new TypeError(`fork repository name ${fork.name} must match upstream name ${upstream.name}`);
+    }
+    const body = fork.owner.toLowerCase() === northsetLogin.toLowerCase()
+      ? null : {organization: fork.owner};
+    const result = await transport.rest({method: 'POST', path: apiPath(upstreamRepository, 'forks'), body});
+    return forkRepository(result, repository, upstreamRepository, 'create fork');
+  };
+
   const getBranch = async ({repository, branch}) => {
     requiredString(branch, 'branch');
     const result = await transport.rest({method: 'GET',
@@ -698,7 +733,10 @@ export function createGhCliPublisherAdapter({
     const mentioned = [...knownText.matchAll(/(?:^|[^A-Za-z0-9])#([1-9][0-9]*)\b/g)]
       .map((match) => Number(match[1])).filter((value, index, values) => values.indexOf(value) === index).slice(0, 10);
     const mentionedFields = mentioned.map((pr, index) =>
-      `p${index}: pullRequest(number: ${pr}) { number state isDraft url }`).join('\n');
+      `p${index}: issueOrPullRequest(number: ${pr}) {
+        __typename
+        ... on PullRequest { number state isDraft url }
+      }`).join('\n');
     const query = `query FactoryDeepOverlap($owner: String!, $name: String!, $issue: Int!) {
       repository(owner: $owner, name: $name) {
         issue(number: $issue) {
@@ -714,14 +752,26 @@ export function createGhCliPublisherAdapter({
         ${mentionedFields}
       }
     }`;
-    const result = await graphql(query, {owner, name, issue: number});
+    let result;
+    try {
+      result = await graphql(query, {owner, name, issue: number});
+    } catch (error) {
+      const partial = error?.body;
+      const errors = partial?.errors;
+      const onlyMissingMentionedNumbers = partial?.data && Array.isArray(errors) && errors.length > 0 &&
+        errors.every((item) => item?.type === 'NOT_FOUND' && Array.isArray(item.path) &&
+          item.path.length === 2 && item.path[0] === 'repository' && /^p[0-9]+$/.test(item.path[1]));
+      if (!onlyMissingMentionedNumbers) throw error;
+      result = partial;
+    }
     const repo = result.data?.repository;
     const timeline = repo?.issue?.timelineItems;
     if (!repo?.issue) return {clean: false, reason: 'issue is missing or inaccessible'};
     if (timeline?.pageInfo?.hasNextPage) return {clean: false, reason: 'cross-reference history remains truncated'};
     const linked = (timeline?.nodes ?? []).map((item) => item?.source)
       .filter((item) => item?.__typename === 'PullRequest' && item.state === 'OPEN');
-    const referenced = mentioned.map((_, index) => repo[`p${index}`]).filter((item) => item?.state === 'OPEN');
+    const referenced = mentioned.map((_, index) => repo[`p${index}`])
+      .filter((item) => item?.__typename === 'PullRequest' && item.state === 'OPEN');
     const overlaps = [...linked, ...referenced].filter((item, index, values) =>
       values.findIndex((other) => other.number === item.number) === index);
     return overlaps.length ? {clean: false,
@@ -729,6 +779,6 @@ export function createGhCliPublisherAdapter({
       : {clean: true, reason: null};
   };
 
-  return {getBranch, pushBranch, findPullRequests, createPullRequest, getPullRequest,
+  return {getFork, createFork, getBranch, pushBranch, findPullRequests, createPullRequest, getPullRequest,
     getCommitStatus, getArtifactAttestation, graphql, finalLiveRecheck, deepOverlap};
 }

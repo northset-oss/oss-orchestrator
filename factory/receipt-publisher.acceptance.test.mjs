@@ -21,6 +21,18 @@ function sha(character) {
 }
 
 function item(id, character, overrides = {}) {
+  const timestamp = '2026-07-19T12:00:00.000Z';
+  const executedCommands = [{
+    phase: 'base_observation', command: 'node --test', network: 'none',
+    expected_result: 'failure', result: 'FAIL', expectation_met: true,
+    started_at: timestamp, finished_at: timestamp, duration_ms: 0, exit_code: 1,
+    output_sha256: sha('1'), stdout_sha256: sha('2'), stderr_sha256: sha('3'),
+  }, {
+    phase: 'patched_observation', command: 'node --test', network: 'none',
+    expected_result: 'success', result: 'PASS', expectation_met: true,
+    started_at: timestamp, finished_at: timestamp, duration_ms: 0, exit_code: 0,
+    output_sha256: sha('4'), stdout_sha256: sha('5'), stderr_sha256: sha('6'),
+  }];
   const manifest = {
     mission_id: id,
     task_id: `TASK-${id}`,
@@ -33,16 +45,24 @@ function item(id, character, overrides = {}) {
     checks: ['node --test', {command: 'npm test', exit_code: 0}],
     receipt_claim: {type: 'regression_fix', statement: `Verified ${id}`},
     proof: {
-      schema_version: 1,
+      schema_version: 2,
       task_id: `TASK-${id}`,
       repository: 'upstream/project',
       issue_number: 17,
+      candidate: 'upstream/project#17',
       base_oid: oid('a'),
       patch_sha256: sha(character),
       commit_oid: oid(character),
       tested_tree_oid: oid('d'),
       checks: ['node --test', {command: 'npm test', exit_code: 0}],
+      executed_commands: executedCommands,
+      checks_not_run: [{check: 'npm test', reason: 'not executed by the clean verifier'}],
+      limitations: ['Only the focused regression command was executed.'],
+      verification_started_at: timestamp,
+      verification_finished_at: timestamp,
       environment: {image: 'sha256:fixture'},
+      base_observation: executedCommands[0],
+      patched_observation: executedCommands[1],
       claim: {type: 'regression_fix', statement: `Verified ${id}`},
       batch_approval_digest: null,
       proof_sha256: sha('f'),
@@ -105,10 +125,11 @@ async function remoteBytes(bare, relativePath) {
   return Buffer.from(result.stdout, 'utf8');
 }
 
-test('receiptUrlFor uses the immutable contribution-commit path', () => {
+test('receiptUrlFor uses the canonical public ledger path while validating contribution identity', () => {
   assert.equal(receiptUrlFor('M-1000', oid('a')),
-    `https://github.com/northset-oss/verification-pilot/blob/receipts/receipts/M-1000/${oid('a')}/proof.json`);
+    'https://northset-oss.github.io/verification-pilot/receipts/M-1000/');
   assert.throws(() => receiptUrlFor('../M-1000', oid('a')), /invalid mission_id/);
+  assert.throws(() => receiptUrlFor('M-1000', 'bad'), /commit_oid/);
 });
 
 test('one non-force batch push publishes deterministic exact proof bytes from an isolated clone', async (t) => {
@@ -144,9 +165,21 @@ test('one non-force batch push publishes deterministic exact proof bytes from an
     assert.equal(proof.commit_oid, entry.manifest.commit_oid);
     assert.equal(proof.tested_tree_oid, entry.manifest.tested_tree_oid);
     assert.deepEqual(proof.checks, entry.manifest.checks);
+    assert.equal(proof.schema_version, 2);
+    assert.deepEqual(proof.executed_commands, entry.manifest.proof.executed_commands);
+    assert.deepEqual(proof.checks_not_run, entry.manifest.proof.checks_not_run);
+    assert.deepEqual(proof.limitations, entry.manifest.proof.limitations);
+    assert.equal(proof.environment.image, 'sha256:fixture');
     assert.deepEqual(proof.claim, entry.manifest.receipt_claim);
     assert.equal(proof.batch_approval_digest, entry.approval_digest);
     assert.equal(proof.proof_sha256, undefined);
+    const pointer = JSON.parse(await remoteBytes(bare, `receipts/${id}/current.json`));
+    assert.deepEqual(pointer, {
+      contribution_commit_oid: entry.commit_oid,
+      mission_id: id,
+      proof_sha256: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
+      schema_version: 1,
+    });
     assert.equal(result[id].mission_id, id);
     assert.equal(result[id].receipt_url, receiptUrlFor(id, entry.commit_oid));
     assert.equal(result[id].proof_sha256,
@@ -173,6 +206,39 @@ test('a retry adopts identical remotely committed proof files without another pu
   assert.deepEqual(adopted, first);
   assert.equal(calls.filter((call) => call.args.includes('push')).length, 2);
   assert.equal(await git(['--git-dir', bare, 'rev-list', '--count', 'receipts']), '2');
+});
+
+test('mixed existing and new proofs are rejected instead of receiving false batch provenance', async (t) => {
+  const {root, bare} = await bareRepository(t);
+  const calls = [];
+  const publisher = createReceiptPublisher({
+    remoteUrl: bare, run: recordingRunner(calls), tempRoot: root,
+    now: () => new Date('2026-07-19T12:00:00.000Z'),
+  });
+  const existing = item('M-1000', 'b');
+  await publisher([existing]);
+  await assert.rejects(() => publisher([existing, item('M-1001', 'c')]),
+    (error) => error.code === 'RECEIPT_PARTIAL_BATCH');
+  assert.equal(calls.filter((call) => call.args.includes('push')).length, 1);
+  assert.equal(await git(['--git-dir', bare, 'rev-list', '--count', 'receipts']), '1');
+});
+
+test('proof v2 publication rejects malformed structured evidence before Git transport', async () => {
+  const calls = [];
+  const publisher = createReceiptPublisher({
+    remoteUrl: '/unused/receipt.git',
+    run: async (...args) => { calls.push(args); assert.fail('malformed proof must not reach Git'); },
+  });
+  const malformedCheck = item('M-1000', 'b');
+  malformedCheck.manifest.proof.checks_not_run = [{check: {command: 'npm test'}, reason: 'blocked'}];
+  await assert.rejects(() => publisher([malformedCheck]), /checks_not_run.*nonblank check and reason strings/);
+
+  const falsePass = item('M-1001', 'c');
+  falsePass.manifest.proof.executed_commands[1] = {
+    ...falsePass.manifest.proof.executed_commands[1], exit_code: 1, result: 'PASS',
+  };
+  await assert.rejects(() => publisher([falsePass]), /result does not match its exit code and expectation/);
+  assert.equal(calls.length, 0);
 });
 
 test('an existing proof with different approved bytes is rejected and never overwritten', async (t) => {
@@ -314,4 +380,29 @@ test('receipt status refuses to publish without its immutable proof', async (t) 
     attestation_url: null, observed_at: '2026-07-19T12:04:00.000Z',
   }]), (error) => error.code === 'RECEIPT_STATUS_WITHOUT_PROOF');
   assert.equal(calls.filter((call) => call.args.includes('push')).length, 0);
+});
+
+test('malformed v2 evidence and contradictory publication state fail before Git', async () => {
+  const malformed = item('M-1000', 'b');
+  malformed.manifest.proof.executed_commands[0].started_at = 'not-a-time';
+  const proofCalls = [];
+  const proofPublisher = createReceiptPublisher({
+    run: recordingRunner(proofCalls),
+  });
+  await assert.rejects(() => proofPublisher([malformed]), /must be an ISO-8601 time/);
+  assert.equal(proofCalls.length, 0);
+
+  const statusCalls = [];
+  const statusPublisher = createReceiptStatusPublisher({
+    run: recordingRunner(statusCalls),
+  });
+  await assert.rejects(() => statusPublisher([{
+    mission_id: 'M-1000', commit_oid: oid('b'), pr_number: 100,
+    receipt_url: receiptUrlFor('M-1000', oid('b')),
+    pr_url: 'https://github.com/upstream/project/pull/100', pr_state: 'MERGED',
+    merged: false, ci_state: 'SUCCESS', attestation_state: 'RECEIPT_ATTESTED',
+    attestation_url: 'https://github.com/northset-oss/verification-pilot/attestations/1',
+    observed_at: '2026-07-19T12:04:00.000Z',
+  }]), /merged state is inconsistent/);
+  assert.equal(statusCalls.length, 0);
 });

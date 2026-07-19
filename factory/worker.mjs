@@ -7,6 +7,26 @@ import {sha256} from './db.mjs';
 import {receiptUrlFor} from './receipt-publisher.mjs';
 import {buildProof} from './verifier.mjs';
 
+const REMOVE_TREE_OPTIONS = Object.freeze({
+  recursive: true,
+  force: true,
+  maxRetries: 5,
+  retryDelay: 100,
+});
+
+export async function removeWorkTree(root, {
+  remove = rm,
+  tolerateBusy = false,
+} = {}) {
+  try {
+    await remove(root, REMOVE_TREE_OPTIONS);
+    return true;
+  } catch (error) {
+    if (tolerateBusy && ['ENOTEMPTY', 'EBUSY', 'EPERM'].includes(error?.code)) return false;
+    throw error;
+  }
+}
+
 export class Semaphore {
   constructor(limit) {
     if (!Number.isInteger(limit) || limit < 1) throw new Error('semaphore limit must be positive');
@@ -145,6 +165,24 @@ function assertVerification(verification) {
   for (const field of ['patch_sha256', 'tested_tree_oid', 'commit_oid', 'claim_type']) {
     if (typeof verification[field] !== 'string' || !verification[field]) {
       throw new Error(`verifier omitted ${field}`);
+    }
+  }
+  if (!Array.isArray(verification.executed_commands) || verification.executed_commands.length !== 2) {
+    throw new Error('verifier omitted structured base and patched command evidence');
+  }
+  if (!verification.verification_started_at || !verification.verification_finished_at) {
+    throw new Error('verifier omitted verification timing evidence');
+  }
+  if (!verification.environment || typeof verification.environment !== 'object' ||
+      typeof verification.environment.image !== 'string' || !verification.environment.image) {
+    throw new Error('verifier omitted exact executor image identity');
+  }
+  for (const [index, command] of verification.executed_commands.entries()) {
+    if (!['base_observation', 'patched_observation'].includes(command?.phase) ||
+        (typeof command.command !== 'string' && !Array.isArray(command.command)) ||
+        !Number.isInteger(command.exit_code) || typeof command.expectation_met !== 'boolean' ||
+        !Number.isFinite(command.duration_ms) || !command.started_at || !command.finished_at) {
+      throw new Error(`verifier returned invalid executed command evidence at index ${index}`);
     }
   }
 }
@@ -443,7 +481,7 @@ async function persistGitArtifact(task, checkout, {attempt, verification}, artif
     await writeFile(verificationFile, `${JSON.stringify(verification, null, 2)}\n`, {mode: 0o600});
     return {repository_path: repository, patch_path: patchFile, verification_path: verificationFile};
   } catch (error) {
-    await rm(root, {recursive: true, force: true});
+    await removeWorkTree(root);
     throw error;
   }
 }
@@ -476,7 +514,7 @@ export function createCommandDriver({
         roots.set(checkout, root);
         return checkout;
       } catch (error) {
-        await rm(root, {recursive: true, force: true});
+        await removeWorkTree(root);
         throw error;
       }
     },
@@ -497,7 +535,8 @@ export function createCommandDriver({
       const root = roots.get(checkout);
       if (!root) return;
       roots.delete(checkout);
-      await rm(root, {recursive: true, force: true});
+      const removed = await removeWorkTree(root, {tolerateBusy: true});
+      if (!removed) process.stderr.write(`factory cleanup deferred for busy work tree ${root}\n`);
     },
   };
 }

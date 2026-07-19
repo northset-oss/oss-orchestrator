@@ -70,6 +70,8 @@ function outbound(plan, events) {
     body: plan.pr_body,
   };
   return {
+    getFork: async () => ({found: true, status: 200}),
+    createFork: async () => { throw new Error('existing fixture fork must not be created'); },
     getBranch: async () => ({found: false, status: 200}),
     pushBranch: async (payload) => { events.push(['push', payload]); return {oid: payload.oid, status: 200}; },
     findPullRequests: async () => ({pull_requests: [], status: 200}),

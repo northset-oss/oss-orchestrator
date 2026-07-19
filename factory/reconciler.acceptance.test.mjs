@@ -114,6 +114,8 @@ test('attestation failure remains pending, publishes factual status, and restart
   assert.equal(saved.attestation_state, 'ATTESTATION_PENDING');
   assert.equal(saved.status_state, 'PUBLISHED');
   assert.equal(statusBatches[0][0].attestation_state, 'ATTESTATION_PENDING');
+  assert.equal(statusBatches[0][0].receipt_url,
+    'https://northset-oss.github.io/verification-pilot/receipts/M-001/');
 
   await reconcilePublicationBatch(fixture);
   saved = await fixture.db.getPublication('M-001');
