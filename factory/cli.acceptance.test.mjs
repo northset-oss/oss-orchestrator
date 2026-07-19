@@ -48,6 +48,7 @@ test('parser provides stable paths and strictly validates command-specific argum
     workRoot: parsed.workRoot,
     artifactRoot: parsed.artifactRoot,
     workerCommand: parsed.workerCommand,
+    receiptRemote: parsed.receiptRemote,
   }, {
     database: FACTORY_DEFAULTS.database,
     lake: FACTORY_DEFAULTS.lake,
@@ -55,6 +56,7 @@ test('parser provides stable paths and strictly validates command-specific argum
     workRoot: FACTORY_DEFAULTS.workRoot,
     artifactRoot: FACTORY_DEFAULTS.artifactRoot,
     workerCommand: FACTORY_DEFAULTS.workerCommand,
+    receiptRemote: FACTORY_DEFAULTS.receiptRemote,
   });
   assert.equal(parsed.profile, 'node');
   assert.equal(parsed.workers, 8);
@@ -302,6 +304,74 @@ test('a transient preflight failure still drains queued work and retries on the 
   assert.match(result.last_source_error, /temporary GitHub preflight timeout/);
 });
 
+test('run performs one bounded asynchronous reconciliation pass without blocking local work', async () => {
+  const db = fakeDb({
+    listReconciliationCandidates: () => [],
+    stats: () => ({ready_items: 1}),
+  });
+  let statusPublisherOptions;
+  let reconciliationOptions;
+  let localCycles = 0;
+  const statusPublisher = async () => ({});
+  const result = await executeFactoryCli([
+    'run', '--once', '--receipt-remote', 'https://example.test/receipts.git',
+  ], {
+    env: {},
+    stdout: output().stream,
+    dependencies: baseDependencies(db, {
+      driver: {},
+      source: {fill: async () => ({candidates: [], results: [], enqueued: []})},
+      createBoard: () => null,
+      createSafety: () => ({request: async (request) => request.execute(), releaseRepository: async () => {}}),
+      createReceiptStatusPublisher: (options) => {
+        statusPublisherOptions = options;
+        return statusPublisher;
+      },
+      reconcilePublicationBatch: async (options) => {
+        reconciliationOptions = options;
+        return {processed: 2, results: []};
+      },
+      runCycle: async () => {
+        localCycles += 1;
+        return {claimed: 1, results: [{state: 'READY'}]};
+      },
+    }),
+  });
+  assert.equal(localCycles, 1);
+  assert.deepEqual(statusPublisherOptions, {remoteUrl: 'https://example.test/receipts.git'});
+  assert.equal(reconciliationOptions.db, db);
+  assert.equal(reconciliationOptions.statusPublisher, statusPublisher);
+  assert.equal(reconciliationOptions.limit, 30);
+  assert.deepEqual(result.reconciliation, {
+    runs: 1, processed: 2, failures: 0, paused: 0, last_error: null,
+  });
+});
+
+test('a paused reconciliation lane is reported but does not stop queued local execution', async () => {
+  const db = fakeDb({listReconciliationCandidates: () => [], stats: () => ({ready_items: 1})});
+  const paused = Object.assign(new Error('GitHub publication is paused'), {code: 'GITHUB_PAUSED'});
+  let localCycles = 0;
+  const result = await executeFactoryCli(['run', '--once'], {
+    env: {},
+    stdout: output().stream,
+    dependencies: baseDependencies(db, {
+      driver: {},
+      source: {fill: async () => ({candidates: [], results: [], enqueued: []})},
+      createBoard: () => null,
+      createReceiptStatusPublisher: () => async () => ({}),
+      reconcilePublicationBatch: async () => { throw paused; },
+      runCycle: async () => {
+        localCycles += 1;
+        return {claimed: 1, results: [{state: 'READY'}]};
+      },
+    }),
+  });
+  assert.equal(localCycles, 1);
+  assert.equal(result.reconciliation.failures, 1);
+  assert.equal(result.reconciliation.paused, 1);
+  assert.match(result.reconciliation.last_error, /publication is paused/);
+});
+
 test('board displays the current immutable board or creates one from READY items', async () => {
   const board = {board_digest: BOARD, items: [{mission_id: 'M-001'}]};
   const db = fakeDb({getCurrentBoard: async () => board});
@@ -515,6 +585,7 @@ test('environment paths and command adapters are resolved without shell parsing'
       OSS_FACTORY_PAUSE_FILE: './tmp/pause.json',
       OSS_FACTORY_WORKER_COMMAND: '/opt/northset/worker',
       OSS_FACTORY_ARTIFACT_ROOT: './tmp/artifacts',
+      OSS_FACTORY_RECEIPT_REMOTE: 'https://example.test/receipts.git',
     },
   });
   assert.equal(parsed.database, path.resolve('./tmp/factory.sqlite'));
@@ -522,4 +593,5 @@ test('environment paths and command adapters are resolved without shell parsing'
   assert.equal(parsed.pauseFile, path.resolve('./tmp/pause.json'));
   assert.equal(parsed.workerCommand, '/opt/northset/worker');
   assert.equal(parsed.artifactRoot, path.resolve('./tmp/artifacts'));
+  assert.equal(parsed.receiptRemote, 'https://example.test/receipts.git');
 });

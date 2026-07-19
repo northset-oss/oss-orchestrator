@@ -90,6 +90,7 @@ export async function reconcilePublicationBatch({
   const getReadyItem = requiredMethod(db, 'getReadyItem', 'db');
   const getPublication = requiredMethod(db, 'getPublication', 'db');
   requiredMethod(db, 'savePublication', 'db');
+  const updateTaskState = requiredMethod(db, 'updateTaskState', 'db');
   const recordObservation = requiredMethod(db, 'recordPublicationObservation', 'db');
   const getPullRequest = requiredMethod(github, 'getPullRequest', 'github');
   const getCommitStatus = requiredMethod(github, 'getCommitStatus', 'github');
@@ -189,6 +190,9 @@ export async function reconcilePublicationBatch({
             attested_at: null,
             attestation_error: null,
           }, {now: observed});
+          if (found && publication.task_id) {
+            await updateTaskState(publication.task_id, 'RECEIPT_ATTESTED', null, {now: observed});
+          }
         } catch (error) {
           if (isPaused(error)) throw error;
           publication = await db.savePublication(missionId, {

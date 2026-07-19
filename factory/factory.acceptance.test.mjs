@@ -131,7 +131,8 @@ test('owner approves a subset and changing one item invalidates only its approva
   const digest = db.connection.prepare('SELECT board_digest FROM boards').get().board_digest;
   const board = db.getBoard(digest);
   const selected = board.items.slice(0, 2).map((item) => item.mission_id);
-  approveBoard(db, {board: digest, ids: selected, approvedBy: 'internal-user:aeziz'});
+  approveBoard(db, {board: digest, ids: selected, approvedBy: 'internal-user:aeziz',
+    verifyArtifacts: () => ({ok: true})});
   assert.equal(db.getReadyItem(selected[0]).approval_state, 'APPROVED');
   assert.equal(db.getReadyItem(selected[1]).approval_state, 'APPROVED');
   assert.equal(db.getReadyItem(board.items[2].mission_id).approval_state, 'PENDING');
@@ -176,6 +177,7 @@ test('a mutation before approval invalidates only that selection and clean items
     board: board.board_digest,
     ids: [changedId, cleanId],
     approvedBy: 'internal-user:aeziz',
+    verifyArtifacts: () => ({ok: true}),
   });
   assert.deepEqual(approval.approved_mission_ids, [cleanId]);
   assert.deepEqual(approval.invalidated_mission_ids, [changedId]);
@@ -200,6 +202,7 @@ test('owner can reject an entire board without approving any mission', async (t)
     ids: [],
     rejectedIds: rejected,
     approvedBy: 'internal-user:aeziz',
+    verifyArtifacts: () => ({ok: true}),
   });
   assert.deepEqual(approval.approved_mission_ids, []);
   assert.deepEqual(approval.rejected_mission_ids, rejected.sort());

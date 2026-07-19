@@ -1,5 +1,6 @@
 import {boardDigest as computeBoardDigest} from './board.mjs';
 import {batchApprovalDigest, canonical, readyItemDigest, sha256} from './db.mjs';
+import {verifyReadyArtifacts} from './artifact-integrity.mjs';
 
 const FINAL_SUBMISSION = 'final_submission';
 
@@ -392,6 +393,7 @@ export async function publishBoard(boardDigest, {
   liveRecheck,
   receiptPublisher,
   refreshStale = null,
+  artifactVerifier = verifyReadyArtifacts,
   now = () => new Date(),
 } = {}) {
   if (!db) throw new TypeError('db is required');
@@ -442,6 +444,12 @@ export async function publishBoard(boardDigest, {
         (approvedDigest !== null && approvedDigest !== immutableDigest)) {
       results.push(await failItem(db, plan, 'APPROVAL_INVALIDATED',
         'the current READY item no longer matches its immutable approved bytes'));
+      continue;
+    }
+    try {
+      artifactVerifier(plan.manifest);
+    } catch (error) {
+      results.push(await failItem(db, plan, 'ARTIFACT_INTEGRITY_FAILED', error.message));
       continue;
     }
     const repoState = await db.getRepositoryState(plan.repository);

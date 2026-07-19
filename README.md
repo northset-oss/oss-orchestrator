@@ -12,12 +12,14 @@ not part of the active path.
 
 ## Prerequisites
 
-- Node.js 24, Git, SQLite's `sqlite3` CLI, Docker, and GitHub's `gh` CLI.
+- Node.js 24, Git, Docker, and GitHub's `gh` CLI.
 - `gh` authenticated as the intended contributor for live preflight and publication.
-- Codex authentication available through `CODEX_ACCESS_TOKEN` or `CODEX_HOME`.
+- Host Codex authentication available through `CODEX_ACCESS_TOKEN` or `CODEX_HOME`. The authenticated
+  model client runs in the host Codex sandbox; credentials are never mounted into repository or test
+  containers.
 - The default candidate lake at `candidate_lake.sqlite`, or an alternate `OSS_FACTORY_LAKE`.
 - Push access to the receipt repository before using `publish`.
-- The author image expected by the worker. Build the pinned default once with:
+- The pinned Node dependency/verifier image expected by the worker. Build it once with:
 
 ```sh
 docker build --pull --tag northset-oss-author:0.144.1 \
@@ -38,8 +40,9 @@ node factory/cli.mjs run \
 
 The process selects only enough lake candidates to maintain queue depth, performs live preflight,
 prepares and verifies patches locally, and creates an immutable board when the size or age threshold
-is reached. `Ctrl-C` or `SIGTERM` stops it cleanly. `--once` is available for a bounded diagnostic
-cycle; it is not the production mode.
+is reached. It also performs a bounded asynchronous PR/CI/attestation reconciliation pass at startup
+and every 15 minutes without blocking local work. `Ctrl-C` or `SIGTERM` stops it cleanly. `--once` is
+available for a bounded diagnostic cycle; it is not the production mode.
 
 In another terminal, display the current board:
 
@@ -63,8 +66,9 @@ node factory/cli.mjs approve \
 ```
 
 To reject every item, omit `--ids` and provide all IDs with `--reject-ids`. Red items cannot be
-approved by the scaled lane. A changed manifest invalidates only that item's approval and sends it
-back for review.
+approved by the scaled lane. Approval rereads the durable patch and Git repository and verifies the
+base, patch digest, commit, and tested tree shown on the board. A changed manifest or artifact
+invalidates only that item's approval and sends it back for review.
 
 Publication is a separate, explicit command:
 
@@ -119,7 +123,7 @@ node factory/cli.mjs github-resume \
 | GitHub executable | `gh` | `--gh-bin`, `GH_BIN` |
 | Approval identity | `internal-user:aeziz` | `--approved-by`, `--cleared-by`, `OSS_FACTORY_APPROVED_BY` |
 | Fork owner | `AysajanE` | `OSS_FACTORY_FORK_OWNER` |
-| Author image | `northset-oss-author:0.144.1` | `OSS_AUTHOR_IMAGE` |
+| Dependency/verifier image | `northset-oss-author:0.144.1` | `OSS_AUTHOR_IMAGE` |
 | Author model | `gpt-5.6-sol` | `OSS_FACTORY_AUTHOR_MODEL` |
 
 Run defaults are eight workers, a 20-item board, a 30-minute board age, a five-second idle poll, and
@@ -135,8 +139,10 @@ a candidate preflight target of twice the worker count, capped at four times the
 - A clean base refresh keeps the mission ID, regenerates verified bytes, and returns only that item to
   READY for fresh approval. A conflict leaves the item recoverable without changing approved bytes.
 - `SUBMITTED` means the upstream PR exists and its stored bytes/head were verified. Receipt
-  attestation and later outcome/status publication are asynchronous. Their integration point is
-  `reconcileReceipt()` in `factory/publisher.mjs`; failure leaves the upstream PR open and recoverable.
+  attestation and later PR/CI outcome publication are asynchronous. The always-on `run` process uses
+  `reconcilePublicationBatch()` to update `publication.json`, retry pending attestations, and release
+  the one-open-PR reservation after merge or closure. Failure leaves the upstream PR open and
+  recoverable and never creates a replacement PR.
 
 There is no shift activation, JIT window, NTP gate, profile-exit gate, reviewer-calibration gate,
 scheduled board, claim-comment step, or per-mission signature command in the active runtime.

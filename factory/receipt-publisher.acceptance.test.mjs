@@ -282,7 +282,21 @@ test('receipt status reconciliation uses one non-force batch push, exact readbac
   const adopted = await statusPublisher(statuses);
   assert.deepEqual(adopted, published);
   assert.equal(calls.filter((call) => call.args.includes('push')).length, 1);
-  assert.equal(await git(['--git-dir', bare, 'rev-list', '--count', 'receipts']), '2');
+
+  const updatedStatuses = statuses.map((status) => status.mission_id === 'M-1000' ? {
+    ...status, pr_state: 'CLOSED', ci_state: 'FAILURE', observed_at: '2026-07-19T12:06:00.000Z',
+  } : status);
+  const updated = await statusPublisher(updatedStatuses);
+  assert.notEqual(updated['M-1000'].status_commit_oid, published['M-1000'].status_commit_oid);
+  assert.equal(calls.filter((call) => call.args.includes('push')).length, 2);
+  const updatedStatus = JSON.parse(await remoteBytes(bare,
+    `receipts/M-1000/${first.commit_oid}/publication.json`));
+  assert.equal(updatedStatus.pr_state, 'CLOSED');
+  assert.equal(updatedStatus.ci_state, 'FAILURE');
+  for (const [index, relativePath] of proofPaths.entries()) {
+    assert.deepEqual(await remoteBytes(bare, relativePath), beforeProofs[index]);
+  }
+  assert.equal(await git(['--git-dir', bare, 'rev-list', '--count', 'receipts']), '3');
 });
 
 test('receipt status refuses to publish without its immutable proof', async (t) => {

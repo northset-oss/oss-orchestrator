@@ -238,6 +238,7 @@ function options(db, github, overrides = {}) {
     safety: safetyFor(github),
     liveRecheck: async () => ({clean: true}),
     receiptPublisher: async (items) => receipts(items),
+    artifactVerifier: () => ({ok: true}),
     now: () => new Date('2026-07-19T12:00:00.000Z'),
     ...overrides,
   };
@@ -340,6 +341,16 @@ test('publisher recomputes immutable board bytes before any outbound action', as
     () => publishBoard(db.board.board_digest, options(db, github)),
     /immutable board bytes do not match stored digests/,
   );
+  assert.equal(github.events.length, 0);
+});
+
+test('durable artifact tampering refuses publication before any outbound action', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  const result = await publishBoard(db.board.board_digest, options(db, github, {
+    artifactVerifier: () => { throw new Error('durable patch digest changed'); },
+  }));
+  assert.equal(result.results[0].code, 'ARTIFACT_INTEGRITY_FAILED');
   assert.equal(github.events.length, 0);
 });
 

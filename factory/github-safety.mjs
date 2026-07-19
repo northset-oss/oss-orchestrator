@@ -214,19 +214,47 @@ function emptyGovernor() {
   };
 }
 
-async function acquireLease(lockDirectory, {staleMs = 5 * 60_000} = {}) {
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === 'EPERM') return true;
+    if (error.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+async function acquireLease(lockDirectory, {
+  staleMs = 5 * 60_000,
+  heartbeatMs = Math.min(30_000, Math.max(10, Math.floor(staleMs / 3))),
+} = {}) {
+  const ownerFile = path.join(lockDirectory, 'owner.json');
   while (true) {
     try {
       await mkdir(lockDirectory, {mode: 0o700});
-      await writeFile(path.join(lockDirectory, 'owner.json'), `${JSON.stringify({
-        pid: process.pid, acquired_at: new Date().toISOString(),
+      const token = randomUUID();
+      const acquiredAt = new Date().toISOString();
+      const writeOwner = () => writeFile(ownerFile, `${JSON.stringify({
+        pid: process.pid, token, acquired_at: acquiredAt, heartbeat_at: new Date().toISOString(),
       })}\n`, {mode: 0o600});
-      return async () => rm(lockDirectory, {recursive: true, force: true});
+      await writeOwner();
+      const heartbeat = setInterval(() => { writeOwner().catch(() => {}); }, heartbeatMs);
+      heartbeat.unref?.();
+      return async () => {
+        clearInterval(heartbeat);
+        const owner = await readJsonFile(ownerFile, null);
+        if (owner?.token === token) await rm(lockDirectory, {recursive: true, force: true});
+      };
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       try {
-        const info = await stat(lockDirectory);
-        if (Date.now() - info.mtimeMs > staleMs) {
+        let owner = null;
+        try { owner = JSON.parse(await readFile(ownerFile, 'utf8')); }
+        catch (readError) { if (readError.code !== 'ENOENT') throw readError; }
+        const info = await stat(owner ? ownerFile : lockDirectory);
+        if (Date.now() - info.mtimeMs > staleMs && !processIsAlive(Number(owner?.pid))) {
           await rm(lockDirectory, {recursive: true, force: true});
           continue;
         }
@@ -314,12 +342,17 @@ export function createGitHubSafety({
   mutationSpacingMs = 1_250,
   searchSpacingMs = 2_000,
   repositoryState = null,
+  leaseStaleMs = 5 * 60_000,
+  leaseHeartbeatMs = Math.min(30_000, Math.max(10, Math.floor(leaseStaleMs / 3))),
 } = {}) {
   if (typeof pauseFile !== 'string' || !pauseFile) throw new TypeError('pauseFile is required');
   if (typeof governorFile !== 'string' || !governorFile) throw new TypeError('governorFile is required');
   if (typeof transport !== 'function') throw new TypeError('transport is required');
   if (![mutationSpacingMs, searchSpacingMs].every((value) => Number.isFinite(value) && value >= 0)) {
     throw new TypeError('GitHub spacing values must be non-negative numbers');
+  }
+  if (![leaseStaleMs, leaseHeartbeatMs].every((value) => Number.isFinite(value) && value >= 10)) {
+    throw new TypeError('GitHub lease timing values must be at least 10 milliseconds');
   }
 
   const queue = [];
@@ -400,7 +433,7 @@ export function createGitHubSafety({
   };
 
   const execute = async (request) => {
-    const release = await acquireLease(leaseDirectory);
+    const release = await acquireLease(leaseDirectory, {staleMs: leaseStaleMs, heartbeatMs: leaseHeartbeatMs});
     try {
       const pause = await readPause(pauseFile);
       if (pause?.paused) throw new GitHubPausedError(pause);
@@ -535,7 +568,7 @@ export function createGitHubSafety({
     if (typeof repository !== 'string' || !repository.includes('/')) {
       throw new TypeError('repository release requires owner/name');
     }
-    const release = await acquireLease(leaseDirectory);
+    const release = await acquireLease(leaseDirectory, {staleMs: leaseStaleMs, heartbeatMs: leaseHeartbeatMs});
     try {
       const governor = await readJsonFile(governorFile, emptyGovernor());
       governor.open_repositories = Object.fromEntries(Object.entries(governor.open_repositories ?? {})

@@ -1,4 +1,5 @@
 import {canonical, sha256} from './db.mjs';
+import {verifyReadyArtifacts} from './artifact-integrity.mjs';
 
 const RED_CLASSES = new Set([
   'dependency', 'lockfile', 'ci', 'security', 'migration', 'release',
@@ -68,16 +69,36 @@ export function approveBoard(db, {
   rejectedIds = [],
   approvedBy = 'internal-user:aeziz',
   approvedAt = new Date(),
+  verifyArtifacts = verifyReadyArtifacts,
 }) {
   const board = db.getBoard(digest);
   if (!board) throw new Error(`unknown board ${digest}`);
   const selected = new Set(ids);
+  const artifactInvalidated = [];
   for (const item of board.items) {
     if (selected.has(item.mission_id) && classifyRisk(item.manifest) === 'RED') {
       throw new Error(`${item.mission_id} is Red and cannot be published by the scaled lane`);
     }
+    if (selected.has(item.mission_id)) {
+      try { verifyArtifacts(item.manifest); }
+      catch (error) { artifactInvalidated.push({mission_id: item.mission_id, reason: error.message}); }
+    }
   }
-  return db.approveBoard(digest, ids, {rejectedIds, approvedBy, now: approvedAt});
+  const invalidIds = new Set(artifactInvalidated.map((item) => item.mission_id));
+  const approvedIds = ids.filter((id) => !invalidIds.has(id));
+  if (!approvedIds.length && !rejectedIds.length) {
+    throw new Error(`all selected missions failed durable artifact verification: ${artifactInvalidated
+      .map((item) => `${item.mission_id}: ${item.reason}`).join('; ')}`);
+  }
+  const result = db.approveBoard(digest, approvedIds, {rejectedIds, approvedBy, now: approvedAt});
+  return {
+    ...result,
+    invalidated_mission_ids: [...new Set([
+      ...(result.invalidated_mission_ids ?? []),
+      ...artifactInvalidated.map((item) => item.mission_id),
+    ])].sort(),
+    artifact_errors: Object.fromEntries(artifactInvalidated.map((item) => [item.mission_id, item.reason])),
+  };
 }
 
 function inline(value) {

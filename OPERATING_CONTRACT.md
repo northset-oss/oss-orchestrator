@@ -43,7 +43,8 @@ metric may block local work.
 
 ## Hard integrity invariants
 
-1. Host GitHub credentials and host Git metadata never enter author or verifier containers.
+1. No host credential, including GitHub or Codex authentication, enters repository, author, or
+   verifier containers. The authenticated model client stays outside that boundary.
 2. Dependency bootstrap is credential-free; frozen dependency material is read-only afterward.
 3. Final verification is network-off and binds the patch, tested tree, DCO commit, published branch,
    and PR head to the same approved bytes.
@@ -75,7 +76,9 @@ at a time.
 The immutable board binds each mission's target, patch and manifest digests, commit/tree, checks,
 exact PR title/body, receipt claim, and planned public actions. The operator may approve a subset,
 reject a subset or reject the complete board. Unspecified items return to READY. A mutation or clean
-base refresh invalidates only the affected item and requires a new board approval.
+base refresh invalidates only the affected item and requires a new board approval. Approval and
+publication both reread the durable patch and repository to prove those review links still bind the
+stored base, commit, and tested tree.
 
 Approval itself performs no GitHub action. `publish --board <digest>` is the explicit authorization to
 execute only the approved public plan.
@@ -107,7 +110,8 @@ and one probe. An account restriction has no local resume path.
 - Clean base movement triggers rebase/reverification and item-only reapproval. Conflicts or failed
   re-verification preserve approved bytes and return a recoverable result.
 - Receipt attestation or final status failure never closes or duplicates an already opened upstream
-  PR. Reconciliation resumes from the stored publication state.
+  PR. The always-on process performs bounded reconciliation every 15 minutes, publishes factual
+  `publication.json` updates in one batch, and resumes from the stored publication state.
 
 ## Commands
 

@@ -8,7 +8,8 @@ import {openFactoryDb} from './db.mjs';
 import {createGhCliPublisherAdapter, createGhCliTransport} from './gh-cli.mjs';
 import {createGitHubSafety, resumeGitHub} from './github-safety.mjs';
 import {publishBoard} from './publisher.mjs';
-import {createReceiptPublisher} from './receipt-publisher.mjs';
+import {createReceiptPublisher, createReceiptStatusPublisher} from './receipt-publisher.mjs';
+import {reconcilePublicationBatch} from './reconciler.mjs';
 import {createSource} from './source.mjs';
 import {createStaleRefresher} from './stale-refresh.mjs';
 import {createCommandDriver, runFactoryCycle} from './worker.mjs';
@@ -30,7 +31,7 @@ const COMMANDS = new Set(['run', 'board', 'approve', 'publish', 'github-status',
 const COMMON_VALUE_FLAGS = new Set(['--db', '--pause-file', '--gh-bin']);
 const COMMAND_VALUE_FLAGS = Object.freeze({
   run: new Set(['--lake', '--profile', '--workers', '--board-size', '--board-max-age-minutes',
-    '--candidate-limit', '--worker-command', '--work-root', '--artifact-root', '--poll-ms']),
+    '--candidate-limit', '--worker-command', '--work-root', '--artifact-root', '--receipt-remote', '--poll-ms']),
   board: new Set(),
   approve: new Set(['--board', '--ids', '--reject-ids', '--approved-by']),
   publish: new Set(['--board', '--receipt-remote', '--artifact-root']),
@@ -149,6 +150,8 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
       workRoot: pathValue(parsed.get('--work-root') ?? env.OSS_FACTORY_WORK_ROOT, FACTORY_DEFAULTS.workRoot),
       artifactRoot: pathValue(parsed.get('--artifact-root') ?? env.OSS_FACTORY_ARTIFACT_ROOT,
         FACTORY_DEFAULTS.artifactRoot),
+      receiptRemote: parsed.get('--receipt-remote') ?? env.OSS_FACTORY_RECEIPT_REMOTE ??
+        FACTORY_DEFAULTS.receiptRemote,
       pollMs: nonnegativeInteger(parsed.get('--poll-ms') ?? '5000', '--poll-ms'),
       once: parsed.get('--once') === true,
     };
@@ -261,6 +264,8 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
   createTransport: createGhCliTransport,
   createPublisherAdapter: createGhCliPublisherAdapter,
   createReceiptPublisher,
+  createReceiptStatusPublisher,
+  reconcilePublicationBatch,
   createStaleRefresher,
   createSafety: createGitHubSafety,
   resumeGitHub,
@@ -378,6 +383,9 @@ export async function executeFactoryCli(argv, {
         artifactRoot: options.artifactRoot,
         checkoutProvider,
       });
+      const statusPublisher = dependencies.receiptStatusPublisher ?? deps.createReceiptStatusPublisher({
+        remoteUrl: options.receiptRemote,
+      });
       const recovered = db.recoverWorkingTasks?.() ?? [];
       const boardPolicy = {minSize: options.boardSize, maxAgeMinutes: options.boardMaxAgeMinutes};
       const sourceTotal = {selected: 0, go: 0, skipped: 0, escalated: 0, enqueued: 0, paused: 0};
@@ -387,6 +395,8 @@ export async function executeFactoryCli(argv, {
       let sourceFailures = 0;
       let lastSourceError = null;
       let lastCycle = null;
+      const reconciliation = {runs: 0, processed: 0, failures: 0, paused: 0, last_error: null};
+      let nextReconciliationAt = 0;
       while (!signal?.aborted) {
         let filled;
         try {
@@ -423,6 +433,27 @@ export async function executeFactoryCli(argv, {
         claimed += Number(lastCycle?.claimed ?? 0);
         completed += lastCycle?.results?.length ?? 0;
         deps.createBoard(db, boardPolicy);
+        const reconciliationDue = Date.now() >= nextReconciliationAt;
+        if (typeof db.listReconciliationCandidates === 'function' && reconciliationDue) {
+          try {
+            const reconciled = await deps.reconcilePublicationBatch({
+              db,
+              github,
+              safety,
+              statusPublisher,
+              limit: 30,
+            });
+            reconciliation.runs += 1;
+            reconciliation.processed += Number(reconciled?.processed ?? 0);
+            reconciliation.last_error = null;
+          } catch (error) {
+            reconciliation.failures += 1;
+            reconciliation.last_error = error.message;
+            if (error?.code === 'GITHUB_PAUSED') reconciliation.paused += 1;
+          } finally {
+            nextReconciliationAt = Date.now() + 15 * 60_000;
+          }
+        }
         if (options.once) break;
         if (Number(lastCycle?.claimed ?? 0) === 0 && summary.enqueued === 0) {
           await (dependencies.sleep ?? defaultSleep)(options.pollMs, signal);
@@ -438,6 +469,7 @@ export async function executeFactoryCli(argv, {
         stopped: signal?.aborted === true,
         source_failures: sourceFailures,
         last_source_error: lastSourceError,
+        reconciliation,
         last_cycle: lastCycle,
         stats: db.stats?.() ?? null,
       };

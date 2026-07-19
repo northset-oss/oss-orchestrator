@@ -54,7 +54,7 @@ async function fixture(t, suffix = 'one') {
     planned_actions: ['publish-proof', 'push-approved-commit', 'open-upstream-pr', 'verify-pr-readback'],
   }));
   const board = createBoardIfDue(db, {force: true});
-  approveBoard(db, {board: board.board_digest, ids: [ready.mission_id]});
+  approveBoard(db, {board: board.board_digest, ids: [ready.mission_id], verifyArtifacts: () => ({ok: true})});
   return {root, db, task, ready, board};
 }
 
@@ -93,6 +93,7 @@ test('real database carries one approved item through exact publication and dura
       batch_commit_oid: 'e'.repeat(40),
       batch_approval_digest: item.approval_digest,
     }])),
+    artifactVerifier: () => ({ok: true}),
     now: () => new Date('2026-07-19T12:00:00.000Z'),
   });
   assert.equal(result.results[0].state, 'SUBMITTED', JSON.stringify(result.results[0]));
@@ -156,6 +157,7 @@ test('changing the outbound fork after approval invalidates only that READY item
     safety: {request: async (request) => { calls += 1; return request.execute(); }},
     liveRecheck: async () => ({clean: true}),
     receiptPublisher: async () => ({}),
+    artifactVerifier: () => ({ok: true}),
   });
   assert.equal(result.results[0].code, 'ITEM_NOT_APPROVED');
   assert.equal(calls, 0);

@@ -262,6 +262,43 @@ test('independent CLI governors share pacing, open-repository reservations, and 
   assert.equal((await governors[0].status()).governor.open_repositories[firstRepository], undefined);
 });
 
+test('a live cross-process lease is never stolen merely because one request runs longer than stale recovery', async (t) => {
+  const clock = await fixture(t, 'factory-github-live-lease');
+  let releaseFirst;
+  let signalStarted;
+  const firstStarted = new Promise((resolve) => { signalStarted = resolve; });
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const starts = [];
+  const common = {
+    ...clock,
+    mutationSpacingMs: 0,
+    leaseStaleMs: 30,
+    leaseHeartbeatMs: 10,
+  };
+  const firstGovernor = createGitHubSafety({
+    ...common,
+    transport: async () => {
+      starts.push('first');
+      signalStarted();
+      await firstGate;
+      return {status: 200};
+    },
+  });
+  const secondGovernor = createGitHubSafety({
+    ...common,
+    transport: async () => { starts.push('second'); return {status: 200}; },
+  });
+  const first = firstGovernor.request({priority: 'final_submission', kind: 'read', operation: 'first'});
+  await firstStarted;
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  const second = secondGovernor.request({priority: 'final_submission', kind: 'read', operation: 'second'});
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(starts, ['first']);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(starts, ['first', 'second']);
+});
+
 test('transient network and 5xx failures get one retry, not an unbounded loop', async (t) => {
   const clock = await fixture(t, 'factory-github-retry');
   let networkCalls = 0;
