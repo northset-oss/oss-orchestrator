@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {mkdtemp, readFile, rm} from 'node:fs/promises';
+import {mkdtemp, readFile, readdir, rm} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
@@ -11,6 +11,7 @@ export const CLAIM_TYPES = Object.freeze([
   'coverage_addition',
   'test_infrastructure_fix',
 ]);
+export const OSS_COMMIT_IDENTITY = Object.freeze({name: 'Aysajan Eziz', email: 'aeziz@northset.ai'});
 
 function commandResult(result) {
   return {
@@ -45,6 +46,17 @@ const MANIFEST_PATTERNS = {
   rust: ['Cargo.toml', 'Cargo.lock'],
 };
 
+async function manifestNames(checkout, profile) {
+  const names = [...MANIFEST_PATTERNS[profile]];
+  if (profile === 'python') {
+    const entries = await readdir(checkout, {withFileTypes: true});
+    for (const entry of entries) {
+      if (entry.isFile() && /^requirements.*\.txt$/i.test(entry.name)) names.push(entry.name);
+    }
+  }
+  return [...new Set(names)].sort();
+}
+
 export async function dependencyCacheKey({
   repositoryNodeId,
   repository,
@@ -59,7 +71,7 @@ export async function dependencyCacheKey({
   if (!MANIFEST_PATTERNS[profile]) throw new Error(`unsupported dependency profile ${profile}`);
   if (!['authored', 'foreign'].includes(trustDomain)) throw new Error('dependency trust domain must be authored or foreign');
   const manifests = [];
-  for (const name of MANIFEST_PATTERNS[profile]) {
+  for (const name of await manifestNames(checkout, profile)) {
     const digest = await fileDigest(path.join(checkout, name));
     if (digest) manifests.push({path: name, sha256: digest});
   }
@@ -80,7 +92,7 @@ export function dependencyVolumePlan({cacheKey, checkout, profile, installComman
   if (!/^sha256:[0-9a-f]{64}$/.test(String(cacheKey ?? ''))) throw new Error('dependency volume requires a cache key');
   const volume = `northset-deps-${cacheKey.slice(-32)}`;
   const targets = {
-    node: [{source: volume, target: path.join(checkout, 'node_modules')}],
+    node: [{source: volume, target: '/workspace/node_modules'}],
     python: [{source: volume, target: '/opt/northset/venv'}],
     go: [{source: volume, target: '/go/pkg/mod'}],
     rust: [{source: volume, target: '/usr/local/cargo/registry'}],
@@ -99,15 +111,18 @@ export function dependencyVolumePlan({cacheKey, checkout, profile, installComman
   };
 }
 
-export async function bootstrapDependencies(input, {runContainer}) {
+export async function bootstrapDependencies(input, {runContainer, volumeExists = async () => false}) {
   if (typeof runContainer !== 'function') throw new Error('dependency bootstrap requires a container runner');
   const key = input.cacheKey ?? await dependencyCacheKey(input);
   const plan = dependencyVolumePlan({...input, cacheKey: key});
-  const result = await runContainer(plan.bootstrap);
-  if (Number(result.code ?? result.exit_code) !== 0) {
-    throw new Error(`dependency bootstrap failed: ${String(result.stderr ?? result.stdout ?? '').trim()}`);
+  const reused = await volumeExists(plan.volume);
+  if (!reused) {
+    const result = await runContainer(plan.bootstrap);
+    if (Number(result.code ?? result.exit_code) !== 0) {
+      throw new Error(`dependency bootstrap failed: ${String(result.stderr ?? result.stdout ?? '').trim()}`);
+    }
   }
-  return {cache_key: key, volume: plan.volume, mounts: plan.runtime_mounts};
+  return {cache_key: key, volume: plan.volume, mounts: plan.runtime_mounts, reused};
 }
 
 export async function inspectGitWorktree(checkout) {
@@ -148,10 +163,75 @@ function assertClaimObservations(claimType, base, patched) {
   if (base.exit_code === 0) throw new Error(`${claimType} requires a failing base observation`);
 }
 
+function classifyPath(file, status) {
+  const normalized = file.toLowerCase();
+  const name = path.basename(normalized);
+  if (/^(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(name)) return 'lockfile';
+  if (/^(?:package\.json|pyproject\.toml|requirements.*\.txt|go\.mod|go\.sum|cargo\.toml|cargo\.lock)$/.test(name)) {
+    return 'dependency';
+  }
+  if (normalized.startsWith('.github/') || /(?:^|\/)(?:ci|workflows?)(?:\/|$)/.test(normalized)) return 'ci';
+  if (/(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^.]+$/.test(normalized)) {
+    return status === 'A' ? 'new_test' : 'existing_test';
+  }
+  if (/(?:^|\/)(?:dist|build|generated|vendor)(?:\/|$)/.test(normalized)) return 'generated';
+  return 'production';
+}
+
+export async function inspectChangedFiles(repoDir, baseOid, commitOid) {
+  const names = await execute('git', [
+    '-C', repoDir, 'diff', '--name-status', '-z', '--no-renames', baseOid, commitOid,
+  ]);
+  if (names.code !== 0) throw new Error(`cannot classify changed files: ${names.stderr.trim()}`);
+  const parts = names.stdout.split('\0').filter(Boolean);
+  const changed = [];
+  for (let index = 0; index < parts.length; index += 2) {
+    const status = parts[index];
+    const file = parts[index + 1];
+    if (!file) throw new Error('changed-file record is malformed');
+    changed.push({path: file, status, class: classifyPath(file, status), lines: 0});
+  }
+  const numstat = await execute('git', ['-C', repoDir, 'diff', '--numstat', '--no-renames', baseOid, commitOid]);
+  if (numstat.code !== 0) throw new Error(`cannot compute diffstat: ${numstat.stderr.trim()}`);
+  const byPath = new Map(changed.map((item) => [item.path, item]));
+  let total = 0;
+  for (const line of numstat.stdout.split('\n').filter(Boolean)) {
+    const [added, removed, ...fileParts] = line.split('\t');
+    const file = fileParts.join('\t');
+    const item = byPath.get(file);
+    if (!item) continue;
+    if (added === '-' || removed === '-') {
+      item.class = 'generated';
+      item.lines = 0;
+    } else {
+      item.lines = Number(added) + Number(removed);
+      total += item.lines;
+    }
+  }
+  return {files: changed, changed_lines: total};
+}
+
+export async function assertDcoIdentity(repoDir, commitOid, identity = OSS_COMMIT_IDENTITY) {
+  const result = await execute('git', ['-C', repoDir, 'show', '-s', '--format=%an%x00%ae%x00%ce%x00%B', commitOid]);
+  if (result.code !== 0) throw new Error(`cannot inspect commit identity: ${result.stderr.trim()}`);
+  const [authorName, authorEmail, committerEmail, ...bodyParts] = result.stdout.split('\0');
+  const body = bodyParts.join('\0');
+  if (authorName !== identity.name || authorEmail !== identity.email || committerEmail !== identity.email) {
+    throw new Error(`commit identity must be ${identity.name} <${identity.email}>`);
+  }
+  const signoff = `Signed-off-by: ${identity.name} <${identity.email}>`;
+  if (!body.split('\n').some((line) => line.trim() === signoff)) {
+    throw new Error(`commit is missing DCO sign-off ${signoff}`);
+  }
+  return true;
+}
+
 export async function verifyContribution(input, {
   runContainer,
   inspectTree = inspectGitWorktree,
   verifyBinding = assertPatchCommitBinding,
+  verifyDco = assertDcoIdentity,
+  inspectChanges = inspectChangedFiles,
   now = () => new Date(),
 } = {}) {
   if (typeof runContainer !== 'function') throw new Error('verification requires a container runner');
@@ -179,6 +259,15 @@ export async function verifyContribution(input, {
   const baseObservation = commandResult(baseResult);
   const patchedObservation = commandResult(patchedResult);
   assertClaimObservations(input.claimType, baseObservation, patchedObservation);
+  if (input.claimType === 'regression_fix') {
+    if (typeof input.baseFailureContains !== 'string' || !input.baseFailureContains.trim()) {
+      throw new Error('regression fix requires an exact base failure marker');
+    }
+    const output = `${baseResult.stdout ?? ''}\n${baseResult.stderr ?? ''}`;
+    if (!output.includes(input.baseFailureContains)) {
+      throw new Error('base observation did not contain the declared regression failure marker');
+    }
+  }
   const after = await inspectTree(input.patchedCheckout);
   if (after.status || before.tree_oid !== after.tree_oid) {
     throw new Error('tracked source changed during final verification');
@@ -192,6 +281,8 @@ export async function verifyContribution(input, {
   if (testedTreeOid !== input.commitTreeOid && input.commitTreeOid !== undefined) {
     throw new Error('verified tree differs from the declared commit tree');
   }
+  await verifyDco(input.patchedCheckout, input.commitOid, input.dcoIdentity ?? OSS_COMMIT_IDENTITY);
+  const changes = await inspectChanges(input.patchedCheckout, input.baseOid, input.commitOid);
   const patchBytes = await readFile(input.patchFile);
   return {
     ok: true,
@@ -203,6 +294,9 @@ export async function verifyContribution(input, {
     tested_tree_oid: testedTreeOid,
     commit_oid: input.commitOid,
     dependency_cache_key: input.dependencyMaterial?.cache_key ?? null,
+    dco_verified: true,
+    changed_files: changes.files,
+    changed_lines: changes.changed_lines,
     environment: input.environment ?? {},
   };
 }
@@ -235,10 +329,13 @@ export function createDockerRunner({docker = 'docker', image}) {
     const args = ['run', '--rm', '--cap-drop=ALL', '--security-opt=no-new-privileges'];
     if (plan.network === false) args.push('--network=none');
     for (const mount of plan.mounts ?? []) {
-      const suffix = mount.readOnly ? ':ro' : '';
+      const suffix = mount.readOnly ? ',readonly' : '';
       args.push('--mount', `type=volume,src=${mount.source},dst=${mount.target}${suffix}`);
     }
-    if (plan.checkout) args.push('--mount', `type=bind,src=${plan.checkout},dst=/workspace`, '--workdir', '/workspace');
+    if (plan.checkout) {
+      const suffix = plan.checkoutReadOnly === false ? '' : ',readonly';
+      args.push('--mount', `type=bind,src=${plan.checkout},dst=/workspace${suffix}`, '--workdir', '/workspace');
+    }
     args.push(image, 'sh', '-lc', Array.isArray(plan.command) ? plan.command.join(' && ') : String(plan.command ?? 'true'));
     return execute(docker, args);
   };

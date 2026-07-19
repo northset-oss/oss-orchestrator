@@ -28,6 +28,7 @@ function mission(index) {
     manifest_sha256: itemDigest,
     repository: `upstream${index}/project`,
     fork_repository: `northset/project-${index}`,
+    repository_path: `/private/factory/M-${String(index).padStart(3, '0')}/repo`,
     base_branch: 'main',
     branch: `northset/${id.toLowerCase()}`,
     commit_oid: oid(index),
@@ -36,6 +37,7 @@ function mission(index) {
     pr_title: `fix: bounded correction ${index}`,
     pr_body: `## Summary\r\n\r\nBounded correction ${index}.\r\n`,
     receipt_claim: `The declared check for ${id} passed in the clean verifier.`,
+    receipt_url: `https://example.test/receipts/${id}/proof.json`,
   };
 }
 
@@ -193,7 +195,7 @@ function safetyFor(github) {
 function receipts(items) {
   return Object.fromEntries(items.map((item) => [item.mission_id, {
     mission_id: item.mission_id,
-    receipt_url: `https://example.test/receipts/${item.mission_id}/proof.json`,
+    receipt_url: item.receipt_url,
   }]));
 }
 

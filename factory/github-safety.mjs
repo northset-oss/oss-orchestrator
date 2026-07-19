@@ -294,7 +294,9 @@ export function createGitHubSafety({
     const recent = sessionPublications.filter((item) => item.at > nowMs - 60 * 60 * 1_000);
     const sessionToday = sessionPublications.filter((item) => item.day === today);
     const repoOpen = numberField(state, ['open_northset_prs', 'openNorthsetPrs']);
-    if (repoOpen >= PUBLIC_LIMITS.repositoryOpen) {
+    const sessionRepoOpen = sessionPublications.some((item) =>
+      item.repository.toLowerCase() === repository.toLowerCase());
+    if (repoOpen >= PUBLIC_LIMITS.repositoryOpen || sessionRepoOpen) {
       throw new GitHubPublicLimitError(`one-open-PR cap reached for ${repository}`);
     }
     const ownerToday = Math.max(

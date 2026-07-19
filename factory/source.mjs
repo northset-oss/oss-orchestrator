@@ -320,13 +320,24 @@ export async function preflightCandidates(candidates, {
   const response = await github.graphql(query);
   const data = response?.data ?? response;
   if (!data || typeof data !== 'object') throw new Error('GitHub preflight returned no data');
-  return selected.map((candidate, index) => {
+  const results = selected.map((candidate, index) => {
     const live = normalizePreflight(candidate, {
       repository: data[`c${index}`] ?? null,
       northset: data[`n${index}`] ?? null,
     });
     return {...evaluatePreflight(live, {northsetLogin, now}), candidate};
   });
+  if (typeof github.deepOverlap === 'function') {
+    for (let index = 0; index < results.length; index += 1) {
+      const result = results[index];
+      if (result.outcome !== 'ESCALATE') continue;
+      const deeper = await github.deepOverlap(result.liveState);
+      results[index] = deeper?.clean
+        ? {...result, outcome: 'GO', reasons: []}
+        : {...result, outcome: 'SKIP', reasons: [deeper?.reason ?? 'deeper overlap review was not clean']};
+    }
+  }
+  return results;
 }
 
 export async function enqueueCandidates(results, {db} = {}) {

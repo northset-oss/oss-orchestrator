@@ -25,8 +25,8 @@ async function makeGitFixture(t) {
   const root = path.join(parent, 'repo');
   await mkdir(root);
   await git(root, 'init', '-q');
-  await git(root, 'config', 'user.name', 'Factory Test');
-  await git(root, 'config', 'user.email', 'factory@example.test');
+  await git(root, 'config', 'user.name', 'Aysajan Eziz');
+  await git(root, 'config', 'user.email', 'aeziz@northset.ai');
   await writeFile(path.join(root, 'value.mjs'), 'export const value = 1;\n');
   await writeFile(path.join(root, 'package.json'), '{"scripts":{"test":"node --test"}}\n');
   await git(root, 'add', '.');
@@ -34,7 +34,7 @@ async function makeGitFixture(t) {
   const baseOid = await git(root, 'rev-parse', 'HEAD');
   await writeFile(path.join(root, 'value.mjs'), 'export const value = 2;\n');
   await git(root, 'add', '.');
-  await git(root, 'commit', '-q', '-m', 'fix');
+  await git(root, 'commit', '-q', '-m', 'fix', '-m', 'Signed-off-by: Aysajan Eziz <aeziz@northset.ai>');
   const commitOid = await git(root, 'rev-parse', 'HEAD');
   const commitTreeOid = await git(root, 'rev-parse', 'HEAD^{tree}');
   const patchFile = path.join(parent, 'fix.patch');
@@ -65,6 +65,7 @@ function input(fixture, claimType) {
     commitTreeOid: fixture.commitTreeOid,
     patchFile: fixture.patchFile,
     testCommand: 'node --test',
+    baseFailureContains: 'failed',
     dependencyMaterial: {cache_key: `sha256:${'a'.repeat(64)}`, mounts: [{source: 'deps', target: '/deps', readOnly: true}]},
     environment: {image: `sha256:${'b'.repeat(64)}`},
   };

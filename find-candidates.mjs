@@ -31,7 +31,6 @@ import {fileURLToPath} from 'node:url';
 
 import {PROFILE_REGISTRY, isInvitationLabel, normalizeLabel, taskIdForCandidate} from './core.mjs';
 import {candidateEvidenceKey, canonicalCandidate, openCandidateLake} from './candidate-lake.mjs';
-import {assertPhase1Runtime} from './campaign/phase1/runtime-guard.mjs';
 import {
   assertGhRateSafetyAllowsAction,
   ghRequest,
@@ -2324,23 +2323,13 @@ async function runQualifyCommand(argv) {
   const profile = takeOption(values, ['--profile'], 'node');
   const reviewScript = commandOutput(takeOption(values, ['--review-script']), DEFAULT_REVIEWER);
   const timeoutSeconds = positiveInteger(takeOption(values, ['--review-timeout-seconds'], '300'), '--review-timeout-seconds');
-  const phase1RuntimeValue = takeOption(values, ['--phase1-runtime'], null);
-  const phase1Runtime = phase1RuntimeValue ? path.resolve(phase1RuntimeValue) : null;
+  takeOption(values, ['--phase1-runtime'], null); // legacy compatibility; the factory has no schedule runtime
   if (values.length) throw new Error(`unknown qualify argument ${values[0]}`);
   await assertGhRateSafetyAllowsAction();
   const loaded = JSON.parse(await readFile(queueFile, 'utf8'));
   const queue = Array.isArray(loaded) ? loaded : loaded.queue;
   if (!Array.isArray(queue)) throw new Error('review queue must be an array or an object with queue[]');
   const count = countValue ? positiveInteger(countValue, '--count') : queue.length;
-  const selected = queue.slice(0, count);
-  await assertPhase1Runtime(phase1Runtime, {
-    action: 'qualify',
-    repositories: selected.map((record) => {
-      const candidate = parseCandidateKey(record.candidate);
-      return `${candidate.owner}/${candidate.repo}`;
-    }),
-    units: selected.length,
-  });
   const lake = await openCandidateLake(lakeFile);
   const results = await qualifyQueueRecords(queue, {
     lake, profile, count,

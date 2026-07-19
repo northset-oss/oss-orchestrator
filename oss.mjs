@@ -44,7 +44,6 @@ import {
   tripPersistentProviderThrottle,
 } from './campaign/phase0/resource-breakers.mjs';
 import {buildAttemptAttribution, validateAttemptAttribution} from './campaign/phase1/attribution.mjs';
-import {assertPhase1Runtime} from './campaign/phase1/runtime-guard.mjs';
 import {
   assertGhRateSafetyAllowsAction,
   resolveGhGatewayStateDir,
@@ -1941,10 +1940,6 @@ async function main() {
     await assertGhRateSafetyAllowsAction();
   }
   const specs = await loadSpecs(options);
-  const repositories = specs.map((spec) => {
-    const candidate = parseCandidate(spec.candidate);
-    return `${candidate.owner}/${candidate.repo}`;
-  });
   if (options.warmManifest) options.warmCache = JSON.parse(await readFile(options.warmManifest, 'utf8'));
   if (options.command === 'warm') {
     const warmed = await warmBatch(specs, {minimumFreeBytes: options.minimumFreeBytes});
@@ -1970,13 +1965,11 @@ async function main() {
     return;
   }
   if (options.command === 'prepare') {
-    await assertPhase1Runtime(options.phase1Runtime, {action: 'prepare', repositories});
     const results = await pool(specs, options.concurrency, (spec) => prepareMission(spec, options));
     await printBoard(results, options);
     if (results.some((result) => result.state.startsWith('FAILED'))) process.exitCode = 1;
     return;
   }
-  await assertPhase1Runtime(options.phase1Runtime, {action: 'ship', repositories});
   const {shipBatch} = await import('./ship.mjs');
   const {loadReviewerRoster} = await import('./campaign/phase0/roster.mjs');
   const [signedBatchApproval, roster] = await Promise.all([

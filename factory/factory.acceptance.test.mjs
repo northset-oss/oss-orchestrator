@@ -53,6 +53,9 @@ function verifiedDriver({verified = 10, startHook = null} = {}) {
     verify: async (task) => ({
       ok: true,
       claim_type: 'regression_fix',
+      dco_verified: true,
+      changed_files: [{path: 'src/a.mjs', status: 'M', class: 'production', lines: 3}],
+      changed_lines: 3,
       patch_sha256: `sha256:${String((task.issue_number % 9) + 1).repeat(64)}`,
       tested_tree_oid: 'b'.repeat(40),
       commit_oid: `${String((task.issue_number % 8) + 1)}`.repeat(40),

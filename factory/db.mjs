@@ -3,7 +3,7 @@ import {mkdirSync} from 'node:fs';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 
-export const FACTORY_SCHEMA_VERSION = 1;
+export const FACTORY_SCHEMA_VERSION = 3;
 export const TASK_STATES = Object.freeze([
   'DISCOVERED', 'QUEUED', 'WORKING', 'VERIFIED', 'READY', 'APPROVED',
   'PR_OPENED', 'RECEIPT_ATTESTED', 'SKIPPED', 'FAILED',
@@ -42,6 +42,7 @@ export function readyItemDigest(manifest) {
     mission_id: manifest.mission_id,
     task_id: manifest.task_id,
     repository: manifest.repository ?? manifest.repo,
+    fork_repository: manifest.fork_repository ?? manifest.fork_repo,
     issue_number: manifest.issue_number,
     issue_url: manifest.issue_url,
     base_branch: manifest.base_branch,
@@ -53,6 +54,10 @@ export function readyItemDigest(manifest) {
     verification: manifest.verification,
     pr_title: manifest.pr_title,
     pr_body: normalizePrBody(manifest.pr_body),
+    branch: manifest.branch,
+    repository_path: manifest.repository_path,
+    patch_path: manifest.patch_path,
+    proof: manifest.proof,
     receipt_claim: manifest.receipt_claim,
     receipt_url: manifest.receipt_url,
     risk_tier: manifest.risk_tier,
@@ -144,16 +149,27 @@ function mapPublication(row) {
   if (!row) return null;
   return {
     mission_id: row.mission_id,
+    task_id: row.task_id,
     branch: row.branch,
     pushed_oid: row.pushed_oid,
     pr_url: row.pr_url,
     pr_number: row.pr_number,
     pr_head_oid: row.pr_head_oid,
+    pr_base_branch: row.pr_base_branch,
     receipt_url: row.receipt_url,
+    receipt_state: row.receipt_state,
     proof_published: Boolean(row.proof_published),
     attestation_state: row.attestation_state,
+    attestation_url: row.attestation_url,
+    attested_at: row.attested_at,
+    attestation_error: row.attestation_error,
+    submitted_at: row.submitted_at,
+    status_state: row.status_state,
+    status_url: row.status_url,
+    status_error: row.status_error,
     publication_state: row.publication_state,
     last_error: row.last_error,
+    last_error_detail: row.last_error_detail,
     updated_at: row.updated_at,
   };
 }
@@ -228,6 +244,7 @@ CREATE TABLE IF NOT EXISTS board_items(
   mission_id TEXT NOT NULL,
   position INTEGER NOT NULL,
   item_digest TEXT NOT NULL,
+  manifest_sha256 TEXT NOT NULL,
   manifest_json TEXT NOT NULL,
   decision TEXT,
   PRIMARY KEY(board_id,mission_id),
@@ -244,16 +261,27 @@ CREATE TABLE IF NOT EXISTS board_approvals(
 );
 CREATE TABLE IF NOT EXISTS publications(
   mission_id TEXT PRIMARY KEY,
+  task_id TEXT,
   branch TEXT,
   pushed_oid TEXT,
   pr_url TEXT,
   pr_number INTEGER,
   pr_head_oid TEXT,
+  pr_base_branch TEXT,
   receipt_url TEXT,
+  receipt_state TEXT NOT NULL DEFAULT 'NOT_STARTED',
   proof_published INTEGER NOT NULL DEFAULT 0,
   attestation_state TEXT NOT NULL DEFAULT 'NOT_STARTED',
+  attestation_url TEXT,
+  attested_at TEXT,
+  attestation_error TEXT,
+  submitted_at TEXT,
+  status_state TEXT NOT NULL DEFAULT 'NOT_STARTED',
+  status_url TEXT,
+  status_error TEXT,
   publication_state TEXT NOT NULL DEFAULT 'APPROVED',
   last_error TEXT,
+  last_error_detail TEXT,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(mission_id) REFERENCES ready_items(mission_id)
 );
@@ -279,7 +307,53 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     .run(String(FACTORY_SCHEMA_VERSION));
   connection.prepare("INSERT INTO factory_meta(key,value) VALUES('next_mission_number',?) ON CONFLICT(key) DO NOTHING")
     .run(String(missionStart));
-  const version = Number(connection.prepare("SELECT value FROM factory_meta WHERE key='schema_version'").get().value);
+  let version = Number(connection.prepare("SELECT value FROM factory_meta WHERE key='schema_version'").get().value);
+  if (version === 1) {
+    const columns = new Set(connection.prepare('PRAGMA table_info(publications)').all().map((row) => row.name));
+    const additions = [
+      ['task_id', 'TEXT'],
+      ['pr_base_branch', 'TEXT'],
+      ['receipt_state', "TEXT NOT NULL DEFAULT 'NOT_STARTED'"],
+      ['attestation_url', 'TEXT'],
+      ['attested_at', 'TEXT'],
+      ['attestation_error', 'TEXT'],
+      ['submitted_at', 'TEXT'],
+      ['status_state', "TEXT NOT NULL DEFAULT 'NOT_STARTED'"],
+      ['status_url', 'TEXT'],
+      ['status_error', 'TEXT'],
+      ['last_error_detail', 'TEXT'],
+    ];
+    connection.exec('BEGIN IMMEDIATE');
+    try {
+      for (const [name, definition] of additions) {
+        if (!columns.has(name)) connection.exec(`ALTER TABLE publications ADD COLUMN ${name} ${definition}`);
+      }
+      connection.prepare("UPDATE factory_meta SET value='2' WHERE key='schema_version'").run();
+      connection.exec('COMMIT');
+      version = 2;
+    } catch (error) {
+      connection.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  if (version === 2) {
+    const columns = new Set(connection.prepare('PRAGMA table_info(board_items)').all().map((row) => row.name));
+    connection.exec('BEGIN IMMEDIATE');
+    try {
+      if (!columns.has('manifest_sha256')) {
+        connection.exec("ALTER TABLE board_items ADD COLUMN manifest_sha256 TEXT NOT NULL DEFAULT ''");
+        connection.exec(`UPDATE board_items SET manifest_sha256=COALESCE(
+          (SELECT r.manifest_sha256 FROM ready_items r WHERE r.mission_id=board_items.mission_id),'')`);
+      }
+      connection.prepare("UPDATE factory_meta SET value=? WHERE key='schema_version'")
+        .run(String(FACTORY_SCHEMA_VERSION));
+      connection.exec('COMMIT');
+      version = FACTORY_SCHEMA_VERSION;
+    } catch (error) {
+      connection.exec('ROLLBACK');
+      throw error;
+    }
+  }
   if (version !== FACTORY_SCHEMA_VERSION) throw new Error(`unsupported factory schema version ${version}`);
 
   function transaction(operation) {
@@ -352,6 +426,24 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       connection.prepare(`INSERT INTO attempts(attempt_id,task_id,attempt_number,started_at,model)
         VALUES(?,?,?,?,?)`).run(attemptId, row.task_id, attemptNumber, startedAt, model);
       return {task: getTask(row.task_id), attempt: getAttempt(attemptId)};
+    });
+  }
+
+  function recoverWorkingTasks({now = new Date()} = {}) {
+    return transaction(() => {
+      const recoveredAt = iso(now);
+      const attempts = connection.prepare(`SELECT a.attempt_id,a.task_id FROM attempts a
+        JOIN tasks t ON t.task_id=a.task_id
+        WHERE t.state='WORKING' AND a.finished_at IS NULL`).all();
+      const finish = connection.prepare(`UPDATE attempts SET finished_at=?,outcome='FAILED',
+        failure_class='infrastructure',duration_ms=NULL WHERE attempt_id=? AND finished_at IS NULL`);
+      const requeue = connection.prepare(`UPDATE tasks SET state='QUEUED',worker_id=NULL,
+        last_error='recovered after interrupted worker',updated_at=? WHERE task_id=? AND state='WORKING'`);
+      for (const attempt of attempts) {
+        finish.run(recoveredAt, attempt.attempt_id);
+        requeue.run(recoveredAt, attempt.task_id);
+      }
+      return {recovered: attempts.length, task_ids: attempts.map((item) => item.task_id)};
     });
   }
 
@@ -450,13 +542,13 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       connection.prepare('INSERT INTO boards(board_id,board_digest,state,created_at) VALUES(?,?,?,?)')
         .run(boardId, boardDigest, 'OPEN', created);
       const add = connection.prepare(`INSERT INTO board_items(
-        board_id,mission_id,position,item_digest,manifest_json
-      ) VALUES(?,?,?,?,?)`);
+        board_id,mission_id,position,item_digest,manifest_sha256,manifest_json
+      ) VALUES(?,?,?,?,?,?)`);
       const bind = connection.prepare('UPDATE ready_items SET board_id=? WHERE mission_id=? AND board_id IS NULL');
       for (const [index, item] of items.entries()) {
         const result = bind.run(boardId, item.mission_id);
         if (result.changes !== 1) throw new Error(`${item.mission_id} is already on another board`);
-        add.run(boardId, item.mission_id, index + 1, item.item_digest, json(item.manifest));
+        add.run(boardId, item.mission_id, index + 1, item.item_digest, item.manifest_sha256, json(item.manifest));
       }
       return getBoard(boardDigest);
     });
@@ -470,6 +562,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
         mission_id: item.mission_id,
         position: item.position,
         item_digest: item.item_digest,
+        manifest_sha256: item.manifest_sha256,
         manifest: parseJson(item.manifest_json, {}),
         decision: item.decision,
       }));
@@ -558,23 +651,35 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
 
   function savePublication(missionId, patch = {}, {now = new Date()} = {}) {
     const current = getPublication(missionId) ?? {
-      mission_id: missionId, branch: null, pushed_oid: null, pr_url: null, pr_number: null,
-      pr_head_oid: null, receipt_url: null, proof_published: false,
-      attestation_state: 'NOT_STARTED', publication_state: 'APPROVED', last_error: null,
+      mission_id: missionId, task_id: null, branch: null, pushed_oid: null, pr_url: null, pr_number: null,
+      pr_head_oid: null, pr_base_branch: null, receipt_url: null, receipt_state: 'NOT_STARTED',
+      proof_published: false, attestation_state: 'NOT_STARTED', attestation_url: null,
+      attested_at: null, attestation_error: null, submitted_at: null, status_state: 'NOT_STARTED',
+      status_url: null, status_error: null, publication_state: 'APPROVED', last_error: null,
+      last_error_detail: null,
     };
     const next = {...current, ...patch, updated_at: iso(now)};
     connection.prepare(`INSERT INTO publications(
-      mission_id,branch,pushed_oid,pr_url,pr_number,pr_head_oid,receipt_url,proof_published,
-      attestation_state,publication_state,last_error,updated_at
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+      mission_id,task_id,branch,pushed_oid,pr_url,pr_number,pr_head_oid,pr_base_branch,
+      receipt_url,receipt_state,proof_published,attestation_state,attestation_url,attested_at,
+      attestation_error,submitted_at,status_state,status_url,status_error,publication_state,
+      last_error,last_error_detail,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(mission_id) DO UPDATE SET
-      branch=excluded.branch,pushed_oid=excluded.pushed_oid,pr_url=excluded.pr_url,
+      task_id=excluded.task_id,branch=excluded.branch,pushed_oid=excluded.pushed_oid,pr_url=excluded.pr_url,
       pr_number=excluded.pr_number,pr_head_oid=excluded.pr_head_oid,receipt_url=excluded.receipt_url,
+      pr_base_branch=excluded.pr_base_branch,receipt_state=excluded.receipt_state,
       proof_published=excluded.proof_published,attestation_state=excluded.attestation_state,
-      publication_state=excluded.publication_state,last_error=excluded.last_error,updated_at=excluded.updated_at`).run(
-      missionId, next.branch, next.pushed_oid, next.pr_url, next.pr_number, next.pr_head_oid,
-      next.receipt_url, next.proof_published ? 1 : 0, next.attestation_state,
-      next.publication_state, next.last_error, next.updated_at,
+      attestation_url=excluded.attestation_url,attested_at=excluded.attested_at,
+      attestation_error=excluded.attestation_error,submitted_at=excluded.submitted_at,
+      status_state=excluded.status_state,status_url=excluded.status_url,status_error=excluded.status_error,
+      publication_state=excluded.publication_state,last_error=excluded.last_error,
+      last_error_detail=excluded.last_error_detail,updated_at=excluded.updated_at`).run(
+      missionId, next.task_id, next.branch, next.pushed_oid, next.pr_url, next.pr_number, next.pr_head_oid,
+      next.pr_base_branch, next.receipt_url, next.receipt_state, next.proof_published ? 1 : 0,
+      next.attestation_state, next.attestation_url, next.attested_at, next.attestation_error,
+      next.submitted_at, next.status_state, next.status_url, next.status_error,
+      next.publication_state, next.last_error, next.last_error_detail, next.updated_at,
     );
     return getPublication(missionId);
   }
@@ -594,6 +699,36 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     const row = connection.prepare('SELECT * FROM repository_state WHERE lower(repository)=lower(?)').get(repository);
     if (!row) return null;
     return {...row};
+  }
+
+  function getPublicActionState({repository, owner = repository?.split('/')[0], now = new Date()} = {}) {
+    if (typeof repository !== 'string' || !repository.includes('/')) {
+      throw new Error('public action state requires repository owner/name');
+    }
+    const observed = now instanceof Date ? now : new Date(now);
+    if (!Number.isFinite(observed.getTime())) throw new Error('public action state timestamp is invalid');
+    const today = observed.toISOString().slice(0, 10);
+    const hourStart = new Date(observed.getTime() - 60 * 60_000).toISOString();
+    const repositoryState = getRepositoryState(repository) ?? {};
+    const counts = connection.prepare(`SELECT
+      sum(CASE WHEN lower(substr(t.repository,1,instr(t.repository,'/')-1))=lower(?) AND
+        substr(p.submitted_at,1,10)=? THEN 1 ELSE 0 END) AS owner_today,
+      sum(CASE WHEN p.submitted_at>=? THEN 1 ELSE 0 END) AS last_hour,
+      sum(CASE WHEN substr(p.submitted_at,1,10)=? THEN 1 ELSE 0 END) AS today
+      FROM publications p
+      JOIN ready_items r ON r.mission_id=p.mission_id
+      JOIN tasks t ON t.task_id=r.task_id
+      WHERE p.publication_state='SUBMITTED' AND p.submitted_at IS NOT NULL`).get(
+      owner, today, hourStart, today,
+    );
+    return {
+      ...repositoryState,
+      repository,
+      owner_login: owner,
+      owner_prs_today: Number(counts.owner_today ?? 0),
+      prs_last_hour: Number(counts.last_hour ?? 0),
+      prs_today: Number(counts.today ?? 0),
+    };
   }
 
   function setRepositoryState(repository, patch = {}, {now = new Date()} = {}) {
@@ -633,6 +768,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     getTask,
     listTasks,
     claimNextTask,
+    recoverWorkingTasks,
     getAttempt,
     finishAttempt,
     promoteVerified,
@@ -647,6 +783,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     getPublication,
     updateTaskState,
     getRepositoryState,
+    getPublicActionState,
     setRepositoryState,
     stats,
   };

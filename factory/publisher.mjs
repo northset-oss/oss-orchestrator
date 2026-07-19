@@ -68,34 +68,36 @@ function exactPlan(ready, immutable) {
   const manifest = manifestFor(ready);
   const snapshot = manifestFor(immutable);
   const id = requiredString(value(missionId(ready), missionId(immutable)), 'mission_id');
-  const repository = requiredString(value(manifest.repository, manifest.repo, manifest.target_repository,
-    snapshot.repository, snapshot.repo, snapshot.target_repository), `${id} repository`);
-  const forkRepository = requiredString(value(manifest.fork_repository, manifest.fork_repo,
-    snapshot.fork_repository, snapshot.fork_repo), `${id} fork_repository`);
-  const baseBranch = requiredString(value(manifest.base_branch, snapshot.base_branch), `${id} base_branch`);
-  const commitOid = requiredString(value(manifest.commit_oid, manifest.patch_commit,
-    snapshot.commit_oid, snapshot.patch_commit), `${id} commit_oid`);
-  const testedTreeOid = requiredString(value(manifest.tested_tree_oid, snapshot.tested_tree_oid),
+  const repository = requiredString(value(snapshot.repository, snapshot.repo, snapshot.target_repository),
+    `${id} repository`);
+  const forkRepository = requiredString(value(snapshot.fork_repository, snapshot.fork_repo),
+    `${id} fork_repository`);
+  const repositoryPath = requiredString(value(snapshot.repository_path, manifest.repository_path),
+    `${id} repository_path`);
+  const baseBranch = requiredString(snapshot.base_branch, `${id} base_branch`);
+  const commitOid = requiredString(value(snapshot.commit_oid, snapshot.patch_commit), `${id} commit_oid`);
+  const testedTreeOid = requiredString(snapshot.tested_tree_oid,
     `${id} tested_tree_oid`);
-  const patchSha256 = requiredString(value(manifest.patch_sha256, snapshot.patch_sha256), `${id} patch_sha256`);
-  const title = requiredString(value(manifest.pr_title, manifest.title, snapshot.pr_title, snapshot.title),
+  const patchSha256 = requiredString(snapshot.patch_sha256, `${id} patch_sha256`);
+  const title = requiredString(value(snapshot.pr_title, snapshot.title),
     `${id} approved PR title`);
-  const body = normalizePrBody(value(manifest.pr_body, manifest.body, snapshot.pr_body, snapshot.body));
-  const receiptClaim = value(manifest.receipt_claim, manifest.receipt_claim_text,
-    snapshot.receipt_claim, snapshot.receipt_claim_text);
+  const body = normalizePrBody(value(snapshot.pr_body, snapshot.body));
+  const receiptClaim = value(snapshot.receipt_claim, snapshot.receipt_claim_text);
   if ((typeof receiptClaim !== 'string' || !receiptClaim.trim()) &&
       (!receiptClaim || typeof receiptClaim !== 'object' || Array.isArray(receiptClaim))) {
     throw new Error(`${id} receipt claim is required`);
   }
-  const branch = requiredString(value(manifest.branch, snapshot.branch, `northset/${id.toLowerCase()}`),
+  const branch = requiredString(value(snapshot.branch, `northset/${id.toLowerCase()}`),
     `${id} branch`);
-  const taskId = requiredString(value(ready.task_id, manifest.task_id, immutable.task_id, snapshot.task_id),
+  const receiptUrl = requiredString(snapshot.receipt_url, `${id} receipt_url`);
+  const taskId = requiredString(value(immutable.task_id, snapshot.task_id),
     `${id} task_id`);
   return {
     mission_id: id,
     task_id: taskId,
     repository,
     fork_repository: forkRepository,
+    repository_path: repositoryPath,
     base_branch: baseBranch,
     commit_oid: commitOid,
     tested_tree_oid: testedTreeOid,
@@ -103,8 +105,9 @@ function exactPlan(ready, immutable) {
     pr_title: title,
     pr_body: body,
     receipt_claim: receiptClaim,
+    receipt_url: receiptUrl,
     branch,
-    manifest,
+    manifest: snapshot,
   };
 }
 
@@ -210,7 +213,7 @@ function cooldownReason(repositoryState, now) {
 }
 
 function openPrCapReached(repositoryState) {
-  const open = Number(value(repositoryState.open_northset_prs, repositoryState.openNorthsetPrs, 0));
+  const open = Number(value(repositoryState?.open_northset_prs, repositoryState?.openNorthsetPrs, 0));
   return Number.isFinite(open) && open >= 1;
 }
 
@@ -247,6 +250,7 @@ async function publishOne(plan, {db, github, safety, now, repositoryState}) {
       upstream_repository: plan.repository,
       branch: plan.branch,
       oid: plan.commit_oid,
+      repository_path: plan.repository_path,
       force: false,
     });
     const pushedOid = value(pushed?.oid, pushed?.commit_oid, plan.commit_oid);
@@ -326,6 +330,14 @@ async function publishOne(plan, {db, github, safety, now, repositoryState}) {
     last_error_detail: null,
   }, `${plan.mission_id} submission`);
   await db.updateTaskState(plan.task_id, 'PR_OPENED');
+  if (typeof db.setRepositoryState === 'function') {
+    const latest = await db.getRepositoryState(plan.repository) ?? {};
+    await db.setRepositoryState(plan.repository, {
+      open_northset_prs: Number(latest.open_northset_prs ?? 0) + 1,
+      opened_today: Number(latest.opened_today ?? 0) + 1,
+      last_pr_at: timestamp(now),
+    });
+  }
   return {mission_id: plan.mission_id, state: 'SUBMITTED', pr_number: stored.number, pr_url: stored.url};
 }
 
@@ -339,6 +351,7 @@ export async function publishBoard(boardDigest, {
 } = {}) {
   if (!db) throw new TypeError('db is required');
   if (!github) throw new TypeError('github is required');
+  if (!safety || typeof safety.request !== 'function') throw new TypeError('GitHub safety queue is required');
   if (typeof liveRecheck !== 'function') throw new TypeError('liveRecheck is required');
   if (typeof receiptPublisher !== 'function') throw new TypeError('receiptPublisher is required');
   const board = await db.getBoard(boardDigest);
@@ -352,7 +365,6 @@ export async function publishBoard(boardDigest, {
   if (!approved.length) return {board_digest: boardDigest, results: []};
   const immutableById = new Map(boardItems(board).map((item) => [missionId(item), item]));
   const eligible = [];
-  const repositoryStates = new Map();
   const results = [];
 
   for (const id of approved) {
@@ -360,6 +372,10 @@ export async function publishBoard(boardDigest, {
     const ready = await db.getReadyItem(id);
     if (!immutable || !ready) {
       results.push({mission_id: id, state: 'FAILED', code: 'APPROVED_ITEM_MISSING'});
+      continue;
+    }
+    if (value(ready.approval_state, 'APPROVED') !== 'APPROVED') {
+      results.push({mission_id: id, state: 'FAILED', code: 'ITEM_NOT_APPROVED'});
       continue;
     }
     let plan;
@@ -370,8 +386,11 @@ export async function publishBoard(boardDigest, {
     }
     const immutableDigest = itemDigest(immutable);
     const currentDigest = itemDigest(ready);
+    const immutableManifestSha = value(immutable.manifest_sha256, immutable.manifest_digest);
+    const currentManifestSha = value(ready.manifest_sha256, ready.manifest_digest);
     const approvedDigest = approvalDigestFor(approval, id);
     if (!immutableDigest || immutableDigest !== currentDigest ||
+        !immutableManifestSha || immutableManifestSha !== currentManifestSha ||
         (approvedDigest !== null && approvedDigest !== immutableDigest)) {
       results.push(await failItem(db, plan, 'APPROVAL_INVALIDATED',
         'the current READY item no longer matches its immutable approved bytes'));
@@ -383,23 +402,20 @@ export async function publishBoard(boardDigest, {
       results.push(await failItem(db, plan, 'PUBLICATION_REPOSITORY_BLOCKED', blocked));
       continue;
     }
-    const live = await liveRecheck(plan);
-    if (!live?.clean) {
-      results.push(await failItem(db, plan, 'STALE_OR_OCCUPIED',
-        live?.reason ?? 'final live recheck was not clean', 'SUPERSEDED'));
-      continue;
-    }
-    eligible.push(plan);
-    repositoryStates.set(plan.mission_id, repoState);
+    eligible.push({...plan, approval_digest: approval.approval_digest});
   }
 
   if (eligible.length) {
-    const receipts = await receiptPublisher(eligible.map((plan) => ({...plan})));
+    const receipts = await throughSafety(safety, 'git_push', 'publish_receipt_batch', {},
+      () => receiptPublisher(eligible.map((plan) => ({...plan}))));
     for (const plan of eligible) {
       const receipt = receiptFor(receipts, plan.mission_id);
       if (!receipt) throw new Error(`receipt publisher omitted ${plan.mission_id}`);
       const receiptUrl = requiredString(value(receipt.receipt_url, receipt.url),
         `${plan.mission_id} published receipt URL`);
+      if (receiptUrl !== plan.receipt_url) {
+        throw new Error(`${plan.mission_id} receipt publisher returned ${receiptUrl}, expected ${plan.receipt_url}`);
+      }
       await db.savePublication(plan.mission_id, {
         mission_id: plan.mission_id,
         task_id: plan.task_id,
@@ -412,8 +428,17 @@ export async function publishBoard(boardDigest, {
 
   for (const plan of eligible) {
     try {
+      const live = await throughSafety(safety, 'read', 'final_live_recheck', {
+        repository: plan.repository,
+      }, () => liveRecheck(plan));
+      if (!live?.clean) {
+        results.push(await failItem(db, plan, 'STALE_OR_OCCUPIED',
+          live?.reason ?? 'final live recheck was not clean', 'SUPERSEDED'));
+        continue;
+      }
       results.push(await publishOne(plan, {
-        db, github, safety, now, repositoryState: repositoryStates.get(plan.mission_id),
+        db, github, safety, now,
+        repositoryState: live.repository_state ?? await db.getRepositoryState(plan.repository),
       }));
     } catch (error) {
       if (isPaused(error)) throw error;
