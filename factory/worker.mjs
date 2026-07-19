@@ -97,9 +97,10 @@ export function finalizePrBody(body, missionId, receiptUrl) {
   return `${rendered}\n`;
 }
 
-function defaultManifest(task, authorResult, verification, missionId) {
+export function buildReadyManifest(task, authorResult, verification, missionId) {
   const receiptUrl = receiptUrlFor(missionId, verification.commit_oid);
   const body = finalizePrBody(authorResult.pr_body, missionId, receiptUrl);
+  const verifiedCommand = verification.patched_observation?.command ?? authorResult.test_command;
   const manifest = {
     repository: task.repository,
     fork_repository: authorResult.fork_repository ?? task.live_state?.fork_repository ?? null,
@@ -116,7 +117,7 @@ function defaultManifest(task, authorResult, verification, missionId) {
     patch_sha256: verification.patch_sha256,
     tested_tree_oid: verification.tested_tree_oid,
     commit_oid: verification.commit_oid,
-    checks: authorResult.checks ?? [authorResult.test_command].filter(Boolean),
+    checks: [verifiedCommand].filter(Boolean),
     test_command: authorResult.test_command,
     install_command: authorResult.install_command ?? null,
     test_only_paths: authorResult.test_only_paths ?? [],
@@ -187,6 +188,35 @@ function assertVerification(verification) {
   }
 }
 
+export function assertPublicVerificationClaims(authored, verification) {
+  const command = verification?.patched_observation?.command;
+  if (typeof command !== 'string' || !command.trim()) return;
+  const contradictory = /\b(?:could not|couldn't|did not run|was not run|not run|blocked|unavailable|failed to (?:start|run))\b/i;
+  const line = String(authored?.pr_body ?? '').split(/\r?\n/)
+    .find((candidate) => candidate.includes(command) && contradictory.test(candidate));
+  if (line) {
+    throw new Error('PR body says the clean verifier command did not run, but its patched observation passed');
+  }
+}
+
+export function assertDeclaredTestsExecuted(authored, verification) {
+  if (!['regression_fix', 'feature_implementation', 'coverage_addition']
+    .includes(verification?.claim_type)) return;
+  const testPaths = Array.isArray(authored?.test_only_paths) ? authored.test_only_paths : [];
+  if (!testPaths.length) return;
+  const command = verification?.patched_observation?.command;
+  if (typeof command !== 'string' || !command.trim()) {
+    throw new Error('clean verifier omitted the command that should exercise the declared tests');
+  }
+  const namesDeclared = testPaths.some((testPath) =>
+    command.includes(testPath) || command.includes(path.posix.basename(testPath)));
+  const runsRepositorySuite = /(?:^|\s)(?:npm(?:\s+run)?|yarn|pnpm|bun)\s+test(?:\s|$)/.test(command) ||
+    /(?:^|\s)node\s+--test\s*$/.test(command.trim());
+  if (!namesDeclared && !runsRepositorySuite) {
+    throw new Error('clean verifier command must execute a declared test-only path or a repository test suite');
+  }
+}
+
 async function processClaim(claim, {
   db,
   driver,
@@ -245,6 +275,8 @@ async function processClaim(claim, {
         const verification = await semaphores.verifier.run(() => oneInfrastructureRetry(() =>
           driver.verify(task, checkout, scout, authored, {dependencyMaterial})));
         assertVerification(verification);
+        assertPublicVerificationClaims(authored, verification);
+        assertDeclaredTestsExecuted(authored, verification);
         const artifacts = await driver.persist?.(task, checkout, {
           attempt,
           authored,
@@ -276,7 +308,7 @@ async function processClaim(claim, {
           return {task_id: task.task_id, state: 'SKIPPED', reason: 'RED'};
         }
         const ready = db.finishVerifiedReady(attempt.attempt_id,
-          (missionId) => defaultManifest(task, publishable, verification, missionId),
+          (missionId) => buildReadyManifest(task, publishable, verification, missionId),
           {
             durationMs: now().getTime() - began,
             patchSha256: verification.patch_sha256,

@@ -53,6 +53,7 @@ function graphRepository(number = 1, overrides = {}) {
     isArchived: false,
     isFork: false,
     defaultBranchRef: {name: 'main', target: {oid: OID}},
+    rootPackage: {byteSize: 1_024, text: '{"scripts":{"test":"node --test"}}'},
     issue: {
       id: `I_${number}`,
       number,
@@ -76,7 +77,8 @@ function normalizedLive(overrides = {}) {
     candidate: candidate(),
     repository: {
       nodeId: 'R_1', nameWithOwner: 'Owner/Repo1', archived: false, fork: false,
-      defaultBranch: 'main', defaultOid: OID, northsetOpenPrs: 0,
+      defaultBranch: 'main', defaultOid: OID, hasRootPackageJson: true,
+      unsupportedNodeLayout: null, northsetOpenPrs: 0,
     },
     issue: {
       nodeId: 'I_1', number: 1, title: 'Fix parser regression', body: 'Expected differs from actual.',
@@ -161,9 +163,10 @@ test('attempt history can reorder the initial mechanical ranking', async () => {
 
 test('preflight query consolidates all live fields and repository-wide Northset PR search', () => {
   const query = buildPreflightQuery([candidate()]);
-  for (const expected of ['isArchived', 'isFork', 'defaultBranchRef', 'assignees', 'labels', 'comments', 'timelineItems']) {
+  for (const expected of ['isArchived', 'isFork', 'defaultBranchRef', 'rootPackage', 'assignees', 'labels', 'comments', 'timelineItems']) {
     assert.match(query, new RegExp(expected));
   }
+  assert.match(query, /rootPackage: object[\s\S]*\.\.\. on Blob \{ byteSize text \}/);
   assert.match(query, /repo:owner\/repo1 is:pr is:open author:AysajanE/);
 });
 
@@ -178,6 +181,10 @@ test('each hard live-preflight violation returns SKIP', async (t) => {
     ['external assignment', normalizedLive({issue: {assignees: ['someone']}}), /assigned/],
     ['missing invitation', normalizedLive({issue: {labels: []}}), /invitation/],
     ['archived repository', normalizedLive({repository: {archived: true}}), /archived/],
+    ['missing root package', normalizedLive({repository: {hasRootPackageJson: false}}), /root package\.json/],
+    ['unsupported workspace', normalizedLive({repository: {
+      unsupportedNodeLayout: 'multi-package workspaces are outside the single-package Node lane',
+    }}), /multi-package workspaces/],
     ['Northset open PR', normalizedLive({repository: {northsetOpenPrs: 1}}), /Northset already/],
     ['linked open PR', normalizedLive({issue: {crossReferencedPrs: [{state: 'OPEN', url: 'https://github.com/o/r/pull/2'}]}}), /linked open PR/],
     ['external claimant', normalizedLive({issue: {comments: [claim]}}), /claimant/],
@@ -219,6 +226,32 @@ test('live preflight makes exactly one GraphQL call and respects the default 2x 
   assert.equal(calls, 1);
   assert.equal(results.length, 2);
   assert.deepEqual(results.map((result) => result.outcome), ['GO', 'GO']);
+});
+
+test('live preflight rejects workspace metadata from the root package without a worker attempt', async () => {
+  const repository = graphRepository(1, {
+    rootPackage: {byteSize: 100, text: '{"workspaces":["packages/*"]}'},
+  });
+  const [result] = await preflightCandidates([candidate(1)], {
+    github: {graphql: async () => ({data: {c0: repository, n0: {issueCount: 0}}})},
+    workers: 1,
+    now: NOW,
+  });
+  assert.equal(result.outcome, 'SKIP');
+  assert.match(result.reasons.join(' '), /multi-package workspaces/);
+});
+
+test('live preflight rejects Yarn Berry declared by the root package', async () => {
+  const repository = graphRepository(1, {
+    rootPackage: {byteSize: 100, text: '{"packageManager":"yarn@4.9.2"}'},
+  });
+  const [result] = await preflightCandidates([candidate(1)], {
+    github: {graphql: async () => ({data: {c0: repository, n0: {issueCount: 0}}})},
+    workers: 1,
+    now: NOW,
+  });
+  assert.equal(result.outcome, 'SKIP');
+  assert.match(result.reasons.join(' '), /Yarn Berry/);
 });
 
 test('enqueue sends only GO tasks and never allocates a public mission ID', async () => {

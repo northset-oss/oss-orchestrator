@@ -21,6 +21,7 @@ import {
   dependencyCacheKey,
   verifyContribution,
 } from './verifier.mjs';
+import {removeWorkTree} from './worker.mjs';
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const DEFAULT_AUTHOR_IMAGE = process.env.OSS_AUTHOR_IMAGE ?? 'northset-oss-author:0.144.1';
@@ -389,6 +390,8 @@ Implement the smallest repository-native direct fix. Work only in this checkout.
 the host creates the canonical DCO commit. Do not edit dependencies, lockfiles, CI, releases,
 generated output, or pull-request templates. For regression_fix, add or identify a focused
 test-only delta that fails on the clean base and report an exact non-empty output marker. For
+feature_implementation, add a focused behavior test that fails on the clean base and report an exact
+non-empty output marker without describing the missing new behavior as a regression. For
 coverage_addition, report the added test paths; those tests must pass on both base and patched code.
 For existing_check_repair or test_infrastructure_fix, the declared existing check must fail on base.
 Run the focused check after the fix. If an honest, bounded patch is not possible, return SKIP.
@@ -416,16 +419,16 @@ function assertAuthor(result) {
   result.test_only_paths = safeRelativePaths(result.test_only_paths ?? [], 'author test_only_paths');
   result.checks = (result.checks ?? []).map(String).filter((item) => item.trim());
   if (!result.checks.length) result.checks = [result.test_command];
-  if (result.claim_type === 'regression_fix') {
-    if (!result.test_only_paths.length) throw new Error('regression fix requires a test-only path');
+  if (['regression_fix', 'feature_implementation'].includes(result.claim_type)) {
+    if (!result.test_only_paths.length) throw new Error(`${result.claim_type} requires a test-only path`);
     if (!String(result.base_failure_contains ?? '').trim()) {
-      throw new Error('regression fix requires an exact base failure marker');
+      throw new Error(`${result.claim_type} requires an exact base failure marker`);
     }
   }
   if (result.claim_type === 'coverage_addition' && !result.test_only_paths.length) {
     throw new Error('coverage addition requires a test-only path');
   }
-  if (['regression_fix', 'coverage_addition'].includes(result.claim_type) &&
+  if (['regression_fix', 'feature_implementation', 'coverage_addition'].includes(result.claim_type) &&
     result.test_only_paths.some((file) => !/(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^/]+$/i.test(file))) {
     throw new Error(`${result.claim_type} test-only delta includes a non-test path`);
   }
@@ -597,6 +600,7 @@ export function createNodeWorker({
   run = runBounded,
   codexRunner = (options) => defaultCodexRunner({...options, run}),
   verifier = verifyContribution,
+  removeTree = removeWorkTree,
   image = DEFAULT_AUTHOR_IMAGE,
   model = DEFAULT_MODEL,
   codexHomeSource,
@@ -732,8 +736,9 @@ export function createNodeWorker({
       throw new Error('verify requires the canonical authored commit and patch');
     }
     const claimType = payload.authored.claim_type;
-    if (claimType === 'regression_fix' && !String(payload.authored.base_failure_contains ?? '').trim()) {
-      throw new Error('regression fix requires an exact base failure marker');
+    if (['regression_fix', 'feature_implementation'].includes(claimType) &&
+        !String(payload.authored.base_failure_contains ?? '').trim()) {
+      throw new Error(`${claimType} requires an exact base failure marker`);
     }
     const base = await detachedBase(run, payload.checkout, payload.task.base_oid);
     try {
@@ -786,7 +791,8 @@ export function createNodeWorker({
         dependency_image_digest: dependency.image_digest ?? null,
       };
     } finally {
-      await rm(base.root, {recursive: true, force: true});
+      const removed = await removeTree(base.root, {tolerateBusy: true});
+      if (!removed) process.stderr.write(`node-worker cleanup deferred for busy base tree ${base.root}\n`);
     }
   }
 
@@ -810,10 +816,12 @@ export function createNodeWorker({
     );
     const baseFailureContains = verificationMetadata.base_failure_contains ??
       manifest.base_failure_contains ?? '';
-    if (claimType === 'regression_fix' && !String(baseFailureContains).trim()) {
-      throw new Error('refresh regression fix requires the persisted base failure marker');
+    if (['regression_fix', 'feature_implementation'].includes(claimType) &&
+        !String(baseFailureContains).trim()) {
+      throw new Error(`refresh ${claimType} requires the persisted base failure marker`);
     }
-    if (['regression_fix', 'coverage_addition'].includes(claimType) && !testOnlyPaths.length) {
+    if (['regression_fix', 'feature_implementation', 'coverage_addition'].includes(claimType) &&
+        !testOnlyPaths.length) {
       throw new Error(`refresh ${claimType} requires persisted test-only paths`);
     }
     const patchFile = path.resolve(payload.patch_file ?? path.join(path.dirname(payload.checkout), 'change.patch'));

@@ -137,6 +137,17 @@ test('V2 existing check repair records an existing failure and patched success',
   assert.equal(result.claim_type, 'existing_check_repair');
 });
 
+test('invited feature implementation records missing base behavior without a regression claim', async (t) => {
+  const fixture = await makeGitFixture(t);
+  const result = await verifyContribution(input(fixture, 'feature_implementation'), {
+    runContainer: fakeRunner(),
+  });
+  assert.equal(result.base_observation.exit_code, 1);
+  assert.equal(result.patched_observation.exit_code, 0);
+  assert.equal(result.claim_type, 'feature_implementation');
+  assert.equal(result.base_observation.expected_result, 'failure');
+});
+
 test('V3 coverage addition records two passes without a runtime defect claim', async (t) => {
   const fixture = await makeGitFixture(t);
   const result = await verifyContribution(input(fixture, 'coverage_addition'), {

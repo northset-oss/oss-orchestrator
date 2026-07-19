@@ -254,6 +254,7 @@ test('N4 only recognizable Docker or registry bootstrap failures are retryable',
 test('N5 direct author produces a host DCO commit and clean verifier proves base-red patched-green', async (t) => {
   const {checkout, baseOid, task} = await repository(t);
   const dockerCalls = [];
+  let deferredBaseRoot = null;
   const run = async (command, args, options = {}) => {
     if (command !== 'docker') return runBounded(command, args, options);
     assert.equal(args[0], 'run');
@@ -277,7 +278,15 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
     mounts: [{source: 'northset-deps-fixture', target: '/workspace/node_modules', readOnly: true}],
   };
   let authorInvocation;
-  const worker = createNodeWorker({run, image: IMAGE, codexRunner: async (options) => {
+  const worker = createNodeWorker({
+    run,
+    image: IMAGE,
+    removeTree: async (root, options) => {
+      assert.deepEqual(options, {tolerateBusy: true});
+      deferredBaseRoot = root;
+      return false;
+    },
+    codexRunner: async (options) => {
     assert.equal(options.schema, AUTHOR_SCHEMA);
     authorInvocation = options;
     await mkdir(path.join(checkout, 'test'));
@@ -298,7 +307,8 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
       test_only_paths: ['test/value.test.mjs'], base_failure_contains: 'BASE_MARKER_EXPECTED_TWO',
       checks: ['node --test test/value.test.mjs'],
     };
-  }});
+    },
+  });
   const authored = await worker.handle({
     action: 'author', task, checkout,
     scout: {decision: 'GO', test_command: 'node --test test/value.test.mjs', estimated_risk: 'GREEN'},
@@ -308,6 +318,8 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
   assert.equal(authorInvocation.timeoutMs, 10 * 60_000);
   assert.equal(authorInvocation.dependencyMaterial, dependencyMaterial);
   assert.equal(authorInvocation.image, IMAGE_DIGEST);
+  assert.match(authorInvocation.prompt, /feature_implementation/);
+  assert.ok(AUTHOR_SCHEMA.properties.claim_type.enum.includes('feature_implementation'));
   assert.equal(await git(['-C', checkout, 'rev-parse', 'HEAD^']), baseOid);
   assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');
   const identity = await git(['-C', checkout, 'show', '-s', '--format=%an%n%ae%n%ce%n%B', 'HEAD']);
@@ -341,6 +353,8 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
     assert.match(joined, /src=northset-deps-fixture,dst=\/workspace\/node_modules,readonly/);
     assert.equal(call.args.at(-4), IMAGE_DIGEST);
   }
+  assert.match(path.basename(deferredBaseRoot), /^\.northset-base-/);
+  await rm(deferredBaseRoot, {recursive: true, force: true});
 
   await worker.handle({action: 'reset', task, checkout, authored});
   assert.equal(await git(['-C', checkout, 'rev-parse', 'HEAD']), baseOid);

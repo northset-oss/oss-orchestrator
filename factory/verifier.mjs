@@ -7,6 +7,7 @@ import {canonical, sha256} from './db.mjs';
 
 export const CLAIM_TYPES = Object.freeze([
   'regression_fix',
+  'feature_implementation',
   'existing_check_repair',
   'coverage_addition',
   'test_infrastructure_fix',
@@ -303,13 +304,13 @@ export async function verifyContribution(input, {
     finishedAt: patchedFinishedAt,
   });
   assertClaimObservations(input.claimType, baseObservation, patchedObservation);
-  if (input.claimType === 'regression_fix') {
+  if (['regression_fix', 'feature_implementation'].includes(input.claimType)) {
     if (typeof input.baseFailureContains !== 'string' || !input.baseFailureContains.trim()) {
-      throw new Error('regression fix requires an exact base failure marker');
+      throw new Error(`${input.claimType} requires an exact base failure marker`);
     }
     const output = `${baseResult.stdout ?? ''}\n${baseResult.stderr ?? ''}`;
     if (!output.includes(input.baseFailureContains)) {
-      throw new Error('base observation did not contain the declared regression failure marker');
+      throw new Error('base observation did not contain the declared failure marker');
     }
   }
   const after = await inspectTree(input.patchedCheckout);

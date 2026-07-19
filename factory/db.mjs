@@ -828,6 +828,72 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     });
   }
 
+  function replaceVerifiedReady(missionId, manifestDraft, {
+    durationMs = null, patchSha256 = null, commitOid = null, verification = null,
+    riskTier = 'GREEN', model = null, now = new Date(),
+  } = {}) {
+    if (!['GREEN', 'AMBER', 'RED'].includes(riskTier)) throw new Error('risk tier must be GREEN, AMBER, or RED');
+    return transaction(() => {
+      const current = getReadyItem(missionId);
+      if (!current) throw new Error(`unknown mission ${missionId}`);
+      if (current.approval_state !== 'REJECTED') {
+        throw new Error('only a rejected READY item can be replaced');
+      }
+      if (getPublication(missionId)) throw new Error('a published mission cannot be replaced');
+      const board = current.board_id ? getBoard(current.board_id) : null;
+      if (board?.state === 'OPEN') throw new Error('the previous READY board must be closed before replacement');
+      const task = connection.prepare('SELECT * FROM tasks WHERE task_id=?').get(current.task_id);
+      if (!task || task.state !== 'REJECTED_BY_OWNER') {
+        throw new Error('only an owner-rejected task can receive replacement verified bytes');
+      }
+
+      const readyAt = iso(now);
+      const attemptId = randomUUID();
+      const attemptNumber = Number(task.attempt_count) + 1;
+      connection.prepare(`INSERT INTO attempts(
+        attempt_id,task_id,attempt_number,started_at,finished_at,model,outcome,failure_class,
+        duration_ms,patch_sha256,commit_oid,verification_json
+      ) VALUES(?,?,?,?,?,?,'VERIFIED',NULL,?,?,?,?)`).run(
+        attemptId, task.task_id, attemptNumber, readyAt, readyAt, model,
+        durationMs, patchSha256, commitOid, verification === null ? null : json(verification),
+      );
+      const suppliedManifest = typeof manifestDraft === 'function'
+        ? manifestDraft(missionId, mapTask(task), getAttempt(attemptId))
+        : manifestDraft;
+      if (!suppliedManifest || typeof suppliedManifest !== 'object') {
+        throw new Error('READY replacement requires a manifest object');
+      }
+      const manifest = {
+        schema_version: 1,
+        ...suppliedManifest,
+        mission_id: missionId,
+        task_id: task.task_id,
+        repository: suppliedManifest.repository ?? task.repository,
+        issue_number: suppliedManifest.issue_number ?? task.issue_number,
+        base_oid: suppliedManifest.base_oid ?? task.base_oid,
+        risk_tier: riskTier,
+        ready_at: readyAt,
+      };
+      manifest.pr_body = normalizePrBody(manifest.pr_body);
+      const manifestSha = sha256(Buffer.from(canonical(manifest), 'utf8'));
+      const itemDigest = readyItemDigest(manifest);
+      const replaced = connection.prepare(`UPDATE ready_items SET
+        attempt_id=?,manifest_sha256=?,item_digest=?,manifest_json=?,risk_tier=?,ready_at=?,
+        board_id=NULL,approval_state='PENDING'
+        WHERE mission_id=? AND task_id=? AND approval_state='REJECTED'`).run(
+        attemptId, manifestSha, itemDigest, json(manifest), riskTier, readyAt,
+        missionId, task.task_id,
+      );
+      if (replaced.changes !== 1) throw new Error('READY replacement lost its rejected mission binding');
+      const updated = connection.prepare(`UPDATE tasks SET state='READY',attempt_count=?,last_error=NULL,
+        worker_id=NULL,updated_at=? WHERE task_id=? AND state='REJECTED_BY_OWNER'`).run(
+        attemptNumber, readyAt, task.task_id,
+      );
+      if (updated.changes !== 1) throw new Error('READY replacement lost its rejected task binding');
+      return getReadyItem(missionId);
+    });
+  }
+
   function savePublication(missionId, patch = {}, {now = new Date()} = {}) {
     const current = getPublication(missionId) ?? {
       mission_id: missionId, task_id: null, branch: null, pushed_oid: null, pr_url: null, pr_number: null,
@@ -1048,6 +1114,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     approveBoard,
     getBoardApproval,
     replaceReadyManifest,
+    replaceVerifiedReady,
     savePublication,
     getPublication,
     listPublications,

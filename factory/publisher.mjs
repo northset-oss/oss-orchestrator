@@ -465,6 +465,13 @@ export async function publishBoard(boardDigest, {
       results.push({mission_id: id, state: 'FAILED', code: 'APPROVED_ITEM_MISSING'});
       continue;
     }
+    const approvedBoardId = value(board.board_id, board.boardId);
+    const currentBoardId = value(ready.board_id, ready.boardId);
+    if (approvedBoardId && currentBoardId && approvedBoardId !== currentBoardId) {
+      results.push({mission_id: id, state: 'SKIPPED', code: 'APPROVAL_SUPERSEDED',
+        detail: `the current READY item belongs to corrected board ${currentBoardId}`});
+      continue;
+    }
     const priorPublication = await db.getPublication(id);
     if (priorPublication?.publication_state === 'SUPERSEDED') {
       results.push({mission_id: id, state: 'SUPERSEDED', code: 'APPROVAL_TERMINAL',

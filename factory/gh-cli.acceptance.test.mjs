@@ -126,33 +126,27 @@ test('H3 transport bounds timeout and aggregate subprocess output', async (t) =>
 test('H3b git clone binds an absolute checkout to the requested base OID', async (t) => {
   const directory = await temporary(t, 'factory-git-clone');
   const log = path.join(directory, 'git-calls.log');
-  const fetched = path.join(directory, 'fetched');
   const oid = '9'.repeat(40);
   const fakeGit = await executable(directory, 'fake-git.mjs', `
-    import {appendFile, mkdir, writeFile} from 'node:fs/promises';
-    import {existsSync} from 'node:fs';
+    import {appendFile, mkdir} from 'node:fs/promises';
     const args = process.argv.slice(2);
     await appendFile(process.env.FAKE_GIT_LOG, JSON.stringify(args) + '\\n');
-    if (args[0] === 'clone') await mkdir(args.at(-1), {recursive: true});
-    if (args.includes('rev-parse') && args.at(-1).endsWith('^{commit}') && !existsSync(process.env.FAKE_FETCHED)) {
-      process.exit(1);
-    }
-    if (args.includes('fetch')) await writeFile(process.env.FAKE_FETCHED, 'yes');
+    if (args[0] === 'init') await mkdir(args.at(-1), {recursive: true});
     if (args.includes('rev-parse')) process.stdout.write(process.env.FAKE_BASE_OID + '\\n');
   `);
   const destination = path.join(directory, 'checkout');
   const transport = createGhCliTransport({gitExecutable: fakeGit,
-    env: {...process.env, FAKE_GIT_LOG: log, FAKE_BASE_OID: oid, FAKE_FETCHED: fetched}});
+    env: {...process.env, FAKE_GIT_LOG: log, FAKE_BASE_OID: oid}});
   const result = await transport({operation: 'git_clone', repository: 'upstream/project',
     destination, base_oid: oid});
   assert.equal(result.repository_path, destination);
   assert.equal(result.base_oid, oid);
   assert.equal(result.head_oid, oid);
   const calls = (await readFile(log, 'utf8')).trim().split('\n').map(JSON.parse);
-  assert.deepEqual(calls[0], ['clone', '--no-tags', '--no-checkout', '--',
-    'https://github.com/upstream/project.git', destination]);
-  assert.deepEqual(calls[1], ['-C', destination, 'rev-parse', '--verify', `${oid}^{commit}`]);
-  assert.deepEqual(calls[2], ['-C', destination, 'fetch', '--no-tags', '--', 'origin', oid]);
+  assert.deepEqual(calls[0], ['init', '--quiet', destination]);
+  assert.deepEqual(calls[1], ['-C', destination, 'remote', 'add', 'origin',
+    'https://github.com/upstream/project.git']);
+  assert.deepEqual(calls[2], ['-C', destination, 'fetch', '--no-tags', '--depth=1', '--', 'origin', oid]);
   assert.deepEqual(calls[3], ['-C', destination, 'rev-parse', '--verify', `${oid}^{commit}`]);
   assert.deepEqual(calls[4], ['-C', destination, 'checkout', '--detach', oid]);
   assert.deepEqual(calls[5], ['-C', destination, 'rev-parse', '--verify', 'HEAD^{commit}']);
@@ -446,6 +440,9 @@ test('H10 reconciliation adapters read combined CI and GitHub artifact attestati
       if (request.path.endsWith(`/commits/${'b'.repeat(40)}/status`)) {
         return structured({state: 'success', total_count: 3, updated_at: '2026-07-19T13:01:00Z'});
       }
+      if (request.path.endsWith(`/commits/${'b'.repeat(40)}/check-runs?per_page=100`)) {
+        return structured({total_count: 0, check_runs: []});
+      }
       if (request.path.includes('/attestations/')) {
         return structured({attestations: [{
           html_url: 'https://github.com/northset-oss/verification-pilot/attestations/123',
@@ -474,7 +471,152 @@ test('H10 reconciliation adapters read combined CI and GitHub artifact attestati
   assert.equal(attestation.attestation_url,
     'https://github.com/northset-oss/verification-pilot/attestations/123');
   assert.equal(attestation.attested_at, '2026-07-19T13:02:00Z');
-  assert.match(requests[1].path, new RegExp(`attestations/sha256%3A${'a'.repeat(64)}$`));
+  assert.match(requests[2].path, new RegExp(`attestations/sha256%3A${'a'.repeat(64)}$`));
+});
+
+test('H10a reconciliation combines GitHub Check Runs with legacy commit statuses', async () => {
+  const oid = 'b'.repeat(40);
+  const transport = fakeTransport({
+    rest: async (request) => {
+      if (request.path.endsWith(`/commits/${oid}/status`)) {
+        return structured({state: 'success', total_count: 1, statuses: [{
+          state: 'success', updated_at: '2026-07-19T13:05:00Z',
+        }]});
+      }
+      if (request.path.endsWith(`/commits/${oid}/check-runs?per_page=100`)) {
+        return structured({total_count: 1, check_runs: [{
+          status: 'completed', conclusion: 'success', completed_at: '2026-07-19T13:04:00Z',
+        }]}, {headers: {'x-ratelimit-remaining': '4988'}});
+      }
+      throw new Error(`unexpected REST request ${request.path}`);
+    },
+    graphql: async () => structured({data: {}}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  assert.deepEqual(await github.getCommitStatus({repository: 'upstream/project', oid}), {
+    status: 200,
+    headers: {'x-ratelimit-remaining': '4988'},
+    found: true,
+    state: 'SUCCESS',
+    total_count: 2,
+    updated_at: '2026-07-19T13:05:00Z',
+  });
+});
+
+test('H10b reconciliation reads every Check Runs page before choosing a state', async () => {
+  const oid = 'b'.repeat(40);
+  const requests = [];
+  const transport = fakeTransport({
+    rest: async (request) => {
+      requests.push(request.path);
+      if (request.path.endsWith(`/commits/${oid}/status`)) {
+        return structured({state: 'success', total_count: 1});
+      }
+      if (request.path.endsWith(`/commits/${oid}/check-runs?per_page=100`)) {
+        return structured({total_count: 101, check_runs: Array.from({length: 100}, () => ({
+          status: 'completed', conclusion: 'success', completed_at: '2026-07-19T13:04:00Z',
+        }))});
+      }
+      if (request.path.endsWith(`/commits/${oid}/check-runs?per_page=100&page=2`)) {
+        return structured({total_count: 101, check_runs: [{
+          status: 'completed', conclusion: 'failure', completed_at: '2026-07-19T13:06:00Z',
+        }]}, {headers: {'x-ratelimit-remaining': '4980'}});
+      }
+      throw new Error(`unexpected REST request ${request.path}`);
+    },
+    graphql: async () => structured({data: {}}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  assert.deepEqual(await github.getCommitStatus({repository: 'upstream/project', oid}), {
+    status: 200,
+    headers: {'x-ratelimit-remaining': '4980'},
+    found: true,
+    state: 'FAILURE',
+    total_count: 102,
+    updated_at: '2026-07-19T13:06:00Z',
+  });
+  assert.equal(requests.length, 3);
+});
+
+test('H10c primary exhaustion stops before the Check Runs request', async () => {
+  let requests = 0;
+  const transport = fakeTransport({
+    rest: async () => {
+      requests += 1;
+      return structured({state: 'success', total_count: 1, statuses: [{
+        state: 'success', updated_at: '2026-07-19T13:05:00Z',
+      }]}, {headers: {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1784490000'}});
+    },
+    graphql: async () => structured({data: {}}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  assert.deepEqual(await github.getCommitStatus({repository: 'upstream/project', oid: 'b'.repeat(40)}), {
+    status: 200,
+    headers: {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1784490000'},
+    found: true,
+    state: 'PENDING',
+    total_count: 1,
+    updated_at: '2026-07-19T13:05:00Z',
+  });
+  assert.equal(requests, 1);
+});
+
+test('H10d primary exhaustion stops before the next Check Runs page', async () => {
+  const oid = 'b'.repeat(40);
+  let requests = 0;
+  const transport = fakeTransport({
+    rest: async (request) => {
+      requests += 1;
+      if (request.path.endsWith('/status')) return structured({state: 'success', total_count: 1});
+      if (request.path.endsWith('/check-runs?per_page=100')) {
+        return structured({total_count: 101, check_runs: Array.from({length: 100}, () => ({
+          status: 'completed', conclusion: 'success', completed_at: '2026-07-19T13:04:00Z',
+        }))}, {headers: {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1784490000'}});
+      }
+      throw new Error(`unexpected REST request ${request.path}`);
+    },
+    graphql: async () => structured({data: {}}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  const result = await github.getCommitStatus({repository: 'upstream/project', oid});
+  assert.equal(result.state, 'PENDING');
+  assert.equal(result.total_count, 102);
+  assert.equal(requests, 2);
+});
+
+test('H10e a failed Check Run overrides successful legacy statuses', async () => {
+  const oid = 'b'.repeat(40);
+  const transport = fakeTransport({
+    rest: async (request) => request.path.endsWith('/status')
+      ? structured({state: 'success', total_count: 1})
+      : structured({total_count: 1, check_runs: [{status: 'completed', conclusion: 'failure'}]}),
+    graphql: async () => structured({data: {}}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  const result = await github.getCommitStatus({repository: 'upstream/project', oid});
+  assert.equal(result.state, 'FAILURE');
+  assert.equal(result.total_count, 2);
+});
+
+test('H10f a failed status read stops before requesting Check Runs', async () => {
+  let requests = 0;
+  const transport = fakeTransport({
+    rest: async () => {
+      requests += 1;
+      return structured({message: 'secondary rate limit'}, {status: 403});
+    },
+    graphql: async () => structured({data: {}}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  await assert.rejects(() => github.getCommitStatus({repository: 'upstream/project', oid: 'b'.repeat(40)}),
+    (error) => error instanceof GhCliError && error.status === 403);
+  assert.equal(requests, 1);
 });
 
 test('H11 missing combined status or attestation remains factual and pending', async () => {

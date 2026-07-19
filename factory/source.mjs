@@ -176,6 +176,9 @@ export function buildPreflightQuery(candidates, {northsetLogin = 'AysajanE'} = {
         isArchived
         isFork
         defaultBranchRef { name target { ... on Commit { oid } } }
+        rootPackage: object(expression: "HEAD:package.json") {
+          ... on Blob { byteSize text }
+        }
         issue(number: ${issueNumber}) {
           id number title bodyText url state locked updatedAt
           assignees(first: 20) { nodes { login } }
@@ -216,6 +219,12 @@ function normalizeComment(comment) {
 export function normalizePreflight(candidate, data) {
   const repository = data?.repository ?? data?.repo ?? data?.repositoryData ?? null;
   const issue = repository?.issue ?? null;
+  const rootPackage = parseJson(repository?.rootPackage?.text, null);
+  const workspaces = rootPackage?.workspaces;
+  const workspaceLayout = (Array.isArray(workspaces) && workspaces.length > 0) ||
+    (workspaces && typeof workspaces === 'object' && Object.keys(workspaces).length > 0);
+  const yarnBerryLayout = /^yarn@(?:[2-9]|[1-9][0-9]+)(?:\.|$)/i
+    .test(String(rootPackage?.packageManager ?? ''));
   const crossReferencedPrs = (issue?.timelineItems?.nodes ?? [])
     .map((event) => event?.source)
     .filter((source) => source?.__typename === 'PullRequest')
@@ -236,6 +245,10 @@ export function normalizePreflight(candidate, data) {
       fork: Boolean(repository.isFork),
       defaultBranch: repository.defaultBranchRef?.name ?? null,
       defaultOid: repository.defaultBranchRef?.target?.oid ?? null,
+      hasRootPackageJson: Number(repository.rootPackage?.byteSize) > 0,
+      unsupportedNodeLayout: workspaceLayout
+        ? 'multi-package workspaces are outside the single-package Node lane'
+        : yarnBerryLayout ? 'Yarn Berry is outside the node_modules dependency lane' : null,
       northsetOpenPrs: Number(data?.northsetOpenPrCount ?? data?.northset?.issueCount ?? 0),
     } : null,
     issue: issue ? {
@@ -292,6 +305,8 @@ export function evaluatePreflight(live, {northsetLogin = 'AysajanE', now = new D
   if (externalAssignees.length) reasons.push(`issue is assigned to ${externalAssignees.join(', ')}`);
   if (issue && !hasInvitation(live.candidate, issue.labels)) reasons.push('invitation label or policy is missing');
   if (repository?.archived || repository?.fork) reasons.push('repository is archived or forked');
+  if (repository && !repository.hasRootPackageJson) reasons.push('root package.json is missing');
+  if (repository?.unsupportedNodeLayout) reasons.push(repository.unsupportedNodeLayout);
   if (repository?.northsetOpenPrs > 0) reasons.push('Northset already has an open PR in the repository');
   const openLinked = (issue?.crossReferencedPrs ?? []).filter((pr) => pr.state === 'OPEN');
   if (openLinked.length) reasons.push(`exact linked open PR exists: ${openLinked.map((pr) => pr.url).join(', ')}`);

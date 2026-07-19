@@ -5,7 +5,14 @@ import path from 'node:path';
 import test from 'node:test';
 import {approveBoard} from './board.mjs';
 import {openFactoryDb} from './db.mjs';
-import {createStageSemaphores, removeWorkTree, runFactoryCycle, runUntilIdle} from './worker.mjs';
+import {
+  assertDeclaredTestsExecuted,
+  assertPublicVerificationClaims,
+  createStageSemaphores,
+  removeWorkTree,
+  runFactoryCycle,
+  runUntilIdle,
+} from './worker.mjs';
 
 async function makeFactory(t, {missionStart = 1000} = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'oss-factory-'));
@@ -104,6 +111,56 @@ test('work-tree cleanup bounds filesystem retries and defers only busy-directory
   await assert.rejects(removeWorkTree('/private/factory-work', {
     remove: async () => { throw busy; },
   }), busy);
+});
+
+test('READY claims use the exact clean verifier command instead of authored status prose', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  const driver = verifiedDriver({verified: 1});
+  const author = driver.author;
+  driver.author = async (...args) => ({
+    ...await author(...args),
+    checks: ['PASS: node --test', 'BLOCKED: npm run lint'],
+  });
+
+  await runFactoryCycle({db, workers: 1, driver, boardPolicy: {minSize: 10}});
+
+  const [ready] = db.listReady({states: ['PENDING'], limit: 1});
+  assert.deepEqual(ready.manifest.checks, ['node --test']);
+  assert.deepEqual(ready.manifest.proof.checks_not_run, []);
+});
+
+test('PR text cannot deny that its exact clean verifier command ran and passed', () => {
+  const command = 'yarn test --watchAll=false --runTestsByPath src/__tests__/selectors.test.js';
+  assert.throws(() => assertPublicVerificationClaims({
+    pr_body: `## Testing\n- \`${command}\` could not start because Yarn is unavailable`,
+  }, {
+    patched_observation: {command, result: 'PASS', exit_code: 0},
+  }), /PR body says the clean verifier command did not run/);
+
+  assert.doesNotThrow(() => assertPublicVerificationClaims({
+    pr_body: `## Testing\n- \`${command}\` passed in the clean verifier\n- npm run lint was not run`,
+  }, {
+    patched_observation: {command, result: 'PASS', exit_code: 0},
+  }));
+});
+
+test('regression verification must exercise its declared tests or the repository suite', () => {
+  const authored = {test_only_paths: ['test/suite/JUnitAnalyzer.test.ts']};
+  const verification = (command) => ({
+    claim_type: 'regression_fix',
+    patched_observation: {command, result: 'PASS', exit_code: 0},
+  });
+
+  assert.throws(() => assertDeclaredTestsExecuted(authored, verification(
+    "node -e \"const source = require('fs').readFileSync('src/analyzer.ts', 'utf8')\"",
+  )), /must execute a declared test-only path or a repository test suite/);
+  assert.doesNotThrow(() => assertDeclaredTestsExecuted(authored, verification(
+    'npm test',
+  )));
+  assert.doesNotThrow(() => assertDeclaredTestsExecuted(authored, verification(
+    'npm test -- --runTestsByPath test/suite/JUnitAnalyzer.test.ts',
+  )));
 });
 
 test('fifty lake candidates enter the continuous queue without shift or board schedule fields', async (t) => {

@@ -510,3 +510,26 @@ test('a superseded mission cannot be resurrected under its previous approval', a
   assert.equal(github.count('create_fork'), 0);
   assert.equal(github.count('create_pull_request'), 0);
 });
+
+test('an older board skips a corrected approval without mutating its current state', async () => {
+  const db = new FakeDb(2);
+  const github = new FakeGitHub();
+  db.board.board_id = 'B-OLD';
+  for (const ready of db.ready.values()) ready.board_id = 'B-OLD';
+  db.ready.get('M-002').board_id = 'B-CORRECTED';
+  const corrected = structuredClone(db.ready.get('M-002'));
+
+  const result = await publishBoard(db.board.board_digest, options(db, github));
+
+  assert.equal(result.results.find(({mission_id}) => mission_id === 'M-001').state, 'SUBMITTED');
+  assert.deepEqual(result.results.find(({mission_id}) => mission_id === 'M-002'), {
+    mission_id: 'M-002',
+    state: 'SKIPPED',
+    code: 'APPROVAL_SUPERSEDED',
+    detail: 'the current READY item belongs to corrected board B-CORRECTED',
+  });
+  assert.deepEqual(await db.getReadyItem('M-002'), corrected);
+  assert.equal(await db.getPublication('M-002'), null);
+  assert.equal(db.taskStates.has('TASK-002'), false);
+  assert.equal(github.count('create_pull_request'), 1);
+});

@@ -140,3 +140,83 @@ test('manifest callback failure rolls back attempt, task, READY item, and missio
   assert.equal(db.stats().ready_items, 0);
   assert.equal(db.connection.prepare("SELECT value FROM factory_meta WHERE key='next_mission_number'").get().value, '42');
 });
+
+test('rejected unpublished READY bytes can be replaced by a new verified attempt without a new mission', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-ready-replacement-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'), {missionStart: 42});
+  t.after(() => db.close());
+  const {task, claim} = enqueueAndClaim(db);
+  const first = db.finishVerifiedReady(claim.attempt.attempt_id, {
+    pr_title: 'feat: broad first version',
+    pr_body: 'Implement the first version.',
+  }, {
+    patchSha256: `sha256:${'b'.repeat(64)}`,
+    commitOid: 'c'.repeat(40),
+    verification: {ok: true, claim_type: 'feature_implementation'},
+    now: '2026-07-19T12:02:00.000Z',
+  });
+  const board = db.insertBoard({
+    boardId: 'B-REPLACEMENT',
+    boardDigest: `sha256:${'d'.repeat(64)}`,
+    items: [first],
+    createdAt: '2026-07-19T12:03:00.000Z',
+  });
+
+  assert.throws(() => db.replaceVerifiedReady(first.mission_id, {}),
+    /only a rejected READY item can be replaced/);
+  db.approveBoard(board.board_digest, [], {
+    rejectedIds: [first.mission_id],
+    now: '2026-07-19T12:04:00.000Z',
+  });
+  const secondVerification = {
+    ok: true,
+    claim_type: 'feature_implementation',
+    patch_sha256: `sha256:${'e'.repeat(64)}`,
+    commit_oid: 'f'.repeat(40),
+  };
+  const replacement = db.replaceVerifiedReady(first.mission_id, (missionId, callbackTask, attempt) => {
+    assert.equal(missionId, 'M-042');
+    assert.equal(callbackTask.task_id, task.task_id);
+    assert.equal(attempt.attempt_number, 2);
+    assert.equal(attempt.outcome, 'VERIFIED');
+    return {
+      pr_title: 'feat: scoped corrected version',
+      pr_body: 'Implement the scoped corrected version.',
+      patch_sha256: secondVerification.patch_sha256,
+      commit_oid: secondVerification.commit_oid,
+    };
+  }, {
+    durationMs: 654,
+    patchSha256: secondVerification.patch_sha256,
+    commitOid: secondVerification.commit_oid,
+    verification: secondVerification,
+    riskTier: 'GREEN',
+    model: 'test-model',
+    now: '2026-07-19T12:05:00.000Z',
+  });
+
+  assert.equal(replacement.mission_id, 'M-042');
+  assert.notEqual(replacement.attempt_id, first.attempt_id);
+  assert.equal(replacement.approval_state, 'PENDING');
+  assert.equal(replacement.board_id, null);
+  assert.equal(replacement.manifest.pr_title, 'feat: scoped corrected version');
+  assert.equal(db.getAttempt(first.attempt_id).commit_oid, 'c'.repeat(40));
+  assert.deepEqual(db.getAttempt(replacement.attempt_id), {
+    attempt_id: replacement.attempt_id,
+    task_id: task.task_id,
+    attempt_number: 2,
+    started_at: '2026-07-19T12:05:00.000Z',
+    finished_at: '2026-07-19T12:05:00.000Z',
+    model: 'test-model',
+    outcome: 'VERIFIED',
+    failure_class: null,
+    duration_ms: 654,
+    patch_sha256: secondVerification.patch_sha256,
+    commit_oid: secondVerification.commit_oid,
+    verification: secondVerification,
+  });
+  assert.equal(db.getTask(task.task_id).state, 'READY');
+  assert.equal(db.getTask(task.task_id).attempt_count, 2);
+  assert.equal(db.connection.prepare("SELECT value FROM factory_meta WHERE key='next_mission_number'").get().value, '43');
+});

@@ -320,25 +320,24 @@ export function createGhCliTransport({
         const destination = requiredString(request.destination, 'clone destination');
         if (!path.isAbsolute(destination)) throw new TypeError('clone destination must be absolute');
         const url = request.url ?? `https://github.com/${repository}.git`;
-        const args = ['clone', '--no-tags', '--no-checkout'];
-        if (Number.isInteger(request.depth) && request.depth > 0) args.push('--depth', String(request.depth));
-        args.push('--', url, destination);
-        const cloned = await git(args, {operation: 'git clone'});
         if (request.base_oid === undefined || request.base_oid === null) {
+          const args = ['clone', '--no-tags', '--no-checkout'];
+          if (Number.isInteger(request.depth) && request.depth > 0) args.push('--depth', String(request.depth));
+          args.push('--', url, destination);
+          const cloned = await git(args, {operation: 'git clone'});
           return {...cloned, repository_path: destination, base_oid: null};
         }
         const baseOid = requiredString(request.base_oid, 'base_oid');
         if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(baseOid)) {
           throw new TypeError('base_oid must be a full commit OID');
         }
-        let verified = await run(gitExecutable,
+        const depth = Number.isInteger(request.depth) && request.depth > 0 ? request.depth : 1;
+        const initialized = await git(['init', '--quiet', destination], {operation: 'git init exact base'});
+        await git(['-C', destination, 'remote', 'add', 'origin', url], {operation: 'git add origin'});
+        await git(['-C', destination, 'fetch', '--no-tags', `--depth=${depth}`, '--', 'origin', baseOid],
+          {operation: 'git fetch exact base'});
+        const verified = await run(gitExecutable,
           ['-C', destination, 'rev-parse', '--verify', `${baseOid}^{commit}`]);
-        if (verified.code !== 0) {
-          await git(['-C', destination, 'fetch', '--no-tags', '--', 'origin', baseOid],
-            {operation: 'git fetch exact base'});
-          verified = await run(gitExecutable,
-            ['-C', destination, 'rev-parse', '--verify', `${baseOid}^{commit}`]);
-        }
         const verifiedResult = rawGitResult(verified, 'verify cloned base');
         if (verifiedResult.stdout.trim() !== baseOid) {
           throw new GhCliError(`cloned base resolved to ${verifiedResult.stdout.trim()}, expected ${baseOid}`,
@@ -351,7 +350,7 @@ export function createGhCliTransport({
           throw new GhCliError(`checked-out HEAD resolved to ${head.stdout.trim()}, expected ${baseOid}`,
             'CHECKED_OUT_BASE_MISMATCH', head);
         }
-        return {...cloned, repository_path: destination, base_oid: baseOid, head_oid: baseOid};
+        return {...initialized, repository_path: destination, base_oid: baseOid, head_oid: baseOid};
       }
       case 'git_fetch': {
         const repositoryPath = requiredString(request.repository_path, 'repository_path');
@@ -606,20 +605,76 @@ export function createGhCliPublisherAdapter({
     if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(String(oid ?? ''))) {
       throw new TypeError('commit status oid must be a full commit OID');
     }
-    const result = await transport.rest({method: 'GET', path: apiPath(repository,
-      `commits/${String(oid).toLowerCase()}/status`)});
-    if (result.httpStatus === 404) {
-      return {status: 404, headers: result.headers, found: false, state: null};
+    const normalizedOid = String(oid).toLowerCase();
+    const statusResult = await transport.rest({method: 'GET', path: apiPath(repository,
+      `commits/${normalizedOid}/status`)});
+    const statusBody = statusResult.httpStatus === 404
+      ? null : bodyObject(statusResult, 'get combined commit status');
+    const legacyState = typeof statusBody?.state === 'string' && statusBody.state
+      ? statusBody.state.toUpperCase() : null;
+    const legacyCount = Number.isInteger(Number(statusBody?.total_count))
+      ? Number(statusBody.total_count) : 0;
+    const legacyUpdatedAt = [statusBody?.updated_at,
+      ...(Array.isArray(statusBody?.statuses) ? statusBody.statuses.map((status) => status?.updated_at) : [])]
+      .filter(Boolean).sort().at(-1) ?? null;
+    if (Number(statusResult.headers?.['x-ratelimit-remaining']) === 0) {
+      return {
+        status: statusResult.httpStatus,
+        headers: statusResult.headers,
+        found: legacyState !== null,
+        state: legacyState === null ? null : 'PENDING',
+        total_count: legacyCount,
+        updated_at: legacyUpdatedAt,
+      };
     }
-    const body = bodyObject(result, 'get combined commit status');
-    const state = typeof body.state === 'string' && body.state ? body.state.toUpperCase() : null;
+    let checksResult = await transport.rest({method: 'GET', path: apiPath(repository,
+      `commits/${normalizedOid}/check-runs?per_page=100`)});
+    const checksBody = checksResult.httpStatus === 404
+      ? null : bodyObject(checksResult, 'get check runs');
+    if (!statusBody && !checksBody) {
+      return {status: 404, headers: checksResult.headers, found: false, state: null};
+    }
+    const checkRuns = Array.isArray(checksBody?.check_runs) ? [...checksBody.check_runs] : [];
+    const checkCount = Number.isInteger(Number(checksBody?.total_count))
+      ? Number(checksBody.total_count) : checkRuns.length;
+    for (let page = 2; checksBody && page <= Math.ceil(checkCount / 100); page += 1) {
+      if (Number(checksResult.headers?.['x-ratelimit-remaining']) === 0) break;
+      checksResult = await transport.rest({method: 'GET', path: apiPath(repository,
+        `commits/${normalizedOid}/check-runs?per_page=100&page=${page}`)});
+      const pageBody = bodyObject(checksResult, `get check runs page ${page}`);
+      if (Array.isArray(pageBody.check_runs)) checkRuns.push(...pageBody.check_runs);
+    }
+    const failureConclusions = new Set([
+      'ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT',
+    ]);
+    const successConclusions = new Set(['NEUTRAL', 'SKIPPED', 'SUCCESS']);
+    const checkFailure = checkRuns.some((run) =>
+      failureConclusions.has(String(run?.conclusion ?? '').toUpperCase()));
+    const checkPending = checkCount > checkRuns.length || checkRuns.some((run) => {
+      if (String(run?.status ?? '').toUpperCase() !== 'COMPLETED') return true;
+      return !successConclusions.has(String(run?.conclusion ?? '').toUpperCase()) &&
+        !failureConclusions.has(String(run?.conclusion ?? '').toUpperCase());
+    });
+    let state = null;
+    if ((legacyCount > 0 && ['ERROR', 'FAILURE'].includes(legacyState)) || checkFailure) {
+      state = 'FAILURE';
+    } else if ((legacyCount > 0 && legacyState === 'PENDING') || checkPending) {
+      state = 'PENDING';
+    } else if (legacyCount > 0 || checkCount > 0) {
+      state = 'SUCCESS';
+    } else {
+      state = legacyState;
+    }
+    const updatedAt = [legacyUpdatedAt,
+      ...checkRuns.map((run) => run?.completed_at ?? run?.started_at ?? null)]
+      .filter(Boolean).sort().at(-1) ?? null;
     return {
-      status: result.httpStatus,
-      headers: result.headers,
+      status: statusBody ? statusResult.httpStatus : checksResult.httpStatus,
+      headers: checksResult.headers,
       found: state !== null,
       state,
-      total_count: Number.isInteger(Number(body.total_count)) ? Number(body.total_count) : null,
-      updated_at: body.updated_at ?? null,
+      total_count: legacyCount + checkCount,
+      updated_at: updatedAt,
     };
   };
 
