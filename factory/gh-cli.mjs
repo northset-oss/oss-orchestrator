@@ -427,6 +427,14 @@ function recentClaim(comments, northsetLogin, now) {
   }) ?? null;
 }
 
+const MAINTAINER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+const STOP_PATTERN = /\b(?:do not|don't|please (?:do not|don't)|stop)\s+(?:submit|open|work|post|create)|\bnot accepting\s+(?:a\s+)?(?:pr|pull request)|\bno\s+(?:pr|pull request)s?\s+(?:please|wanted|accepted)|\bopt(?:ing)?\s+out\b/i;
+
+function maintainerStop(comments) {
+  return comments.find((comment) => MAINTAINER_ASSOCIATIONS.has(comment?.authorAssociation) &&
+    STOP_PATTERN.test(String(comment?.body ?? ''))) ?? null;
+}
+
 const FINAL_RECHECK_QUERY = `query FactoryFinalLiveRecheck(
   $owner: String!, $name: String!, $issue: Int!, $qualifiedBase: String!, $northsetQuery: String!
 ) {
@@ -436,8 +444,9 @@ const FINAL_RECHECK_QUERY = `query FactoryFinalLiveRecheck(
     issue(number: $issue) {
       state locked
       assignees(first: 20) { nodes { login } pageInfo { hasNextPage } }
-      comments(last: 20) {
-        nodes { body createdAt author { login __typename } }
+      comments(last: 100) {
+        pageInfo { hasPreviousPage }
+        nodes { body createdAt authorAssociation author { login __typename } }
       }
       timelineItems(last: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
         pageInfo { hasPreviousPage }
@@ -590,11 +599,15 @@ export function createGhCliPublisherAdapter({
     if (issueState?.state !== 'OPEN') reasons.push(`issue is ${String(issueState?.state ?? 'missing').toLowerCase()}`);
     if (issueState?.locked) reasons.push('issue is locked');
     const assignees = issueState?.assignees?.nodes ?? [];
-    if (assignees.length || issueState?.assignees?.pageInfo?.hasNextPage) {
-      reasons.push(`issue is assigned${assignees.length ? ` to ${assignees.map((item) => item.login).join(', ')}` : ''}`);
+    const externalAssignees = assignees.filter((item) =>
+      item.login?.toLowerCase() !== northsetLogin.toLowerCase());
+    if (externalAssignees.length || issueState?.assignees?.pageInfo?.hasNextPage) {
+      reasons.push(`issue is assigned${externalAssignees.length ? ` to ${externalAssignees.map((item) => item.login).join(', ')}` : ''}`);
     }
     const currentBaseOid = repo?.ref?.target?.oid ?? null;
-    if (currentBaseOid !== expectedBaseOid) reasons.push(`base branch moved from ${expectedBaseOid} to ${currentBaseOid}`);
+    const baseChanged = currentBaseOid !== expectedBaseOid;
+    if (baseChanged) reasons.push(`base branch moved from ${expectedBaseOid} to ${currentBaseOid}`);
+    if (issueState?.comments?.pageInfo?.hasPreviousPage) reasons.push('issue comment history is truncated');
     if (issueState?.timelineItems?.pageInfo?.hasPreviousPage) reasons.push('issue cross-reference history is truncated');
     const linkedOpen = (issueState?.timelineItems?.nodes ?? []).map((item) => item?.source)
       .filter((item) => item?.__typename === 'PullRequest' && item.state === 'OPEN' &&
@@ -602,6 +615,8 @@ export function createGhCliPublisherAdapter({
     if (linkedOpen.length) reasons.push(`linked open competing PR exists: ${linkedOpen.map((item) => `#${item.number}`).join(', ')}`);
     const claim = recentClaim(issueState?.comments?.nodes ?? [], northsetLogin, now());
     if (claim) reasons.push(`active external claim by ${claim.author.login}`);
+    const stop = maintainerStop(issueState?.comments?.nodes ?? []);
+    if (stop) reasons.push(`maintainer requested no submission${stop.author?.login ? `: ${stop.author.login}` : ''}`);
     const northsetPrs = (result.data?.northset?.nodes ?? []).filter((item) =>
       item?.repository?.nameWithOwner === repository && item.headRefName !== branch);
     if (northsetPrs.length || Number(result.data?.northset?.issueCount ?? 0) >
@@ -609,7 +624,11 @@ export function createGhCliPublisherAdapter({
       reasons.push('Northset already has another open PR in the repository');
     }
     return {clean: reasons.length === 0, reason: reasons.join('; ') || null,
-      base_oid: currentBaseOid, issue_state: issueState?.state ?? null};
+      base_oid: currentBaseOid, current_base_oid: currentBaseOid,
+      base_changed: baseChanged,
+      refreshable: baseChanged && reasons.length === 1,
+      cooldown: stop ? {reason: 'explicit maintainer stop/opt-out', until: 'manual-release'} : null,
+      issue_state: issueState?.state ?? null};
   };
 
   const deepOverlap = async (liveCandidate) => {

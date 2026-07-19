@@ -1,0 +1,278 @@
+import assert from 'node:assert/strict';
+import {mkdtemp, readFile, rm, writeFile, mkdir} from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+
+import {
+  AUTHOR_SCHEMA,
+  SCOUT_SCHEMA,
+  bootstrapDockerArgs,
+  codexDockerArgs,
+  createNodeWorker,
+  runBounded,
+  runtimeDockerArgs,
+} from './node-worker.mjs';
+
+const IMAGE = 'northset-oss-author:test';
+const IMAGE_DIGEST = `sha256:${'a'.repeat(64)}`;
+
+async function temporary(t, prefix) {
+  const root = await mkdtemp(path.join(os.tmpdir(), `${prefix}-`));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  return root;
+}
+
+async function git(args, options = {}) {
+  const result = await runBounded('git', args, {timeoutMs: 30_000, ...options});
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  return result.stdout.trim();
+}
+
+async function repository(t) {
+  const root = await temporary(t, 'factory-node-worker');
+  const checkout = path.join(root, 'repository');
+  await mkdir(path.join(checkout, 'src'), {recursive: true});
+  await writeFile(path.join(checkout, 'package.json'), `${JSON.stringify({
+    name: 'worker-fixture', private: true, type: 'module', scripts: {test: 'node --test'},
+  }, null, 2)}\n`);
+  await writeFile(path.join(checkout, 'package-lock.json'), `${JSON.stringify({
+    name: 'worker-fixture', lockfileVersion: 3, requires: true, packages: {'': {name: 'worker-fixture'}},
+  }, null, 2)}\n`);
+  await writeFile(path.join(checkout, 'src', 'value.mjs'), 'export function value() { return 1; }\n');
+  await git(['init', '-q', checkout]);
+  await git(['-C', checkout, 'add', '-A']);
+  await git(['-C', checkout, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+    'commit', '-q', '-m', 'fixture base']);
+  const baseOid = await git(['-C', checkout, 'rev-parse', 'HEAD']);
+  const task = {
+    task_id: 'TASK-NODE-1', candidate: 'owner/repo#7', repository: 'owner/repo', issue_number: 7,
+    base_oid: baseOid,
+    issue_snapshot: {title: 'Return the expected value', body: 'Please add a regression and fix value().'},
+    live_state: {repository: {id: 'R_fixture', defaultBranch: 'main'}},
+  };
+  return {root, checkout, baseOid, task};
+}
+
+function ok(stdout = '') {
+  return {code: 0, stdout, stderr: ''};
+}
+
+test('N1 scout uses the bounded structured read-only contract', async (t) => {
+  const {checkout, task} = await repository(t);
+  let invocation;
+  const worker = createNodeWorker({image: IMAGE, codexRunner: async (options) => {
+    invocation = options;
+    return {
+      decision: 'GO', reason: 'small focused correction', test_command: 'node --test test/value.test.mjs',
+      target_files: ['src/value.mjs', 'test/value.test.mjs'], estimated_risk: 'GREEN',
+    };
+  }});
+  const result = await worker.handle({
+    action: 'scout', task, checkout, effort: 'medium', timeoutMs: 200_000,
+  });
+  assert.equal(invocation.schema, SCOUT_SCHEMA);
+  assert.equal(invocation.readOnly, true);
+  assert.equal(invocation.effort, 'medium');
+  assert.equal(invocation.timeoutMs, 90_000);
+  assert.match(invocation.prompt, /Inspect this checkout read-only/);
+  assert.match(invocation.prompt, /Never call GitHub|Do not call GitHub/);
+  assert.deepEqual(result.target_files, ['src/value.mjs', 'test/value.test.mjs']);
+});
+
+test('N2 Docker plans isolate git and credentials and freeze dependency material after bootstrap', async () => {
+  const checkout = '/private/factory/repository';
+  const codexHome = '/private/factory/codex-home';
+  const outputRoot = '/private/factory/output';
+  const author = codexDockerArgs({
+    checkout, codexHome, outputRoot,
+    schemaFile: `${outputRoot}/schema.json`, outputFile: `${outputRoot}/result.json`,
+    image: IMAGE, model: 'test-model', effort: 'high', readOnly: false,
+    dependencyMaterial: {mounts: [{source: 'northset-deps-abc', target: '/workspace/node_modules', readOnly: true}]},
+  });
+  const joinedAuthor = author.join('\n');
+  assert.match(joinedAuthor, /src=\/private\/factory\/repository\/.git,dst=\/workspace\/.git,readonly/);
+  assert.match(joinedAuthor, /src=\/private\/factory\/codex-home\/auth.json,dst=\/codex-home\/auth.json,readonly/);
+  assert.match(joinedAuthor, /src=northset-deps-abc,dst=\/workspace\/node_modules,readonly/);
+  assert.match(joinedAuthor, /--output-schema/);
+  assert.match(joinedAuthor, /--output-last-message/);
+  assert.doesNotMatch(joinedAuthor, /GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|AWS_/);
+
+  const bootstrap = bootstrapDockerArgs({
+    checkout, volume: 'northset-deps-abc', image: IMAGE,
+    installCommand: 'npm ci --no-audit --no-fund',
+  }).join('\n');
+  assert.match(bootstrap, /src=\/private\/factory\/repository,dst=\/workspace,readonly/);
+  assert.match(bootstrap, /src=northset-deps-abc,dst=\/workspace\/node_modules$/m);
+  assert.doesNotMatch(bootstrap, /dst=\/workspace\/node_modules,readonly/);
+  assert.doesNotMatch(bootstrap, /auth\.json|CODEX_HOME|GITHUB_TOKEN|GH_TOKEN/);
+
+  const runtime = runtimeDockerArgs({
+    checkout, volume: 'northset-deps-abc', image: IMAGE, command: 'node --test',
+  }).join('\n');
+  assert.match(runtime, /--network=none/);
+  assert.match(runtime, /src=northset-deps-abc,dst=\/workspace\/node_modules,readonly/);
+  assert.match(runtime, /src=\/private\/factory\/repository,dst=\/workspace,readonly/);
+});
+
+test('N3 bootstrap creates one content-keyed volume and then reuses its frozen marker', async (t) => {
+  const {checkout, task} = await repository(t);
+  const calls = [];
+  let ready = false;
+  const run = async (command, args, options) => {
+    calls.push({command, args: [...args], options});
+    assert.equal(command, 'docker');
+    if (args[0] === 'image') return ok(`${IMAGE_DIGEST}\n`);
+    if (args.includes('/deps/.northset-ready')) return {code: ready ? 0 : 1, stdout: '', stderr: ''};
+    if (args[0] === 'volume' && args[1] === 'create') return ok(`${args[2]}\n`);
+    if (args[0] === 'volume' && args[1] === 'rm') return ok();
+    if (args[0] === 'run') { ready = true; return ok(); }
+    assert.fail(`unexpected Docker command ${args.join(' ')}`);
+  };
+  const worker = createNodeWorker({run, image: IMAGE, codexRunner: async () => assert.fail('no model call')});
+  const payload = {
+    action: 'bootstrap', task, checkout,
+    scout: {test_command: 'node --test test/value.test.mjs', estimated_risk: 'GREEN'},
+  };
+  const first = await worker.handle(payload);
+  const second = await worker.handle(payload);
+  assert.match(first.cache_key, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(second.cache_key, first.cache_key);
+  assert.equal(first.reused, false);
+  assert.equal(second.reused, true);
+  assert.deepEqual(first.mounts, [{
+    source: `northset-deps-${first.cache_key.slice(-32)}`,
+    target: '/workspace/node_modules', readOnly: true,
+  }]);
+  assert.equal(calls.filter((call) => call.args[0] === 'volume' && call.args[1] === 'create').length, 1);
+  const install = calls.find((call) => call.args[0] === 'run' &&
+    call.args.some((arg) => String(arg).includes('npm ci')));
+  assert.ok(install);
+  assert.match(install.args.join('\n'), /dst=\/workspace\/node_modules(?:\n|$)/);
+  assert.doesNotMatch(install.args.join('\n'), /dst=\/workspace\/node_modules,readonly/);
+});
+
+test('N4 only recognizable Docker or registry bootstrap failures are retryable', async (t) => {
+  const {checkout, task} = await repository(t);
+  const runner = (stderr) => async (_command, args) => {
+    if (args[0] === 'image') return ok(`${IMAGE_DIGEST}\n`);
+    if (args.includes('/deps/.northset-ready')) return {code: 1, stdout: '', stderr: ''};
+    if (args[0] === 'volume') return ok();
+    return {code: 1, stdout: '', stderr};
+  };
+  const payload = {action: 'bootstrap', task, checkout, scout: {test_command: 'node --test'}};
+  const transient = createNodeWorker({run: runner('npm error code EAI_AGAIN\npackage registry unavailable'), image: IMAGE});
+  await assert.rejects(() => transient.handle(payload), (error) =>
+    error.transient === true && /temporary bootstrap infrastructure failure/.test(error.message));
+
+  const deterministic = createNodeWorker({run: runner('npm error: unsupported engine for this package'), image: IMAGE});
+  await assert.rejects(() => deterministic.handle(payload), (error) =>
+    error.transient !== true && /unsupported engine/.test(error.message));
+});
+
+test('N5 direct author produces a host DCO commit and clean verifier proves base-red patched-green', async (t) => {
+  const {checkout, baseOid, task} = await repository(t);
+  const dockerCalls = [];
+  const run = async (command, args, options = {}) => {
+    if (command !== 'docker') return runBounded(command, args, options);
+    assert.equal(args[0], 'run');
+    const checkoutMount = args.find((arg) => typeof arg === 'string' &&
+      arg.startsWith('type=bind,src=') && arg.includes(',dst=/workspace,readonly'));
+    assert.ok(checkoutMount, args.join(' '));
+    const source = checkoutMount.slice('type=bind,src='.length).split(',dst=/workspace,readonly')[0];
+    const cleanEnvironment = Object.fromEntries(Object.entries(process.env)
+      .filter(([name]) => !name.startsWith('NODE_TEST')));
+    const result = await runBounded('sh', ['-lc', args.at(-1)], {
+      cwd: source, env: cleanEnvironment,
+      timeoutMs: options.timeoutMs, maxOutputBytes: options.maxOutputBytes,
+    });
+    dockerCalls.push({args: [...args], source, result});
+    return result;
+  };
+  const dependencyMaterial = {
+    cache_key: `sha256:${'b'.repeat(64)}`,
+    image: IMAGE,
+    image_digest: IMAGE_DIGEST,
+    mounts: [{source: 'northset-deps-fixture', target: '/workspace/node_modules', readOnly: true}],
+  };
+  let authorInvocation;
+  const worker = createNodeWorker({run, image: IMAGE, codexRunner: async (options) => {
+    assert.equal(options.schema, AUTHOR_SCHEMA);
+    authorInvocation = options;
+    await mkdir(path.join(checkout, 'test'));
+    await writeFile(path.join(checkout, 'test', 'value.test.mjs'), [
+      "import test from 'node:test';",
+      "import assert from 'node:assert/strict';",
+      "import {value} from '../src/value.mjs';",
+      "test('value', () => assert.equal(value(), 2, 'BASE_MARKER_EXPECTED_TWO'));",
+      '',
+    ].join('\n'));
+    await writeFile(path.join(checkout, 'src', 'value.mjs'), 'export function value() { return 2; }\n');
+    return {
+      outcome: 'PATCH', reason: 'implemented focused correction',
+      pr_title: 'fix: return expected value',
+      pr_body: '## Summary\n\nReturn the expected value and cover it with a regression.',
+      summary: 'Return the expected value.', claim_type: 'regression_fix',
+      test_command: 'node --test test/value.test.mjs',
+      test_only_paths: ['test/value.test.mjs'], base_failure_contains: 'BASE_MARKER_EXPECTED_TWO',
+      checks: ['node --test test/value.test.mjs'],
+    };
+  }});
+  const authored = await worker.handle({
+    action: 'author', task, checkout,
+    scout: {decision: 'GO', test_command: 'node --test test/value.test.mjs', estimated_risk: 'GREEN'},
+    effort: 'high', timeoutMs: 20 * 60_000, dependencyMaterial,
+  });
+  assert.equal(authorInvocation.readOnly, false);
+  assert.equal(authorInvocation.timeoutMs, 10 * 60_000);
+  assert.equal(authorInvocation.dependencyMaterial, dependencyMaterial);
+  assert.equal(await git(['-C', checkout, 'rev-parse', 'HEAD^']), baseOid);
+  assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');
+  const identity = await git(['-C', checkout, 'show', '-s', '--format=%an%n%ae%n%ce%n%B', 'HEAD']);
+  assert.match(identity, /^Aysajan Eziz\naeziz@northset\.ai\naeziz@northset\.ai\n/);
+  assert.match(identity, /Signed-off-by: Aysajan Eziz <aeziz@northset\.ai>/);
+  const testOnlyPatch = await readFile(authored.test_only_patch_file, 'utf8');
+  assert.match(testOnlyPatch, /diff --git a\/test\/value\.test\.mjs b\/test\/value\.test\.mjs/);
+  assert.doesNotMatch(testOnlyPatch, /diff --git a\/src\/value\.mjs b\/src\/value\.mjs/);
+
+  let verification;
+  try {
+    verification = await worker.handle({action: 'verify', task, checkout, authored, dependencyMaterial});
+  } catch (error) {
+    assert.fail(`${error.message}\n${JSON.stringify(dockerCalls, null, 2)}`);
+  }
+  assert.equal(verification.ok, true);
+  assert.equal(verification.claim_type, 'regression_fix');
+  assert.equal(verification.base_observation.exit_code, 1);
+  assert.equal(verification.patched_observation.exit_code, 0);
+  assert.equal(verification.dco_verified, true);
+  assert.equal(verification.commit_oid, authored.commit_oid);
+  assert.equal(verification.dependency_cache_key, dependencyMaterial.cache_key);
+  assert.equal(verification.test_command, 'node --test test/value.test.mjs');
+  assert.deepEqual(verification.test_only_paths, ['test/value.test.mjs']);
+  assert.equal(verification.base_failure_contains, 'BASE_MARKER_EXPECTED_TWO');
+  assert.equal(verification.dependency_image_digest, IMAGE_DIGEST);
+  assert.equal(dockerCalls.length, 2);
+  for (const call of dockerCalls) {
+    const joined = call.args.join('\n');
+    assert.match(joined, /--network=none/);
+    assert.match(joined, /src=northset-deps-fixture,dst=\/workspace\/node_modules,readonly/);
+  }
+
+  await worker.handle({action: 'reset', task, checkout, authored});
+  assert.equal(await git(['-C', checkout, 'rev-parse', 'HEAD']), baseOid);
+  assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');
+  assert.equal(await readFile(path.join(checkout, 'src', 'value.mjs'), 'utf8'),
+    'export function value() { return 1; }\n');
+  await assert.rejects(() => readFile(path.join(checkout, 'test', 'value.test.mjs'), 'utf8'),
+    (error) => error.code === 'ENOENT');
+});
+
+test('N6 subprocess execution is bounded by both wall time and aggregate output', async () => {
+  await assert.rejects(() => runBounded(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], {
+    timeoutMs: 30, maxOutputBytes: 1024,
+  }), (error) => error.code === 'ETIMEDOUT');
+  await assert.rejects(() => runBounded(process.execPath, ['-e', "process.stdout.write('x'.repeat(4096))"], {
+    timeoutMs: 2_000, maxOutputBytes: 128,
+  }), (error) => error.code === 'EOUTPUTLIMIT');
+});

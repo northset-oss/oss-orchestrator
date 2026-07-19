@@ -188,6 +188,30 @@ test('one verifier failure is passed to exactly one second author attempt', asyn
   assert.equal(db.stats().ready_items, 1);
 });
 
+test('one transient verifier startup retry does not consume the second author attempt', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  const driver = verifiedDriver({verified: 1});
+  let authors = 0;
+  let verifications = 0;
+  const originalAuthor = driver.author;
+  const originalVerify = driver.verify;
+  driver.author = async (...args) => { authors += 1; return originalAuthor(...args); };
+  driver.verify = async (...args) => {
+    verifications += 1;
+    if (verifications === 1) {
+      const error = new Error('temporary Docker startup failure');
+      error.transient = true;
+      throw error;
+    }
+    return originalVerify(...args);
+  };
+  await runFactoryCycle({db, workers: 1, driver});
+  assert.equal(authors, 1);
+  assert.equal(verifications, 2);
+  assert.equal(db.stats().ready_items, 1);
+});
+
 test('local factory work continues without consulting a paused GitHub publisher', async (t) => {
   const {db} = await makeFactory(t);
   db.enqueueTasks(candidates(1));

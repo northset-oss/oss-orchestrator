@@ -347,6 +347,7 @@ export async function publishBoard(boardDigest, {
   safety = null,
   liveRecheck,
   receiptPublisher,
+  refreshStale = null,
   now = () => new Date(),
 } = {}) {
   if (!db) throw new TypeError('db is required');
@@ -405,10 +406,46 @@ export async function publishBoard(boardDigest, {
     eligible.push({...plan, approval_digest: approval.approval_digest});
   }
 
-  if (eligible.length) {
+  const clean = [];
+  for (const plan of eligible) {
+    try {
+      const live = await throughSafety(safety, 'read', 'final_live_recheck', {
+        repository: plan.repository,
+      }, () => liveRecheck(plan));
+      if (live?.cooldown && typeof db.setRepositoryState === 'function') {
+        await db.setRepositoryState(plan.repository, {
+          cooldown_reason: live.cooldown.reason,
+          cooldown_until: live.cooldown.until ?? 'manual-release',
+        });
+      }
+      if (!live?.clean) {
+        if (live?.refreshable === true && typeof refreshStale === 'function') {
+          const refreshed = await refreshStale(plan, live);
+          if (!refreshed?.manifest) {
+            results.push({mission_id: plan.mission_id, state: 'READY', code: 'REBASE_FAILED',
+              detail: refreshed?.reason ?? 'stale refresh did not produce a verified manifest'});
+            continue;
+          }
+          const ready = await db.replaceReadyManifest(plan.mission_id, refreshed.manifest);
+          results.push({mission_id: plan.mission_id, state: 'READY', code: 'REAPPROVAL_REQUIRED',
+            manifest_sha256: ready.manifest_sha256});
+          continue;
+        }
+        results.push(await failItem(db, plan, 'STALE_OR_OCCUPIED',
+          live?.reason ?? 'final live recheck was not clean', 'SUPERSEDED'));
+        continue;
+      }
+      clean.push({plan, repositoryState: live.repository_state ?? await db.getRepositoryState(plan.repository)});
+    } catch (error) {
+      if (isPaused(error)) throw error;
+      results.push(await failItem(db, plan, error.code ?? 'PUBLICATION_FAILED', error.message));
+    }
+  }
+
+  if (clean.length) {
     const receipts = await throughSafety(safety, 'git_push', 'publish_receipt_batch', {},
-      () => receiptPublisher(eligible.map((plan) => ({...plan}))));
-    for (const plan of eligible) {
+      () => receiptPublisher(clean.map(({plan}) => ({...plan}))));
+    for (const {plan} of clean) {
       const receipt = receiptFor(receipts, plan.mission_id);
       if (!receipt) throw new Error(`receipt publisher omitted ${plan.mission_id}`);
       const receiptUrl = requiredString(value(receipt.receipt_url, receipt.url),
@@ -416,29 +453,39 @@ export async function publishBoard(boardDigest, {
       if (receiptUrl !== plan.receipt_url) {
         throw new Error(`${plan.mission_id} receipt publisher returned ${receiptUrl}, expected ${plan.receipt_url}`);
       }
+      const approvalDigest = requiredString(receipt.batch_approval_digest,
+        `${plan.mission_id} receipt batch approval digest`);
+      if (approvalDigest !== plan.approval_digest) {
+        throw new Error(`${plan.mission_id} receipt binds ${approvalDigest}, expected ${plan.approval_digest}`);
+      }
+      const proofSha256 = requiredString(receipt.proof_sha256,
+        `${plan.mission_id} receipt proof_sha256`);
+      if (!/^sha256:[a-f0-9]{64}$/.test(proofSha256)) {
+        throw new Error(`${plan.mission_id} receipt proof_sha256 is invalid`);
+      }
+      const batchCommitOid = requiredString(receipt.batch_commit_oid,
+        `${plan.mission_id} receipt batch_commit_oid`);
+      if (!/^[a-f0-9]{40}$/.test(batchCommitOid)) {
+        throw new Error(`${plan.mission_id} receipt batch_commit_oid is invalid`);
+      }
       await db.savePublication(plan.mission_id, {
         mission_id: plan.mission_id,
         task_id: plan.task_id,
         receipt_url: receiptUrl,
         receipt_state: 'PUBLISHED',
         proof_published: true,
+        receipt_proof_sha256: proofSha256,
+        receipt_batch_commit_oid: batchCommitOid,
+        receipt_approval_digest: approvalDigest,
       });
     }
   }
 
-  for (const plan of eligible) {
+  for (const {plan, repositoryState} of clean) {
     try {
-      const live = await throughSafety(safety, 'read', 'final_live_recheck', {
-        repository: plan.repository,
-      }, () => liveRecheck(plan));
-      if (!live?.clean) {
-        results.push(await failItem(db, plan, 'STALE_OR_OCCUPIED',
-          live?.reason ?? 'final live recheck was not clean', 'SUPERSEDED'));
-        continue;
-      }
       results.push(await publishOne(plan, {
         db, github, safety, now,
-        repositoryState: live.repository_state ?? await db.getRepositoryState(plan.repository),
+        repositoryState,
       }));
     } catch (error) {
       if (isPaused(error)) throw error;

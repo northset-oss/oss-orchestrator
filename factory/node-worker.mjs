@@ -362,6 +362,25 @@ async function resolveImage(run, image) {
   return digest.toLowerCase();
 }
 
+function transientBootstrapFailure(error) {
+  const code = String(error?.code ?? '').toUpperCase();
+  if (['EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENETDOWN', 'ENETUNREACH',
+    'EHOSTUNREACH'].includes(code)) return true;
+  const message = String(error?.message ?? error ?? '');
+  return /\b(?:EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETDOWN|ENETUNREACH|EHOSTUNREACH)\b/i.test(message) ||
+    /temporary failure in name resolution|tls handshake timeout|socket hang up|network timeout/i.test(message) ||
+    /cannot connect to (?:the )?docker daemon/i.test(message) ||
+    /(?:registry|package registry)[^\n]{0,120}\b(?:500|502|503|504)\b/i.test(message);
+}
+
+function asTransientBootstrapError(error) {
+  if (!transientBootstrapFailure(error)) return error;
+  const wrapped = new Error(`temporary bootstrap infrastructure failure: ${error.message}`, {cause: error});
+  wrapped.code = error.code;
+  wrapped.transient = true;
+  return wrapped;
+}
+
 export function bootstrapDockerArgs({checkout, volume, image, installCommand}) {
   return [
     'run', '--rm', '--cap-drop=ALL', '--security-opt=no-new-privileges',
@@ -411,6 +430,11 @@ async function withVolumeLock(volume, operation, {
 }
 
 async function createPatch(run, checkout, paths, destination) {
+  // `git diff` omits untracked files. Mark declared test paths intent-to-add so a
+  // newly authored regression is represented without staging its contents.
+  await mustRun(run, 'git', ['-C', checkout, 'add', '--intent-to-add', '--', ...paths], {
+    timeoutMs: 60_000,
+  }, 'register test-only paths');
   const args = ['-C', checkout, 'diff', '--binary', '--full-index', 'HEAD', '--'];
   args.push(...paths);
   const result = await mustRun(run, 'git', args, {timeoutMs: 60_000}, 'test-only patch');
@@ -509,51 +533,55 @@ export function createNodeWorker({
   }
 
   async function bootstrap(payload) {
-    const commands = await resolveNodeCommands(payload.checkout, payload.scout);
-    const imageDigest = await resolveImage(run, image);
-    const cacheKey = await dependencyCacheKey({
-      repositoryNodeId: payload.task.live_state?.repository?.id ??
-        payload.task.live_state?.repository_node_id ?? null,
-      repository: payload.task.repository,
-      profile: 'node',
-      executorImageDigest: imageDigest,
-      architecture: process.arch,
-      installCommands: [commands.installCommand],
-      checkout: payload.checkout,
-      trustDomain: 'authored',
-    });
-    const volume = `northset-deps-${cacheKey.slice(-32)}`;
-    let reused = false;
-    await withVolumeLock(volume, async () => {
-      const marker = await run('docker', [
-        'run', '--rm', '--network=none',
-        '--mount', `type=volume,src=${volume},dst=/deps,readonly`,
-        image, 'test', '-f', '/deps/.northset-ready',
-      ], {timeoutMs: 30_000});
-      reused = marker.code === 0;
-      if (reused) return;
-      await mustRun(run, 'docker', ['volume', 'create', volume], {timeoutMs: 30_000}, 'dependency volume creation');
-      try {
-        await mustRun(run, 'docker', bootstrapDockerArgs({
-          checkout: payload.checkout,
-          volume,
-          image,
-          installCommand: commands.installCommand,
-        }), {timeoutMs: INSTALL_TIMEOUT_MS, maxOutputBytes: OUTPUT_LIMIT}, 'dependency bootstrap');
-      } catch (error) {
-        await run('docker', ['volume', 'rm', '-f', volume], {timeoutMs: 30_000});
-        throw error;
-      }
-    });
-    return {
-      cache_key: cacheKey,
-      image,
-      image_digest: imageDigest,
-      install_command: commands.installCommand,
-      test_command: commands.testCommand,
-      reused,
-      mounts: [{source: volume, target: '/workspace/node_modules', readOnly: true}],
-    };
+    try {
+      const commands = await resolveNodeCommands(payload.checkout, payload.scout);
+      const imageDigest = await resolveImage(run, image);
+      const cacheKey = await dependencyCacheKey({
+        repositoryNodeId: payload.task.live_state?.repository?.id ??
+          payload.task.live_state?.repository_node_id ?? null,
+        repository: payload.task.repository,
+        profile: 'node',
+        executorImageDigest: imageDigest,
+        architecture: process.arch,
+        installCommands: [commands.installCommand],
+        checkout: payload.checkout,
+        trustDomain: 'authored',
+      });
+      const volume = `northset-deps-${cacheKey.slice(-32)}`;
+      let reused = false;
+      await withVolumeLock(volume, async () => {
+        const marker = await run('docker', [
+          'run', '--rm', '--network=none',
+          '--mount', `type=volume,src=${volume},dst=/deps,readonly`,
+          image, 'test', '-f', '/deps/.northset-ready',
+        ], {timeoutMs: 30_000});
+        reused = marker.code === 0;
+        if (reused) return;
+        await mustRun(run, 'docker', ['volume', 'create', volume], {timeoutMs: 30_000}, 'dependency volume creation');
+        try {
+          await mustRun(run, 'docker', bootstrapDockerArgs({
+            checkout: payload.checkout,
+            volume,
+            image,
+            installCommand: commands.installCommand,
+          }), {timeoutMs: INSTALL_TIMEOUT_MS, maxOutputBytes: OUTPUT_LIMIT}, 'dependency bootstrap');
+        } catch (error) {
+          await run('docker', ['volume', 'rm', '-f', volume], {timeoutMs: 30_000});
+          throw error;
+        }
+      });
+      return {
+        cache_key: cacheKey,
+        image,
+        image_digest: imageDigest,
+        install_command: commands.installCommand,
+        test_command: commands.testCommand,
+        reused,
+        mounts: [{source: volume, target: '/workspace/node_modules', readOnly: true}],
+      };
+    } catch (error) {
+      throw asTransientBootstrapError(error);
+    }
   }
 
   async function author(payload) {
@@ -631,7 +659,7 @@ export function createNodeWorker({
         image: dependency.image ?? image,
         command: plan.command,
       }), {timeoutMs: VERIFY_TIMEOUT_MS, maxOutputBytes: OUTPUT_LIMIT});
-      return await verifier({
+      const result = await verifier({
         claimType,
         baseCheckout: base.target,
         patchedCheckout: payload.checkout,
@@ -650,9 +678,126 @@ export function createNodeWorker({
           network: 'none',
         },
       }, {runContainer});
+      return {
+        ...result,
+        test_command: payload.authored.test_command,
+        test_only_paths: [...(payload.authored.test_only_paths ?? [])],
+        base_failure_contains: payload.authored.base_failure_contains ?? '',
+        dependency_install_command: dependency.install_command ?? null,
+        dependency_image_digest: dependency.image_digest ?? null,
+      };
     } finally {
       await rm(base.root, {recursive: true, force: true});
     }
+  }
+
+  async function refresh(payload) {
+    const manifest = payload.plan?.manifest ?? payload.manifest;
+    if (!manifest || typeof manifest !== 'object') throw new Error('refresh requires the approved manifest');
+    const newBaseOid = String(payload.new_base_oid ?? '');
+    const oldCommitOid = String(manifest.commit_oid ?? '');
+    if (!/^[0-9a-f]{40}$/i.test(newBaseOid)) throw new Error('refresh requires an exact new base OID');
+    if (!/^[0-9a-f]{40}$/i.test(oldCommitOid)) throw new Error('refresh requires the approved commit OID');
+    const verificationMetadata = manifest.verification ?? {};
+    const claimType = verificationMetadata.claim_type ?? manifest.receipt_claim?.type;
+    if (!CLAIM_TYPES.includes(claimType)) throw new Error('refresh requires persisted claim metadata');
+    const testCommand = verificationMetadata.test_command ?? manifest.checks?.[0];
+    if (typeof testCommand !== 'string' || !testCommand.trim()) {
+      throw new Error('refresh requires the persisted test command');
+    }
+    const testOnlyPaths = safeRelativePaths(
+      verificationMetadata.test_only_paths ?? manifest.test_only_paths ?? [],
+      'refresh test_only_paths',
+    );
+    const baseFailureContains = verificationMetadata.base_failure_contains ??
+      manifest.base_failure_contains ?? '';
+    if (claimType === 'regression_fix' && !String(baseFailureContains).trim()) {
+      throw new Error('refresh regression fix requires the persisted base failure marker');
+    }
+    if (['regression_fix', 'coverage_addition'].includes(claimType) && !testOnlyPaths.length) {
+      throw new Error(`refresh ${claimType} requires persisted test-only paths`);
+    }
+    const patchFile = path.resolve(payload.patch_file ?? path.join(path.dirname(payload.checkout), 'change.patch'));
+    const testOnlyPatchFile = path.resolve(payload.test_only_patch_file ??
+      path.join(path.dirname(payload.checkout), 'test-only.patch'));
+    const artifactDirectory = path.resolve(path.dirname(payload.checkout));
+    if (path.dirname(patchFile) !== artifactDirectory || path.dirname(testOnlyPatchFile) !== artifactDirectory) {
+      throw new Error('refresh patch artifacts must remain beside the durable checkout');
+    }
+    const task = {
+      ...(payload.task ?? {}),
+      repository: payload.task?.repository ?? manifest.repository,
+      issue_number: payload.task?.issue_number ?? manifest.issue_number,
+      base_oid: newBaseOid,
+      live_state: {
+        ...(payload.task?.live_state ?? {}),
+        repository: {
+          ...(payload.task?.live_state?.repository ?? {}),
+          id: payload.task?.live_state?.repository?.id ?? manifest.repository_node_id ?? null,
+          defaultBranch: manifest.base_branch,
+        },
+      },
+    };
+    const parentRecord = await mustRun(run, 'git', [
+      '-C', payload.checkout, 'rev-list', '--parents', '-n', '1', oldCommitOid,
+    ], {timeoutMs: 30_000}, 'inspect approved commit');
+    if (parentRecord.stdout.trim().split(/\s+/).length !== 2) {
+      throw new Error('refresh requires an approved one-parent commit');
+    }
+    await mustRun(run, 'git', ['-C', payload.checkout, 'checkout', '--detach', newBaseOid], {
+      timeoutMs: 60_000,
+    }, 'checkout refreshed base');
+    const picked = await run('git', ['-C', payload.checkout, 'cherry-pick', '--no-commit', oldCommitOid], {
+      env: cleanGitEnv(), timeoutMs: 2 * 60_000,
+    });
+    if (picked.code !== 0) {
+      await run('git', ['-C', payload.checkout, 'cherry-pick', '--abort'], {
+        env: cleanGitEnv(), timeoutMs: 30_000,
+      });
+      await run('git', ['-C', payload.checkout, 'reset', '--hard', newBaseOid], {
+        env: cleanGitEnv(), timeoutMs: 30_000,
+      });
+      throw new Error(`refresh rebase conflict: ${(picked.stderr || picked.stdout).trim() || 'cherry-pick failed'}`);
+    }
+    if (testOnlyPaths.length) {
+      const bytes = await createPatch(run, payload.checkout, testOnlyPaths, testOnlyPatchFile);
+      if (bytes === 0) throw new Error('refreshed test-only delta is empty');
+    } else {
+      await writeFile(testOnlyPatchFile, '', {mode: 0o600});
+    }
+    const canonical = await canonicalCommit(run, payload.checkout, newBaseOid, manifest.pr_title);
+    if (!canonical) throw new Error('approved patch is already present on the refreshed base');
+    const patchSha256 = await makeFullPatch(
+      run, payload.checkout, newBaseOid, canonical.commitOid, patchFile,
+    );
+    const scout = {
+      test_command: testCommand,
+      install_command: verificationMetadata.dependency_install_command ?? undefined,
+      estimated_risk: manifest.risk_tier ?? 'AMBER',
+    };
+    const dependencyMaterial = await bootstrap({task, checkout: payload.checkout, scout});
+    const authored = {
+      claim_type: claimType,
+      test_command: testCommand,
+      test_only_paths: testOnlyPaths,
+      base_failure_contains: baseFailureContains,
+      commit_oid: canonical.commitOid,
+      commit_tree_oid: canonical.treeOid,
+      patch_file: patchFile,
+      patch_sha256: patchSha256,
+      test_only_patch_file: testOnlyPatchFile,
+    };
+    const verification = await verify({task, checkout: payload.checkout, authored, dependencyMaterial});
+    return {
+      base_oid: newBaseOid,
+      commit_oid: canonical.commitOid,
+      tested_tree_oid: verification.tested_tree_oid,
+      patch_sha256: verification.patch_sha256,
+      patch_file: patchFile,
+      test_only_patch_file: testOnlyPatchFile,
+      dependency_material: dependencyMaterial,
+      verification,
+    };
   }
 
   async function reset(payload) {
@@ -686,6 +831,7 @@ export function createNodeWorker({
       if (payload.action === 'bootstrap') return bootstrap(payload);
       if (payload.action === 'author') return author(payload);
       if (payload.action === 'verify') return verify(payload);
+      if (payload.action === 'refresh') return refresh(payload);
       if (payload.action === 'reset') return reset(payload);
       throw new Error(`unsupported worker action ${payload.action}`);
     },

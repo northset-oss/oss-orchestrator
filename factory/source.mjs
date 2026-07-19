@@ -125,10 +125,12 @@ export async function selectCandidates({
   query = (sql) => sqliteQuery(lakePath, sql),
   workers,
   limit,
+  excludeCandidates = [],
   attemptStats = {},
   now = new Date(),
 } = {}) {
   const selectedLimit = boundedLimit(workers, limit);
+  const excluded = new Set(excludeCandidates.map((candidate) => canonicalCandidate(candidate)));
   if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error('now must be a valid Date');
   const cutoff = new Date(now.getTime() - DISCOVERY_TTL_MS).toISOString();
   const rows = await query(`SELECT
@@ -156,6 +158,7 @@ export async function selectCandidates({
         ['OPEN', 'open', 'REVIEWED', null, undefined].includes(row.state);
     })
     .map((row) => normalizeLakeRow(row, attemptStats))
+    .filter((candidate) => !excluded.has(candidate.candidate))
     .sort((left, right) => right.priority - left.priority ||
       right.mechanicalScore - left.mechanicalScore || left.candidate.localeCompare(right.candidate))
     .slice(0, selectedLimit);
@@ -365,13 +368,29 @@ export async function enqueueCandidates(results, {db} = {}) {
 export function createSource({lakePath = 'candidate_lake.sqlite', query, db, github, northsetLogin = 'AysajanE'} = {}) {
   const lakeQuery = query ?? ((sql) => sqliteQuery(lakePath, sql));
   return {
-    select: (options) => selectCandidates({...options, lakePath, query: lakeQuery}),
+    select: (options) => selectCandidates({
+      ...options,
+      lakePath,
+      query: lakeQuery,
+      attemptStats: options?.attemptStats ?? db?.candidateAttemptStats?.() ?? {},
+    }),
     preflight: (candidates, options) => preflightCandidates(candidates, {
       ...options, github, northsetLogin: options?.northsetLogin ?? northsetLogin,
     }),
     enqueue: (results) => enqueueCandidates(results, {db}),
     async fill(options) {
-      const candidates = await this.select(options);
+      const targetDepth = boundedLimit(options.workers, options.limit);
+      const known = typeof db?.listTasks === 'function'
+        ? await db.listTasks({profile: options.profile ?? 'node', limit: 100_000})
+        : [];
+      const active = known.filter((task) => ['QUEUED', 'WORKING'].includes(task.state)).length;
+      const available = Math.max(0, targetDepth - active);
+      if (available === 0) return {candidates: [], results: [], enqueued: []};
+      const candidates = await this.select({
+        ...options,
+        limit: available,
+        excludeCandidates: known.map((task) => task.candidate),
+      });
       const results = await this.preflight(candidates, options);
       const enqueued = await this.enqueue(results);
       return {candidates, results, enqueued};

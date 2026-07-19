@@ -134,6 +134,17 @@ test('selector defaults to 2x workers and clamps an explicit request at 4x worke
   assert.equal((await selectCandidates({workers: 3, limit: 99, query, now: NOW})).length, 12);
 });
 
+test('selector skips candidates already recorded by the factory before applying its bound', async () => {
+  const selected = await selectCandidates({
+    workers: 1,
+    limit: 2,
+    now: NOW,
+    query: async () => [row(1), row(2), row(3)],
+    excludeCandidates: ['owner/repo1#1'],
+  });
+  assert.deepEqual(selected.map((item) => item.candidate), ['owner/repo2#2', 'owner/repo3#3']);
+});
+
 test('attempt history can reorder the initial mechanical ranking', async () => {
   const selected = await selectCandidates({
     workers: 1,
@@ -236,4 +247,22 @@ test('createSource fills from lake through one preflight and injected enqueue se
   assert.equal(result.results[0].outcome, 'GO');
   assert.equal(result.enqueued, 1);
   assert.equal(enqueued, 1);
+});
+
+test('source does not call GitHub when queued and working tasks already fill the target depth', async () => {
+  let githubCalls = 0;
+  const source = createSource({
+    query: async () => [row(1)],
+    github: {graphql: async () => { githubCalls += 1; return {data: {}}; }},
+    db: {
+      listTasks: () => [
+        {candidate: 'owner/repo1#1', state: 'QUEUED'},
+        {candidate: 'owner/repo2#2', state: 'WORKING'},
+      ],
+      enqueueTasks: async () => assert.fail('full queue must not enqueue'),
+    },
+  });
+  const result = await source.fill({workers: 1, now: NOW});
+  assert.deepEqual(result, {candidates: [], results: [], enqueued: []});
+  assert.equal(githubCalls, 0);
 });

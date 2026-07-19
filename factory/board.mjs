@@ -89,6 +89,11 @@ function observation(value) {
   return `${outcome}; ${value.output_sha256 ?? value.stdout_sha256 ?? 'output hash unavailable'}`;
 }
 
+function artifactLink(label, file) {
+  if (typeof file !== 'string' || !file) return `${label} unavailable`;
+  return `[${label}](<${file.replaceAll('>', '%3E')}>)`;
+}
+
 export function renderBoard(board) {
   if (!board?.items?.length) throw new Error('cannot render an empty board');
   const lines = [
@@ -113,6 +118,8 @@ export function renderBoard(board) {
       '',
       `Risk: **${classifyRisk(manifest)}**`,
       '',
+      `Risk warnings: ${(manifest.risk_warnings ?? []).map(inline).join('; ') || 'none'}`,
+      '',
       `Upstream target: \`${manifest.repository}:${manifest.base_branch}\``,
       '',
       `Fork target: \`${manifest.fork_repository}:${manifest.branch}\``,
@@ -125,7 +132,9 @@ export function renderBoard(board) {
       '',
       `Diffstat: ${Number(manifest.changed_lines ?? 0)} changed lines across ${files.length} files`,
       '',
-      `Approved patch: \`${manifest.patch_sha256}\` (${manifest.patch_path ?? 'local path unavailable'})`,
+      `Approved patch: \`${manifest.patch_sha256}\` — ${artifactLink('full diff', manifest.patch_path)}`,
+      '',
+      `Verification evidence: ${artifactLink('verification log', manifest.verification_path)}`,
       '',
       `Declared checks: ${(manifest.checks ?? []).map((check) => `\`${check}\``).join(', ') || '(none)'}`,
       '',

@@ -5,7 +5,6 @@ import test from 'node:test';
 import {
   FACTORY_DEFAULTS,
   executeFactoryCli,
-  main,
   parseFactoryCliArgs,
 } from './cli.mjs';
 
@@ -47,7 +46,14 @@ test('parser provides stable paths and strictly validates command-specific argum
     lake: parsed.lake,
     pauseFile: parsed.pauseFile,
     workRoot: parsed.workRoot,
-  }, FACTORY_DEFAULTS);
+    workerCommand: parsed.workerCommand,
+  }, {
+    database: FACTORY_DEFAULTS.database,
+    lake: FACTORY_DEFAULTS.lake,
+    pauseFile: FACTORY_DEFAULTS.pauseFile,
+    workRoot: FACTORY_DEFAULTS.workRoot,
+    workerCommand: FACTORY_DEFAULTS.workerCommand,
+  });
   assert.equal(parsed.profile, 'node');
   assert.equal(parsed.workers, 8);
   assert.equal(parsed.candidateLimit, 16);
@@ -117,28 +123,31 @@ test('run fills from the lake once and drains workers with the requested board p
   const runCall = calls.find((call) => call.name === 'run');
   assert.equal(runCall.options.driver, driver);
   assert.deepEqual(runCall.options.boardPolicy, {minSize: 12, maxAgeMinutes: 15});
-  assert.deepEqual(result.source, {selected: 2, go: 1, skipped: 1, escalated: 0, enqueued: 1});
+  assert.deepEqual(result.source, {selected: 2, go: 1, skipped: 1, escalated: 0, enqueued: 1, paused: 0});
   assert.equal(result.iterations, 1);
   assert.equal(result.claimed, 1);
   assert.equal(JSON.parse(stdout.read()).stats.ready_items, 1);
   assert.equal(db.closed, true);
 });
 
-test('run requires the explicit production worker command when no driver is injected', async () => {
-  const stderr = output();
-  const db = fakeDb();
-  const code = await main(['run'], {
+test('run uses the production Node worker by default', async () => {
+  const db = fakeDb({stats: () => ({tasks: 0})});
+  let driverOptions;
+  await executeFactoryCli(['run', '--once'], {
     env: {},
-    stderr: stderr.stream,
     stdout: output().stream,
-    dependencies: baseDependencies(db),
+    dependencies: baseDependencies(db, {
+      source: {fill: async () => ({candidates: [], results: [], enqueued: []})},
+      createDriver: (options) => { driverOptions = options; return {}; },
+      createBoard: () => null,
+      runCycle: async () => ({claimed: 0, results: []}),
+    }),
   });
-  assert.equal(code, 1);
-  assert.match(stderr.read(), /--worker-command/);
+  assert.equal(driverOptions.command, FACTORY_DEFAULTS.workerCommand);
   assert.equal(db.closed, true);
 });
 
-test('production run admits exact-base cloning through GitHub safety instead of the worker command', async () => {
+test('production run clones exact public source outside the publication pause queue', async () => {
   const publicState = () => ({open_northset_prs: 0});
   const db = fakeDb({
     getPublicActionState: publicState,
@@ -146,9 +155,11 @@ test('production run admits exact-base cloning through GitHub safety instead of 
     stats: () => ({tasks: 1}),
   });
   const requests = [];
+  const transportRequests = [];
   let driverOptions;
   let safetyRepositoryState;
   const transport = async (request) => {
+    transportRequests.push(request);
     assert.equal(request.operation, 'git_clone');
     return {status: 200, repository_path: request.destination, base_oid: request.base_oid};
   };
@@ -179,11 +190,11 @@ test('production run admits exact-base cloning through GitHub safety instead of 
     }),
   });
   assert.equal(driverOptions.command, '/opt/northset/author');
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].kind, 'read');
-  assert.equal(requests[0].operation, 'git_clone');
-  assert.equal(requests[0].base_oid, '1'.repeat(40));
-  assert.equal(requests[0].destination, path.resolve('/tmp/factory-test-root/repository'));
+  assert.equal(requests.length, 0);
+  assert.equal(transportRequests.length, 1);
+  assert.equal(transportRequests[0].operation, 'git_clone');
+  assert.equal(transportRequests[0].base_oid, '1'.repeat(40));
+  assert.equal(transportRequests[0].destination, path.resolve('/tmp/factory-test-root/repository'));
   assert.equal(typeof safetyRepositoryState, 'function');
   assert.deepEqual(safetyRepositoryState({repository: 'owner/repo'}), {open_northset_prs: 0});
   assert.equal(result.recovered, 1);
@@ -217,10 +228,35 @@ test('run remains alive when idle, ticks board age, and stops through the inject
     }),
   });
   assert.equal(cycles, 2);
+  assert.equal(result.source.paused, 0);
   assert.equal(boardTicks, 2);
   assert.equal(sleeps, 1);
   assert.equal(result.stopped, true);
   assert.equal(result.claimed, 1);
+  assert.equal(db.closed, true);
+});
+
+test('a publication pause skips new preflight but still drains already queued local work', async () => {
+  const db = fakeDb({stats: () => ({ready_items: 1})});
+  let cycles = 0;
+  const paused = new Error('publication paused');
+  paused.code = 'GITHUB_PAUSED';
+  const result = await executeFactoryCli(['run', '--once'], {
+    env: {},
+    stdout: output().stream,
+    dependencies: baseDependencies(db, {
+      driver: {},
+      source: {fill: async () => { throw paused; }},
+      createBoard: () => null,
+      runCycle: async () => {
+        cycles += 1;
+        return {claimed: 1, results: [{state: 'READY'}]};
+      },
+    }),
+  });
+  assert.equal(cycles, 1);
+  assert.equal(result.claimed, 1);
+  assert.equal(result.source.paused, 1);
   assert.equal(db.closed, true);
 });
 
@@ -310,7 +346,13 @@ test('publish routes the final recheck through safety and uses the injected rece
       publishBoard: async (digest, options) => {
         publicationOptions = options;
         const plan = {mission_id: 'M-001', repository: 'owner/repo'};
-        assert.deepEqual(await options.liveRecheck(plan), {clean: true});
+        assert.deepEqual(await options.safety.request({
+          priority: 'final_submission',
+          kind: 'read',
+          operation: 'final_live_recheck',
+          repository: plan.repository,
+          execute: () => options.liveRecheck(plan),
+        }), {clean: true});
         await options.receiptPublisher([plan]);
         return {board_digest: digest, results: [{mission_id: 'M-001', state: 'SUBMITTED'}]};
       },
@@ -329,17 +371,29 @@ test('publish routes the final recheck through safety and uses the injected rece
   assert.equal(db.closed, true);
 });
 
-test('publish refuses to start without a receipt prepublication adapter', async () => {
+test('publish uses the production receipt prepublication adapter by default', async () => {
   const db = fakeDb();
-  await assert.rejects(() => executeFactoryCli(['publish', '--board', BOARD], {
+  let receiptOptions;
+  let publicationOptions;
+  const receiptPublisher = async () => ({commit_oid: '1'.repeat(40)});
+  await executeFactoryCli(['publish', '--board', BOARD], {
     env: {},
     stdout: output().stream,
     dependencies: baseDependencies(db, {
       github: {finalLiveRecheck: async () => ({clean: true})},
       createSafety: () => ({request: async (request) => request.execute()}),
-      publishBoard: async () => assert.fail('publisher must not start'),
+      createReceiptPublisher: (options) => {
+        receiptOptions = options;
+        return receiptPublisher;
+      },
+      publishBoard: async (_board, options) => {
+        publicationOptions = options;
+        return {results: []};
+      },
     }),
-  }), /--receipt-command/);
+  });
+  assert.deepEqual(receiptOptions, {remoteUrl: FACTORY_DEFAULTS.receiptRemote});
+  assert.equal(publicationOptions.receiptPublisher, receiptPublisher);
   assert.equal(db.closed, true);
 });
 

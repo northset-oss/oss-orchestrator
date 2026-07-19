@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {createBoardIfDue, classifyRisk} from './board.mjs';
 import {sha256} from './db.mjs';
+import {receiptUrlFor} from './receipt-publisher.mjs';
 import {buildProof} from './verifier.mjs';
 
 export class Semaphore {
@@ -51,8 +52,7 @@ async function oneInfrastructureRetry(operation) {
   }
 }
 
-function receiptFooter(missionId) {
-  const receiptUrl = `https://northset-oss.github.io/verification-pilot/receipts/${missionId}/`;
+function receiptFooter(missionId, receiptUrl) {
   return [
     '---',
     'AI assistance was used. This change was reviewed by Northset, and I accept responsibility for this submission.',
@@ -66,26 +66,26 @@ function receiptFooter(missionId) {
   ].join('\n');
 }
 
-export function finalizePrBody(body, missionId) {
-  const receiptUrl = `https://northset-oss.github.io/verification-pilot/receipts/${missionId}/`;
+export function finalizePrBody(body, missionId, receiptUrl) {
   let rendered = String(body ?? '')
     .replaceAll('{{MISSION_ID}}', missionId)
     .replaceAll('{{RECEIPT_URL}}', receiptUrl)
     .trimEnd();
   if (!rendered.includes(`<!-- northset-receipt:${missionId}:start -->`)) {
-    rendered = `${rendered}\n\n${receiptFooter(missionId)}`.trim();
+    rendered = `${rendered}\n\n${receiptFooter(missionId, receiptUrl)}`.trim();
   }
   return `${rendered}\n`;
 }
 
 function defaultManifest(task, authorResult, verification, missionId) {
-  const receiptUrl = `https://northset-oss.github.io/verification-pilot/receipts/${missionId}/`;
-  const body = finalizePrBody(authorResult.pr_body, missionId);
+  const receiptUrl = receiptUrlFor(missionId, verification.commit_oid);
+  const body = finalizePrBody(authorResult.pr_body, missionId, receiptUrl);
   const manifest = {
     repository: task.repository,
     fork_repository: authorResult.fork_repository ?? task.live_state?.fork_repository ?? null,
     repository_path: authorResult.repository_path ?? null,
     patch_path: authorResult.patch_path ?? null,
+    verification_path: authorResult.verification_path ?? null,
     issue_number: task.issue_number,
     issue_url: authorResult.issue_url ?? `https://github.com/${task.repository}/issues/${task.issue_number}`,
     invitation_summary: task.live_state?.invitation_summary ?? 'Live preflight confirmed an invited, unoccupied issue.',
@@ -97,6 +97,10 @@ function defaultManifest(task, authorResult, verification, missionId) {
     tested_tree_oid: verification.tested_tree_oid,
     commit_oid: verification.commit_oid,
     checks: authorResult.checks ?? [authorResult.test_command].filter(Boolean),
+    test_command: authorResult.test_command,
+    install_command: authorResult.install_command ?? null,
+    test_only_paths: authorResult.test_only_paths ?? [],
+    base_failure_contains: authorResult.base_failure_contains ?? null,
     verification,
     pr_title: authorResult.pr_title,
     pr_body: body,
@@ -175,13 +179,14 @@ async function processClaim(claim, {
     let lastError = null;
     for (let authorAttempt = 1; authorAttempt <= 2; authorAttempt += 1) {
       try {
-        const authored = await semaphores.author.run(() => driver.author(task, checkout, scout, {
-          attempt: authorAttempt,
-          effort: authorAttempt === 1 ? 'high' : (driver.secondEffort ?? 'high'),
-          timeoutMs: 10 * 60_000,
-          verifierFeedback: feedback,
-          dependencyMaterial,
-        }));
+        const authored = await semaphores.author.run(() => oneInfrastructureRetry(() =>
+          driver.author(task, checkout, scout, {
+            attempt: authorAttempt,
+            effort: authorAttempt === 1 ? 'high' : (driver.secondEffort ?? 'high'),
+            timeoutMs: 10 * 60_000,
+            verifierFeedback: feedback,
+            dependencyMaterial,
+          })));
         if (!authored || authored.outcome === 'SKIP') {
           db.finishAttempt(attempt.attempt_id, {
             outcome: 'SKIPPED', failureClass: 'authoring',
@@ -191,9 +196,8 @@ async function processClaim(claim, {
           return {task_id: task.task_id, state: 'SKIPPED', reason: authored?.reason ?? null};
         }
         assertAuthorResult(authored);
-        const verification = await semaphores.verifier.run(() => driver.verify(task, checkout, scout, authored, {
-          dependencyMaterial,
-        }));
+        const verification = await semaphores.verifier.run(() => oneInfrastructureRetry(() =>
+          driver.verify(task, checkout, scout, authored, {dependencyMaterial})));
         assertVerification(verification);
         const artifacts = await driver.persist?.(task, checkout, {
           attempt,
@@ -203,23 +207,38 @@ async function processClaim(claim, {
         const publishable = {
           ...authored,
           ...artifacts,
+          install_command: dependencyMaterial?.install_command ?? authored.install_command ?? null,
           changed_files: verification.changed_files,
           changed_lines: verification.changed_lines,
         };
-        db.finishAttempt(attempt.attempt_id, {
-          outcome: 'VERIFIED', durationMs: now().getTime() - began,
-          patchSha256: verification.patch_sha256,
-          commitOid: verification.commit_oid,
-          verification, now: now(),
+        const riskTier = classifyRisk({
+          ...publishable,
+          risk_tier: undefined,
+          changed_files: verification.changed_files,
+          changed_lines: verification.changed_lines,
         });
-        const riskTier = publishable.risk_tier ?? classifyRisk(publishable);
         if (riskTier === 'RED') {
-          db.updateTaskState(task.task_id, 'SKIPPED', 'Red work is outside the scaled lane', {now: now()});
+          db.finishAttempt(attempt.attempt_id, {
+            outcome: 'SKIPPED', failureClass: 'risk',
+            durationMs: now().getTime() - began,
+            patchSha256: verification.patch_sha256,
+            commitOid: verification.commit_oid,
+            verification,
+            error: 'Red work is outside the scaled lane',
+            now: now(),
+          });
           return {task_id: task.task_id, state: 'SKIPPED', reason: 'RED'};
         }
-        const ready = db.promoteVerified(attempt.attempt_id,
+        const ready = db.finishVerifiedReady(attempt.attempt_id,
           (missionId) => defaultManifest(task, publishable, verification, missionId),
-          {riskTier, now: now()});
+          {
+            durationMs: now().getTime() - began,
+            patchSha256: verification.patch_sha256,
+            commitOid: verification.commit_oid,
+            verification,
+            riskTier,
+            now: now(),
+          });
         const board = createBoardIfDue(db, {...boardPolicy, now: now()});
         return {task_id: task.task_id, state: 'READY', mission_id: ready.mission_id, board};
       } catch (error) {
@@ -354,7 +373,8 @@ function runJsonCommand(command, args, payload, {
       }
       if (code !== 0) {
         const error = new Error(`worker command failed: ${(stderr || stdout).trim() || `exit ${code}`}`);
-        error.transient = /temporar|timed out|connection reset/i.test(stderr);
+        error.transient = /temporar|timed out|connection reset|econnreset|etimedout|eai_again|network unreachable|registry[^\n]*(?:unavailable|timeout)|cannot connect to the docker daemon/i
+          .test(stderr);
         reject(error);
         return;
       }
@@ -396,6 +416,7 @@ async function persistGitArtifact(task, checkout, {attempt, verification}, artif
   const root = await mkdtemp(path.join(taskRoot, `${attempt.attempt_id}-`));
   const repository = path.join(root, 'repo');
   const patchFile = path.join(root, 'change.patch');
+  const verificationFile = path.join(root, 'verification.json');
   try {
     await runBufferedCommand('git', ['clone', '--no-local', '--no-checkout', checkout, repository]);
     await runBufferedCommand('git', ['-C', repository, 'checkout', '--detach', verification.commit_oid]);
@@ -411,7 +432,8 @@ async function persistGitArtifact(task, checkout, {attempt, verification}, artif
       throw new Error('durable artifact patch does not match the verified patch digest');
     }
     await writeFile(patchFile, patch, {mode: 0o600});
-    return {repository_path: repository, patch_path: patchFile};
+    await writeFile(verificationFile, `${JSON.stringify(verification, null, 2)}\n`, {mode: 0o600});
+    return {repository_path: repository, patch_path: patchFile, verification_path: verificationFile};
   } catch (error) {
     await rm(root, {recursive: true, force: true});
     throw error;
@@ -431,7 +453,9 @@ export function createCommandDriver({
   const roots = new Map();
   return {
     async checkout(task, attempt) {
-      const root = await mkdtemp(path.join(workRoot ?? os.tmpdir(), `northset-${task.task_id.toLowerCase()}-`));
+      const parent = path.resolve(workRoot ?? os.tmpdir());
+      await mkdir(parent, {recursive: true, mode: 0o700});
+      const root = await mkdtemp(path.join(parent, `northset-${task.task_id.toLowerCase()}-`));
       try {
         const result = checkoutProvider
           ? await checkoutProvider(task, attempt, root)

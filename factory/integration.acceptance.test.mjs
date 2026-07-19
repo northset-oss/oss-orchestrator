@@ -89,6 +89,9 @@ test('real database carries one approved item through exact publication and dura
     liveRecheck: async () => ({clean: true}),
     receiptPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
       mission_id: item.mission_id, receipt_url: item.receipt_url,
+      proof_sha256: `sha256:${'f'.repeat(64)}`,
+      batch_commit_oid: 'e'.repeat(40),
+      batch_approval_digest: item.approval_digest,
     }])),
     now: () => new Date('2026-07-19T12:00:00.000Z'),
   });

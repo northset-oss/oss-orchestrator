@@ -9,6 +9,9 @@ import {
 } from './publisher.mjs';
 
 const BOARD_DIGEST = `sha256:${'b'.repeat(64)}`;
+const APPROVAL_DIGEST = `sha256:${'a'.repeat(64)}`;
+const RECEIPT_PROOF_DIGEST = `sha256:${'c'.repeat(64)}`;
+const RECEIPT_BATCH_OID = 'd'.repeat(40);
 
 function digest(value) {
   return `sha256:${createHash('sha256').update(value).digest('hex')}`;
@@ -58,6 +61,7 @@ class FakeDb {
     this.board = {board_digest: BOARD_DIGEST, items};
     this.approval = {
       board_digest: BOARD_DIGEST,
+      approval_digest: APPROVAL_DIGEST,
       approved_ids: items.map((item) => item.mission_id),
       approved_by: 'internal-user:aeziz',
     };
@@ -96,6 +100,14 @@ class FakeDb {
 
   async getRepositoryState(repository) {
     return structuredClone(this.repositoryStates.get(repository) ?? {open_northset_prs: 0});
+  }
+
+  async replaceReadyManifest(id, manifest) {
+    const current = this.ready.get(id);
+    const next = {...current, ...structuredClone(manifest), mission_id: id,
+      approval_state: 'PENDING', manifest_sha256: digest(`refreshed:${id}`)};
+    this.ready.set(id, next);
+    return structuredClone(next);
   }
 }
 
@@ -196,6 +208,9 @@ function receipts(items) {
   return Object.fromEntries(items.map((item) => [item.mission_id, {
     mission_id: item.mission_id,
     receipt_url: item.receipt_url,
+    proof_sha256: RECEIPT_PROOF_DIGEST,
+    batch_commit_oid: RECEIPT_BATCH_OID,
+    batch_approval_digest: item.approval_digest,
   }]));
 }
 
@@ -262,6 +277,26 @@ test('one stale item is removed without stopping clean batch items', async () =>
   assert.equal(github.count('push_branch'), 19);
   assert.equal(github.count('create_pull_request'), 19);
   assert.equal(db.taskStates.get('TASK-008').state, 'SUPERSEDED');
+});
+
+test('a cleanly refreshed moved-base item keeps its mission ID and returns alone for reapproval', async () => {
+  const db = new FakeDb(3);
+  const github = new FakeGitHub();
+  const refreshedBase = 'e'.repeat(40);
+  const result = await publishBoard(BOARD_DIGEST, options(db, github, {
+    liveRecheck: async (item) => item.mission_id === 'M-002'
+      ? {clean: false, refreshable: true, current_base_oid: refreshedBase, reason: 'base moved'}
+      : {clean: true},
+    refreshStale: async (plan) => ({manifest: {...plan.manifest, base_oid: refreshedBase,
+      commit_oid: 'f'.repeat(40)}}),
+  }));
+  const refreshed = result.results.find((item) => item.mission_id === 'M-002');
+  assert.equal(refreshed.state, 'READY');
+  assert.equal(refreshed.code, 'REAPPROVAL_REQUIRED');
+  assert.equal(db.ready.get('M-002').approval_state, 'PENDING');
+  assert.equal(db.ready.get('M-002').base_oid, refreshedBase);
+  assert.equal(result.results.filter((item) => item.state === 'SUBMITTED').length, 2);
+  assert.equal(github.count('create_pull_request'), 2);
 });
 
 test('stored PR body or head mismatch fails only that item', async () => {

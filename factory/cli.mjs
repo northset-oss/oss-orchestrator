@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import {spawn} from 'node:child_process';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
@@ -9,6 +8,7 @@ import {openFactoryDb} from './db.mjs';
 import {createGhCliPublisherAdapter, createGhCliTransport} from './gh-cli.mjs';
 import {createGitHubSafety, resumeGitHub} from './github-safety.mjs';
 import {publishBoard} from './publisher.mjs';
+import {createReceiptPublisher} from './receipt-publisher.mjs';
 import {createSource} from './source.mjs';
 import {createCommandDriver, runFactoryCycle} from './worker.mjs';
 
@@ -20,6 +20,8 @@ export const FACTORY_DEFAULTS = Object.freeze({
   lake: path.join(REPO_ROOT, 'candidate_lake.sqlite'),
   pauseFile: path.join(REPO_ROOT, 'runs', 'factory', 'github-pause.json'),
   workRoot: path.join(REPO_ROOT, 'runs', 'factory', 'work'),
+  workerCommand: path.join(REPO_ROOT, 'factory', 'node-worker.mjs'),
+  receiptRemote: 'https://github.com/northset-oss/verification-pilot.git',
 });
 
 const COMMANDS = new Set(['run', 'board', 'approve', 'publish', 'github-status', 'github-resume']);
@@ -29,7 +31,7 @@ const COMMAND_VALUE_FLAGS = Object.freeze({
     '--candidate-limit', '--worker-command', '--work-root', '--poll-ms']),
   board: new Set(),
   approve: new Set(['--board', '--ids', '--reject-ids', '--approved-by']),
-  publish: new Set(['--board', '--receipt-command']),
+  publish: new Set(['--board', '--receipt-remote']),
   'github-status': new Set(),
   'github-resume': new Set(['--reason', '--cleared-by']),
 });
@@ -140,7 +142,8 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
       boardMaxAgeMinutes: nonnegativeNumber(
         parsed.get('--board-max-age-minutes') ?? '30', '--board-max-age-minutes'),
       candidateLimit,
-      workerCommand: parsed.get('--worker-command') ?? env.OSS_FACTORY_WORKER_COMMAND ?? null,
+      workerCommand: parsed.get('--worker-command') ?? env.OSS_FACTORY_WORKER_COMMAND ??
+        FACTORY_DEFAULTS.workerCommand,
       workRoot: pathValue(parsed.get('--work-root') ?? env.OSS_FACTORY_WORK_ROOT, FACTORY_DEFAULTS.workRoot),
       pollMs: nonnegativeInteger(parsed.get('--poll-ms') ?? '5000', '--poll-ms'),
       once: parsed.get('--once') === true,
@@ -172,7 +175,8 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
     return {
       ...common,
       board,
-      receiptCommand: parsed.get('--receipt-command') ?? env.OSS_FACTORY_RECEIPT_COMMAND ?? null,
+      receiptRemote: parsed.get('--receipt-remote') ?? env.OSS_FACTORY_RECEIPT_REMOTE ??
+        FACTORY_DEFAULTS.receiptRemote,
     };
   }
   if (command === 'github-resume') {
@@ -189,33 +193,6 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
 
 function printJson(stdout, value) {
   stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-}
-
-function runJsonCommand(command, payload) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, [], {stdio: ['pipe', 'pipe', 'pipe']});
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk; });
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`receipt command failed: ${(stderr || stdout).trim() || `exit ${code}`}`));
-        return;
-      }
-      try { resolve(stdout.trim() ? JSON.parse(stdout) : null); }
-      catch (error) { reject(new Error(`receipt command returned invalid JSON: ${error.message}`)); }
-    });
-    child.stdin.end(`${JSON.stringify(payload)}\n`);
-  });
-}
-
-function receiptPublisherFor(command) {
-  if (!command) {
-    throw new Error('publish requires --receipt-command or OSS_FACTORY_RECEIPT_COMMAND');
-  }
-  return (items) => runJsonCommand(command, {action: 'publish-receipt-batch', items});
 }
 
 async function currentBoard(db, createBoard) {
@@ -264,6 +241,7 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
   publishBoard,
   createTransport: createGhCliTransport,
   createPublisherAdapter: createGhCliPublisherAdapter,
+  createReceiptPublisher,
   createSafety: createGitHubSafety,
   resumeGitHub,
 });
@@ -301,9 +279,6 @@ export async function executeFactoryCli(argv, {
   const db = deps.openDb(options.database);
   try {
     if (options.command === 'run') {
-      if (!options.workerCommand && !dependencies.driver) {
-        throw new Error('run requires --worker-command or OSS_FACTORY_WORKER_COMMAND');
-      }
       const safety = deps.createSafety({
         pauseFile: options.pauseFile,
         transport: safetyTransport,
@@ -337,9 +312,7 @@ export async function executeFactoryCli(argv, {
           throw new Error(`${task?.task_id ?? 'task'} cannot clone without an exact base OID`);
         }
         const destination = path.join(allocatedRoot, 'repository');
-        const result = await safety.request({
-          priority: 'live_preflight',
-          kind: 'read',
+        const result = await transport({
           operation: 'git_clone',
           repository: task.repository,
           destination,
@@ -358,18 +331,30 @@ export async function executeFactoryCli(argv, {
         checkoutProvider,
       });
       const recovered = db.recoverWorkingTasks?.() ?? [];
-      const filled = await source.fill({
-        workers: options.workers,
-        limit: options.candidateLimit,
-        profile: options.profile,
-        now: new Date(),
-      });
       const boardPolicy = {minSize: options.boardSize, maxAgeMinutes: options.boardMaxAgeMinutes};
+      const sourceTotal = {selected: 0, go: 0, skipped: 0, escalated: 0, enqueued: 0, paused: 0};
       let iterations = 0;
       let claimed = 0;
       let completed = 0;
       let lastCycle = null;
       while (!signal?.aborted) {
+        let filled;
+        try {
+          filled = await source.fill({
+            workers: options.workers,
+            limit: options.candidateLimit,
+            profile: options.profile,
+            now: new Date(),
+          });
+        } catch (error) {
+          if (error?.code !== 'GITHUB_PAUSED') throw error;
+          filled = {candidates: [], results: [], enqueued: [], paused: true};
+        }
+        const summary = sourceSummary(filled);
+        for (const key of ['selected', 'go', 'skipped', 'escalated', 'enqueued']) {
+          sourceTotal[key] += summary[key];
+        }
+        if (filled?.paused) sourceTotal.paused += 1;
         lastCycle = await deps.runCycle({
           db,
           driver,
@@ -382,12 +367,12 @@ export async function executeFactoryCli(argv, {
         completed += lastCycle?.results?.length ?? 0;
         deps.createBoard(db, boardPolicy);
         if (options.once) break;
-        if (Number(lastCycle?.claimed ?? 0) === 0) {
+        if (Number(lastCycle?.claimed ?? 0) === 0 && summary.enqueued === 0) {
           await (dependencies.sleep ?? defaultSleep)(options.pollMs, signal);
         }
       }
       const result = {
-        source: sourceSummary(filled),
+        source: sourceTotal,
         recovered: Array.isArray(recovered)
           ? recovered.length : Number(recovered?.recovered ?? recovered ?? 0),
         iterations,
@@ -432,14 +417,10 @@ export async function executeFactoryCli(argv, {
       const github = dependencies.github ?? deps.createPublisherAdapter({
         transport,
       });
-      const liveRecheck = dependencies.liveRecheck ?? ((plan) => safety.request({
-        priority: 'final_submission',
-        kind: 'read',
-        operation: 'final_live_recheck',
-        repository: plan.repository,
-        execute: () => github.finalLiveRecheck(plan),
-      }));
-      const receiptPublisher = dependencies.receiptPublisher ?? receiptPublisherFor(options.receiptCommand);
+      const liveRecheck = dependencies.liveRecheck ?? github.finalLiveRecheck.bind(github);
+      const receiptPublisher = dependencies.receiptPublisher ?? deps.createReceiptPublisher({
+        remoteUrl: options.receiptRemote,
+      });
       const result = await deps.publishBoard(options.board, {
         db,
         github,

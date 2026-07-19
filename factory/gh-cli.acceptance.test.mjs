@@ -241,7 +241,7 @@ test('H6 final live recheck accepts unchanged clean state and explains concrete 
         issue: {
           state: 'OPEN', locked: false,
           assignees: {nodes: [], pageInfo: {hasNextPage: false}},
-          comments: {nodes: []},
+          comments: {pageInfo: {hasPreviousPage: false}, nodes: []},
           timelineItems: {pageInfo: {hasPreviousPage: false}, nodes: []},
         },
       },
@@ -261,7 +261,8 @@ test('H6 final live recheck accepts unchanged clean state and explains concrete 
   const plan = {repository: 'upstream/project', issue_number: 9, base_branch: 'main', base_oid: baseOid,
     branch: 'northset/m-1001', mission_id: 'M-1001'};
   assert.deepEqual(await github.finalLiveRecheck(plan),
-    {clean: true, reason: null, base_oid: baseOid, issue_state: 'OPEN'});
+    {clean: true, reason: null, base_oid: baseOid, current_base_oid: baseOid,
+      base_changed: false, refreshable: false, cooldown: null, issue_state: 'OPEN'});
   response = structuredClone(response);
   response.data.repository.ref.target.oid = 'e'.repeat(40);
   response.data.repository.issue.assignees.nodes = [{login: 'someone'}];
@@ -278,6 +279,37 @@ test('H6 final live recheck accepts unchanged clean state and explains concrete 
   assert.match(blocked.reason, /linked open competing PR exists: #44/);
   assert.match(blocked.reason, /active external claim by contributor/);
   assert.match(blocked.reason, /another open PR/);
+});
+
+test('H6b final live recheck recognizes a maintainer opt-out and emits a manual cooldown', async () => {
+  const baseOid = 'd'.repeat(40);
+  const transport = fakeTransport({
+    rest: async () => structured({}),
+    graphql: async () => structured({data: {
+      repository: {
+        nameWithOwner: 'upstream/project', isArchived: false, isFork: false,
+        ref: {target: {oid: baseOid}},
+        issue: {
+          state: 'OPEN', locked: false,
+          assignees: {nodes: [{login: 'AysajanE'}], pageInfo: {hasNextPage: false}},
+          comments: {pageInfo: {hasPreviousPage: false}, nodes: [{
+            body: 'Please do not submit a pull request for this issue.',
+            createdAt: '2026-07-19T10:00:00Z', authorAssociation: 'MEMBER',
+            author: {login: 'maintainer', __typename: 'User'},
+          }]},
+          timelineItems: {pageInfo: {hasPreviousPage: false}, nodes: []},
+        },
+      },
+      northset: {issueCount: 0, nodes: []},
+    }}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  const result = await github.finalLiveRecheck({repository: 'upstream/project', issue_number: 9,
+    base_branch: 'main', base_oid: baseOid, branch: 'northset/m-1001', mission_id: 'M-1001'});
+  assert.equal(result.clean, false);
+  assert.match(result.reason, /maintainer requested no submission/);
+  assert.deepEqual(result.cooldown, {reason: 'explicit maintainer stop/opt-out', until: 'manual-release'});
 });
 
 test('H7 deep overlap resolves closed history and rejects an open referenced PR', async () => {

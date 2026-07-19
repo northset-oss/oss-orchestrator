@@ -55,3 +55,81 @@ test('schema v1 publication checkpoints migrate additively and retain async reco
   assert.equal(saved.status_error, 'temporary status failure');
   assert.equal(saved.last_error_detail, 'retry asynchronously');
 });
+
+function enqueueAndClaim(db) {
+  const [task] = db.enqueueTasks([{
+    candidate: 'owner/repo#123',
+    repository: 'owner/repo',
+    issue_number: 123,
+    profile: 'node',
+    base_oid: 'a'.repeat(40),
+  }], {now: '2026-07-19T12:00:00.000Z'});
+  return {task, claim: db.claimNextTask({now: '2026-07-19T12:01:00.000Z'})};
+}
+
+test('successful verification closes its attempt and creates READY atomically', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-ready-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'), {missionStart: 42});
+  t.after(() => db.close());
+  const {task, claim} = enqueueAndClaim(db);
+  const verification = {ok: true, patch_sha256: `sha256:${'b'.repeat(64)}`, commit_oid: 'c'.repeat(40)};
+
+  const ready = db.finishVerifiedReady(claim.attempt.attempt_id, (missionId, callbackTask, callbackAttempt) => {
+    assert.equal(missionId, 'M-042');
+    assert.equal(callbackTask.task_id, task.task_id);
+    assert.equal(callbackAttempt.outcome, 'VERIFIED');
+    assert.deepEqual(callbackAttempt.verification, verification);
+    return {pr_title: 'fix: bounded issue', pr_body: 'Fix the bounded issue.'};
+  }, {
+    durationMs: 321,
+    patchSha256: verification.patch_sha256,
+    commitOid: verification.commit_oid,
+    verification,
+    riskTier: 'GREEN',
+    now: '2026-07-19T12:02:00.000Z',
+  });
+
+  assert.equal(ready.mission_id, 'M-042');
+  assert.equal(ready.task_id, task.task_id);
+  assert.equal(ready.attempt_id, claim.attempt.attempt_id);
+  assert.equal(db.getTask(task.task_id).state, 'READY');
+  assert.equal(db.getTask(task.task_id).worker_id, null);
+  assert.deepEqual(db.getAttempt(claim.attempt.attempt_id), {
+    ...claim.attempt,
+    finished_at: '2026-07-19T12:02:00.000Z',
+    outcome: 'VERIFIED',
+    failure_class: null,
+    duration_ms: 321,
+    patch_sha256: verification.patch_sha256,
+    commit_oid: verification.commit_oid,
+    verification,
+  });
+  assert.equal(db.connection.prepare("SELECT value FROM factory_meta WHERE key='next_mission_number'").get().value, '43');
+});
+
+test('manifest callback failure rolls back attempt, task, READY item, and mission allocation', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-ready-rollback-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'), {missionStart: 42});
+  t.after(() => db.close());
+  const {task, claim} = enqueueAndClaim(db);
+
+  assert.throws(() => db.finishVerifiedReady(claim.attempt.attempt_id, (missionId, _task, attempt) => {
+    assert.equal(missionId, 'M-042');
+    assert.equal(attempt.outcome, 'VERIFIED');
+    throw new Error('manifest persistence failed');
+  }, {
+    durationMs: 321,
+    patchSha256: `sha256:${'b'.repeat(64)}`,
+    commitOid: 'c'.repeat(40),
+    verification: {ok: true},
+    now: '2026-07-19T12:02:00.000Z',
+  }), /manifest persistence failed/);
+
+  assert.deepEqual(db.getAttempt(claim.attempt.attempt_id), claim.attempt);
+  assert.equal(db.getTask(task.task_id).state, 'WORKING');
+  assert.equal(db.getTask(task.task_id).worker_id, 'factory');
+  assert.equal(db.stats().ready_items, 0);
+  assert.equal(db.connection.prepare("SELECT value FROM factory_meta WHERE key='next_mission_number'").get().value, '42');
+});
