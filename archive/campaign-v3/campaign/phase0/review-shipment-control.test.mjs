@@ -82,7 +82,7 @@ test('production review history is canonical across caller-selected runs directo
   const first = phase0ReviewControlFileForBatch([{missionDir: '/tmp/run-a/M-001'}]);
   const second = phase0ReviewControlFileForBatch([{missionDir: '/tmp/run-b/M-001'}]);
   assert.equal(first, second);
-  assert.equal(first, path.resolve('runs/phase0/review-control.json'));
+  assert.equal(first, path.resolve(import.meta.dirname, '../..', 'runs/phase0/review-control.json'));
 });
 
 test('ship preflight durably records a disagreement and blocks before founder adjudication', async (t) => {

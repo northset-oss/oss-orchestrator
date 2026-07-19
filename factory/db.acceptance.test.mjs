@@ -41,6 +41,9 @@ test('schema v1 publication checkpoints migrate additively and retain async reco
     status_state: 'PENDING',
     status_url: null,
     status_error: 'temporary status failure',
+    pr_state: 'OPEN',
+    merged: false,
+    ci_state: 'PENDING',
     last_error_detail: 'retry asynchronously',
   });
   assert.equal(saved.branch, 'northset/m-1000');
@@ -53,6 +56,10 @@ test('schema v1 publication checkpoints migrate additively and retain async reco
   assert.equal(saved.submitted_at, '2026-07-19T12:01:00.000Z');
   assert.equal(saved.status_state, 'PENDING');
   assert.equal(saved.status_error, 'temporary status failure');
+  assert.equal(saved.pr_state, 'OPEN');
+  assert.equal(saved.merged, false);
+  assert.equal(saved.ci_state, 'PENDING');
+  assert.equal(saved.outcome_recorded_at, null);
   assert.equal(saved.last_error_detail, 'retry asynchronously');
 });
 

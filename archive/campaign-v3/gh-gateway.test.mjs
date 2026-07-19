@@ -252,7 +252,10 @@ test('environment test mode treats blank paths as unset and refuses mixed or rea
   }}), refusesProductionIdentity);
 
   const productionAlias = path.join(files.root, 'production-runs-alias');
-  await symlink(path.join(process.cwd(), 'runs'), productionAlias);
+  const archivedProductionRuns = path.join(import.meta.dirname, 'runs');
+  await mkdir(archivedProductionRuns, {recursive: true});
+  t.after(() => rm(archivedProductionRuns, {recursive: true, force: true}));
+  await symlink(archivedProductionRuns, productionAlias);
   await assert.rejects(() => readGhDailyBudgetState({env: {
     ...isolatedEnv,
     OSS_GH_GATEWAY_STATE_DIR: productionAlias,
@@ -261,7 +264,7 @@ test('environment test mode treats blank paths as unset and refuses mixed or rea
   if (process.platform === 'darwin') {
     await assert.rejects(() => readGhDailyBudgetState({env: {
       ...isolatedEnv,
-      OSS_GH_GATEWAY_STATE_DIR: path.join(process.cwd().toUpperCase(), 'RUNS', 'GH-GATEWAY-STATE'),
+      OSS_GH_GATEWAY_STATE_DIR: path.join(import.meta.dirname.toUpperCase(), 'RUNS', 'GH-GATEWAY-STATE'),
     }}), refusesProductionIdentity);
   }
 

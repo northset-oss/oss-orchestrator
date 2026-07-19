@@ -384,3 +384,60 @@ test('H9 commit and PR head mismatches fail instead of silently changing approve
     head_oid: oid, title: 'Keep exact title', body: 'Exact body\n'}),
   (error) => error instanceof GhCliError && error.code === 'PR_HEAD_MISMATCH');
 });
+
+test('H10 reconciliation adapters read combined CI and GitHub artifact attestation state', async () => {
+  const proofDigest = `sha256:${'a'.repeat(64)}`;
+  const requests = [];
+  const transport = fakeTransport({
+    rest: async (request) => {
+      requests.push(request);
+      if (request.path.endsWith(`/commits/${'b'.repeat(40)}/status`)) {
+        return structured({state: 'success', total_count: 3, updated_at: '2026-07-19T13:01:00Z'});
+      }
+      if (request.path.includes('/attestations/')) {
+        return structured({attestations: [{
+          html_url: 'https://github.com/northset-oss/verification-pilot/attestations/123',
+          created_at: '2026-07-19T13:02:00Z',
+          bundle: {mediaType: 'application/vnd.dev.sigstore.bundle+json;version=0.3'},
+        }]});
+      }
+      throw new Error(`unexpected REST request ${request.path}`);
+    },
+    graphql: async () => structured({data: {}}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  assert.deepEqual(await github.getCommitStatus({repository: 'upstream/project', oid: 'b'.repeat(40)}), {
+    status: 200,
+    headers: {'x-ratelimit-remaining': '4999'},
+    found: true,
+    state: 'SUCCESS',
+    total_count: 3,
+    updated_at: '2026-07-19T13:01:00Z',
+  });
+  const attestation = await github.getArtifactAttestation({
+    repository: 'northset-oss/verification-pilot', subject_digest: proofDigest,
+  });
+  assert.equal(attestation.found, true);
+  assert.equal(attestation.attestation_url,
+    'https://github.com/northset-oss/verification-pilot/attestations/123');
+  assert.equal(attestation.attested_at, '2026-07-19T13:02:00Z');
+  assert.match(requests[1].path, new RegExp(`attestations/sha256%3A${'a'.repeat(64)}$`));
+});
+
+test('H11 missing combined status or attestation remains factual and pending', async () => {
+  const transport = fakeTransport({
+    rest: async () => structured({message: 'Not Found'}, {status: 404}),
+    graphql: async () => structured({data: {}}),
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  assert.deepEqual(await github.getCommitStatus({repository: 'upstream/project', oid: 'b'.repeat(40)}), {
+    status: 404, headers: {'x-ratelimit-remaining': '4999'}, found: false, state: null,
+  });
+  assert.deepEqual(await github.getArtifactAttestation({repository: 'northset-oss/verification-pilot',
+    subject_digest: `sha256:${'a'.repeat(64)}`}), {
+    status: 404, headers: {'x-ratelimit-remaining': '4999'}, found: false,
+    attestation_url: null, attested_at: null,
+  });
+});

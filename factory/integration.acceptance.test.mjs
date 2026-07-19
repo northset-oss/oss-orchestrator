@@ -102,6 +102,10 @@ test('real database carries one approved item through exact publication and dura
   assert.equal(publication.publication_state, 'SUBMITTED');
   assert.equal(publication.attestation_state, 'ATTESTATION_PENDING');
   assert.equal(publication.pr_head_oid, OID);
+  assert.equal(publication.pr_state, 'OPEN');
+  assert.equal(publication.merged, false);
+  assert.equal(publication.outcome_recorded_at, null);
+  assert.deepEqual(db.listReconciliationCandidates().map((item) => item.mission_id), [ready.mission_id]);
   const publicState = db.getPublicActionState({
     repository: ready.manifest.repository,
     now: new Date('2026-07-19T12:01:00.000Z'),
@@ -110,6 +114,36 @@ test('real database carries one approved item through exact publication and dura
   assert.equal(publicState.owner_prs_today, 1);
   assert.equal(publicState.prs_last_hour, 1);
   assert.equal(publicState.prs_today, 1);
+
+  const firstClosure = db.recordPublicationObservation(ready.mission_id, {
+    repository: ready.manifest.repository,
+    prState: 'CLOSED',
+    merged: true,
+    ciState: 'SUCCESS',
+    observedAt: '2026-07-19T13:00:00.000Z',
+  });
+  assert.equal(firstClosure.repository_released, true);
+  assert.equal(firstClosure.publication.pr_state, 'MERGED');
+  assert.equal(firstClosure.publication.merged, true);
+  assert.equal(firstClosure.publication.ci_state, 'SUCCESS');
+  assert.equal(firstClosure.publication.outcome_recorded_at, '2026-07-19T13:00:00.000Z');
+  assert.equal(db.getRepositoryState(ready.manifest.repository).open_northset_prs, 0);
+
+  const repeatedClosure = db.recordPublicationObservation(ready.mission_id, {
+    repository: ready.manifest.repository,
+    prState: 'CLOSED',
+    merged: true,
+    ciState: 'SUCCESS',
+    observedAt: '2026-07-19T13:05:00.000Z',
+  });
+  assert.equal(repeatedClosure.repository_released, false);
+  assert.equal(db.getRepositoryState(ready.manifest.repository).open_northset_prs, 0);
+  const afterClosure = db.getPublicActionState({
+    repository: ready.manifest.repository,
+    now: new Date('2026-07-19T13:06:00.000Z'),
+  });
+  assert.equal(afterClosure.owner_prs_today, 1);
+  assert.equal(afterClosure.prs_today, 1);
 });
 
 test('changing the outbound fork after approval invalidates only that READY item before transport', async (t) => {

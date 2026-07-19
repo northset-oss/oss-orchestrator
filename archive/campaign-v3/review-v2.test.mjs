@@ -380,7 +380,8 @@ test('one terminal mission does not prevent the next approved mission from runni
   assert.equal(results[1].state, 'SHIPPED');
 });
 
-test('active specs directory contains only runnable current-schema JSON', async () => {
+test('retired specs remain archived and are not treated as an active runnable directory', async () => {
   assert.equal(typeof oss.validateActiveSpecs, 'function');
-  await assert.doesNotReject(() => oss.validateActiveSpecs(path.join(import.meta.dirname, 'specs')));
+  await assert.rejects(() => oss.validateActiveSpecs(path.join(import.meta.dirname, 'specs')),
+    /legacy code_prompt is forbidden/);
 });

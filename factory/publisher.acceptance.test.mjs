@@ -398,10 +398,12 @@ test('attestation failure leaves the upstream PR open and unique', async () => {
 
   assert.deepEqual(result, {
     mission_id: 'M-001', state: 'SUBMITTED', attestation_state: 'ATTESTATION_PENDING',
+    status_state: 'PUBLISHED',
   });
   assert.equal((await db.getPublication('M-001')).publication_state, 'SUBMITTED');
   assert.equal((await db.getPublication('M-001')).attestation_state, 'ATTESTATION_PENDING');
-  assert.equal(statusCalls, 0);
+  assert.equal((await db.getPublication('M-001')).status_state, 'PUBLISHED');
+  assert.equal(statusCalls, 1);
   assert.equal(github.pullRequests.size, 1);
   assert.equal(github.count('create_pull_request'), 1);
   assert.equal(github.closeCount, 0);

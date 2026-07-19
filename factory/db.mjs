@@ -3,7 +3,7 @@ import {mkdirSync} from 'node:fs';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 
-export const FACTORY_SCHEMA_VERSION = 4;
+export const FACTORY_SCHEMA_VERSION = 5;
 export const TASK_STATES = Object.freeze([
   'DISCOVERED', 'QUEUED', 'WORKING', 'VERIFIED', 'READY', 'APPROVED',
   'PR_OPENED', 'RECEIPT_ATTESTED', 'SKIPPED', 'FAILED',
@@ -178,6 +178,10 @@ function mapPublication(row) {
     pr_number: row.pr_number,
     pr_head_oid: row.pr_head_oid,
     pr_base_branch: row.pr_base_branch,
+    pr_state: row.pr_state,
+    merged: Boolean(row.merged),
+    ci_state: row.ci_state,
+    outcome_recorded_at: row.outcome_recorded_at,
     receipt_url: row.receipt_url,
     receipt_state: row.receipt_state,
     receipt_proof_sha256: row.receipt_proof_sha256,
@@ -293,6 +297,10 @@ CREATE TABLE IF NOT EXISTS publications(
   pr_number INTEGER,
   pr_head_oid TEXT,
   pr_base_branch TEXT,
+  pr_state TEXT,
+  merged INTEGER NOT NULL DEFAULT 0,
+  ci_state TEXT,
+  outcome_recorded_at TEXT,
   receipt_url TEXT,
   receipt_state TEXT NOT NULL DEFAULT 'NOT_STARTED',
   receipt_proof_sha256 TEXT,
@@ -389,6 +397,26 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
         ['receipt_proof_sha256', 'TEXT'],
         ['receipt_batch_commit_oid', 'TEXT'],
         ['receipt_approval_digest', 'TEXT'],
+      ]) {
+        if (!columns.has(name)) connection.exec(`ALTER TABLE publications ADD COLUMN ${name} ${definition}`);
+      }
+      connection.prepare("UPDATE factory_meta SET value='4' WHERE key='schema_version'").run();
+      connection.exec('COMMIT');
+      version = 4;
+    } catch (error) {
+      connection.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  if (version === 4) {
+    const columns = new Set(connection.prepare('PRAGMA table_info(publications)').all().map((row) => row.name));
+    connection.exec('BEGIN IMMEDIATE');
+    try {
+      for (const [name, definition] of [
+        ['pr_state', 'TEXT'],
+        ['merged', 'INTEGER NOT NULL DEFAULT 0'],
+        ['ci_state', 'TEXT'],
+        ['outcome_recorded_at', 'TEXT'],
       ]) {
         if (!columns.has(name)) connection.exec(`ALTER TABLE publications ADD COLUMN ${name} ${definition}`);
       }
@@ -803,7 +831,8 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
   function savePublication(missionId, patch = {}, {now = new Date()} = {}) {
     const current = getPublication(missionId) ?? {
       mission_id: missionId, task_id: null, branch: null, pushed_oid: null, pr_url: null, pr_number: null,
-      pr_head_oid: null, pr_base_branch: null, receipt_url: null, receipt_state: 'NOT_STARTED',
+      pr_head_oid: null, pr_base_branch: null, pr_state: null, merged: false, ci_state: null,
+      outcome_recorded_at: null, receipt_url: null, receipt_state: 'NOT_STARTED',
       receipt_proof_sha256: null, receipt_batch_commit_oid: null, receipt_approval_digest: null,
       proof_published: false, attestation_state: 'NOT_STARTED', attestation_url: null,
       attested_at: null, attestation_error: null, submitted_at: null, status_state: 'NOT_STARTED',
@@ -813,15 +842,18 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     const next = {...current, ...patch, updated_at: iso(now)};
     connection.prepare(`INSERT INTO publications(
       mission_id,task_id,branch,pushed_oid,pr_url,pr_number,pr_head_oid,pr_base_branch,
+      pr_state,merged,ci_state,outcome_recorded_at,
       receipt_url,receipt_state,receipt_proof_sha256,receipt_batch_commit_oid,receipt_approval_digest,
       proof_published,attestation_state,attestation_url,attested_at,
       attestation_error,submitted_at,status_state,status_url,status_error,publication_state,
       last_error,last_error_detail,updated_at
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(mission_id) DO UPDATE SET
       task_id=excluded.task_id,branch=excluded.branch,pushed_oid=excluded.pushed_oid,pr_url=excluded.pr_url,
       pr_number=excluded.pr_number,pr_head_oid=excluded.pr_head_oid,receipt_url=excluded.receipt_url,
-      pr_base_branch=excluded.pr_base_branch,receipt_state=excluded.receipt_state,
+      pr_base_branch=excluded.pr_base_branch,pr_state=excluded.pr_state,merged=excluded.merged,
+      ci_state=excluded.ci_state,outcome_recorded_at=excluded.outcome_recorded_at,
+      receipt_state=excluded.receipt_state,
       receipt_proof_sha256=excluded.receipt_proof_sha256,
       receipt_batch_commit_oid=excluded.receipt_batch_commit_oid,
       receipt_approval_digest=excluded.receipt_approval_digest,
@@ -832,7 +864,8 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       publication_state=excluded.publication_state,last_error=excluded.last_error,
       last_error_detail=excluded.last_error_detail,updated_at=excluded.updated_at`).run(
       missionId, next.task_id, next.branch, next.pushed_oid, next.pr_url, next.pr_number, next.pr_head_oid,
-      next.pr_base_branch, next.receipt_url, next.receipt_state,
+      next.pr_base_branch, next.pr_state, next.merged ? 1 : 0, next.ci_state, next.outcome_recorded_at,
+      next.receipt_url, next.receipt_state,
       next.receipt_proof_sha256, next.receipt_batch_commit_oid, next.receipt_approval_digest,
       next.proof_published ? 1 : 0,
       next.attestation_state, next.attestation_url, next.attested_at, next.attestation_error,
@@ -854,6 +887,59 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     const placeholders = states.map(() => '?').join(',');
     return connection.prepare(`SELECT * FROM publications WHERE publication_state IN (${placeholders})
       ORDER BY updated_at,mission_id LIMIT ?`).all(...states, limit).map(mapPublication);
+  }
+
+  function listReconciliationCandidates({limit = 30} = {}) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      throw new Error('reconciliation limit must be an integer from 1 through 1000');
+    }
+    return connection.prepare(`SELECT * FROM publications
+      WHERE publication_state='SUBMITTED' AND (
+        attestation_state!='RECEIPT_ATTESTED' OR
+        outcome_recorded_at IS NULL OR
+        status_state!='PUBLISHED'
+      )
+      ORDER BY updated_at,mission_id LIMIT ?`).all(limit).map(mapPublication);
+  }
+
+  function recordPublicationObservation(missionId, {
+    repository,
+    prState,
+    merged = false,
+    ciState = null,
+    observedAt = new Date(),
+  } = {}) {
+    if (typeof repository !== 'string' || !repository.includes('/')) {
+      throw new Error('publication observation requires repository owner/name');
+    }
+    const normalizedState = String(prState ?? '').toUpperCase();
+    if (!['OPEN', 'CLOSED', 'MERGED'].includes(normalizedState)) {
+      throw new Error('publication observation requires PR state OPEN, CLOSED, or MERGED');
+    }
+    const observed = iso(observedAt);
+    return transaction(() => {
+      const current = getPublication(missionId);
+      if (!current) throw new Error(`unknown publication ${missionId}`);
+      const closed = merged === true || normalizedState === 'CLOSED' || normalizedState === 'MERGED';
+      const previouslyClosed = current.outcome_recorded_at !== null || current.merged === true ||
+        ['CLOSED', 'MERGED'].includes(String(current.pr_state ?? '').toUpperCase());
+      const repositoryReleased = closed && !previouslyClosed;
+      connection.prepare(`UPDATE publications SET pr_state=?,merged=?,ci_state=?,
+        outcome_recorded_at=?,updated_at=? WHERE mission_id=?`).run(
+        merged === true || normalizedState === 'MERGED' ? 'MERGED' : normalizedState,
+        merged === true || normalizedState === 'MERGED' ? 1 : 0,
+        ciState,
+        closed ? (current.outcome_recorded_at ?? observed) : current.outcome_recorded_at,
+        observed,
+        missionId,
+      );
+      if (repositoryReleased) {
+        connection.prepare(`UPDATE repository_state
+          SET open_northset_prs=max(open_northset_prs-1,0),updated_at=?
+          WHERE lower(repository)=lower(?)`).run(observed, repository);
+      }
+      return {publication: getPublication(missionId), repository_released: repositoryReleased};
+    });
   }
 
   function updateTaskState(taskId, state, detail = null, {now = new Date()} = {}) {
@@ -886,7 +972,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       FROM publications p
       JOIN ready_items r ON r.mission_id=p.mission_id
       JOIN tasks t ON t.task_id=r.task_id
-      WHERE p.publication_state='SUBMITTED' AND p.submitted_at IS NOT NULL`).get(
+      WHERE p.submitted_at IS NOT NULL`).get(
       owner, today, hourStart, today,
     );
     return {
@@ -965,6 +1051,8 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     savePublication,
     getPublication,
     listPublications,
+    listReconciliationCandidates,
+    recordPublicationObservation,
     updateTaskState,
     getRepositoryState,
     getPublicActionState,

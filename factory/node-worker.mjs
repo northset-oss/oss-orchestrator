@@ -216,42 +216,48 @@ async function loadCodexAccessToken(sourceHome = process.env.CODEX_HOME ??
   return token;
 }
 
-export function codexDockerArgs({
+export function codexHostArgs({
   checkout,
-  codexHome,
-  outputRoot,
   schemaFile,
   outputFile,
-  image,
   model,
   effort,
   readOnly,
-  dependencyMaterial = null,
 }) {
-  const workspaceSuffix = readOnly ? ',readonly' : '';
-  const args = [
-    'run', '--rm', '-i', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-    '--pids-limit=512', '--memory=8g', '--cpus=4',
-    '--mount', `type=bind,src=${checkout},dst=/workspace${workspaceSuffix}`,
-    '--mount', `type=bind,src=${path.join(checkout, '.git')},dst=/workspace/.git,readonly`,
-    '--mount', `type=bind,src=${codexHome},dst=/codex-home`,
-    '--mount', `type=bind,src=${outputRoot},dst=/northset-output`,
-    '--workdir', '/workspace', '--env', 'HOME=/tmp', '--env', 'CI=true',
-    '--env', 'CODEX_HOME=/codex-home', '--env', 'CODEX_ACCESS_TOKEN',
-    '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=1g',
-  ];
-  if (readOnly) args.push('--read-only');
-  for (const mount of dependencyMaterial?.mounts ?? []) {
-    if (mount.readOnly !== true) throw new Error('author dependency material must be read-only');
-    args.push('--mount', `type=volume,src=${mount.source},dst=${mount.target},readonly`);
+  if (!path.isAbsolute(checkout) || !path.isAbsolute(schemaFile) || !path.isAbsolute(outputFile)) {
+    throw new TypeError('host Codex paths must be absolute');
   }
-  args.push('--entrypoint', 'codex', image,
-    'exec', '--json', '--ephemeral', '--sandbox', 'workspace-write', '--ignore-user-config',
-    '--ignore-rules', '--skip-git-repo-check', '--output-schema', `/northset-output/${path.basename(schemaFile)}`,
-    '--output-last-message', `/northset-output/${path.basename(outputFile)}`,
+  return [
+    'exec', '--json', '--ephemeral', '--sandbox', readOnly ? 'read-only' : 'workspace-write',
+    '--ignore-user-config', '--ignore-rules', '--skip-git-repo-check', '--output-schema', schemaFile,
+    '--output-last-message', outputFile,
     '--color', 'never', '--model', model,
-    '-c', `model_reasoning_effort="${effort}"`, '-c', 'service_tier="fast"', '-C', '/workspace', '-');
-  return args;
+    '-c', 'approval_policy="never"',
+    '-c', `model_reasoning_effort="${effort}"`,
+    '-c', 'service_tier="fast"',
+    '-c', 'shell_environment_policy.inherit="core"',
+    '-c', 'shell_environment_policy.exclude=["CODEX_ACCESS_TOKEN","CODEX_API_KEY","OPENAI_API_KEY","GH_TOKEN","GITHUB_TOKEN"]',
+    '-c', 'sandbox_workspace_write.network_access=false',
+    '-c', 'features.apps=false',
+    '-c', 'features.memories=false',
+    '-c', 'features.multi_agent=false',
+    '-C', checkout, '-',
+  ];
+}
+
+export function codexProcessEnvironment({codexHome, accessToken}) {
+  const allowed = [
+    'PATH', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'TERM',
+    'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
+  ];
+  return {
+    ...Object.fromEntries(allowed.filter((name) => process.env[name] !== undefined)
+      .map((name) => [name, process.env[name]])),
+    HOME: codexHome,
+    CODEX_HOME: codexHome,
+    CODEX_ACCESS_TOKEN: accessToken,
+    CI: 'true',
+  };
 }
 
 async function defaultCodexRunner({
@@ -276,16 +282,14 @@ async function defaultCodexRunner({
     const schemaFile = path.join(outputRoot, 'schema.json');
     const outputFile = path.join(outputRoot, 'result.json');
     await writeFile(schemaFile, JSON.stringify(schema), {mode: 0o600});
-    const args = codexDockerArgs({
-      checkout, codexHome, outputRoot, schemaFile, outputFile, image, model, effort, readOnly,
-      dependencyMaterial,
-    });
-    await mustRun(run, 'docker', args, {
+    const args = codexHostArgs({checkout, schemaFile, outputFile, model, effort, readOnly});
+    await mustRun(run, process.env.CODEX_BIN ?? 'codex', args, {
       input: prompt,
-      env: {...process.env, CODEX_ACCESS_TOKEN: accessToken},
+      cwd: checkout,
+      env: codexProcessEnvironment({codexHome, accessToken}),
       timeoutMs,
       maxOutputBytes: OUTPUT_LIMIT,
-    }, 'Codex container');
+    }, 'host Codex sandbox');
     const outputStat = await stat(outputFile);
     if (outputStat.size > 1024 * 1024) throw new Error('Codex structured result exceeded 1048576 bytes');
     const parsed = JSON.parse(await readFile(outputFile, 'utf8'));

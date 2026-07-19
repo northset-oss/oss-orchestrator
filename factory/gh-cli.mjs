@@ -401,6 +401,10 @@ function pullRequest(value, repository) {
     mergeable: value.mergeable ?? null,
     mergeable_state: value.mergeable_state ?? null,
     merged: Boolean(value.merged ?? value.merged_at),
+    created_at: value.created_at ?? null,
+    updated_at: value.updated_at ?? null,
+    closed_at: value.closed_at ?? null,
+    merged_at: value.merged_at ?? null,
   };
 }
 
@@ -562,6 +566,57 @@ export function createGhCliPublisherAdapter({
       ...pullRequest(bodyObject(result, 'get pull request'), repository)};
   };
 
+  const getCommitStatus = async ({repository, oid}) => {
+    validRepository(repository);
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(String(oid ?? ''))) {
+      throw new TypeError('commit status oid must be a full commit OID');
+    }
+    const result = await transport.rest({method: 'GET', path: apiPath(repository,
+      `commits/${String(oid).toLowerCase()}/status`)});
+    if (result.httpStatus === 404) {
+      return {status: 404, headers: result.headers, found: false, state: null};
+    }
+    const body = bodyObject(result, 'get combined commit status');
+    const state = typeof body.state === 'string' && body.state ? body.state.toUpperCase() : null;
+    return {
+      status: result.httpStatus,
+      headers: result.headers,
+      found: state !== null,
+      state,
+      total_count: Number.isInteger(Number(body.total_count)) ? Number(body.total_count) : null,
+      updated_at: body.updated_at ?? null,
+    };
+  };
+
+  const getArtifactAttestation = async ({repository, subject_digest: subjectDigest}) => {
+    validRepository(repository);
+    if (!/^sha256:[a-f0-9]{64}$/.test(String(subjectDigest ?? ''))) {
+      throw new TypeError('attestation subject_digest must be a sha256 digest');
+    }
+    const suffix = `attestations/${encodeURIComponent(subjectDigest)}`;
+    const result = await transport.rest({method: 'GET', path: apiPath(repository, suffix)});
+    if (result.httpStatus === 404) {
+      return {status: 404, headers: result.headers, found: false, attestation_url: null, attested_at: null};
+    }
+    const body = bodyObject(result, 'get artifact attestations');
+    const attestations = Array.isArray(body.attestations) ? body.attestations : [];
+    const attestation = attestations[0] ?? null;
+    if (!attestation) {
+      return {status: result.httpStatus, headers: result.headers, found: false,
+        attestation_url: null, attested_at: null};
+    }
+    const attestationUrl = attestation.html_url ?? attestation.attestation_url ?? attestation.url ??
+      `https://api.github.com/${apiPath(repository, suffix).replace(/^\//, '')}`;
+    return {
+      status: result.httpStatus,
+      headers: result.headers,
+      found: true,
+      attestation_url: attestationUrl,
+      attested_at: attestation.created_at ?? body.created_at ?? null,
+      attestation,
+    };
+  };
+
   const graphql = async (query, variables = {}) => {
     const result = await transport.graphql({query, variables});
     ensureSuccess(result, 'GraphQL request');
@@ -675,5 +730,5 @@ export function createGhCliPublisherAdapter({
   };
 
   return {getBranch, pushBranch, findPullRequests, createPullRequest, getPullRequest,
-    graphql, finalLiveRecheck, deepOverlap};
+    getCommitStatus, getArtifactAttestation, graphql, finalLiveRecheck, deepOverlap};
 }

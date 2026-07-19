@@ -8,7 +8,8 @@ import {
   AUTHOR_SCHEMA,
   SCOUT_SCHEMA,
   bootstrapDockerArgs,
-  codexDockerArgs,
+  codexHostArgs,
+  codexProcessEnvironment,
   createNodeWorker,
   runBounded,
   runtimeDockerArgs,
@@ -80,26 +81,37 @@ test('N1 scout uses the bounded structured read-only contract', async (t) => {
   assert.deepEqual(result.target_files, ['src/value.mjs', 'test/value.test.mjs']);
 });
 
-test('N2 Docker plans isolate git, omit reusable auth files, and freeze dependency material', async () => {
+test('N2 the authenticated model client stays host-side and Docker plans remain credential-free', async () => {
   const checkout = '/private/factory/repository';
   const codexHome = '/private/factory/codex-home';
   const outputRoot = '/private/factory/output';
-  const author = codexDockerArgs({
-    checkout, codexHome, outputRoot,
+  const author = codexHostArgs({
+    checkout,
     schemaFile: `${outputRoot}/schema.json`, outputFile: `${outputRoot}/result.json`,
-    image: IMAGE, model: 'test-model', effort: 'high', readOnly: false,
-    dependencyMaterial: {mounts: [{source: 'northset-deps-abc', target: '/workspace/node_modules', readOnly: true}]},
+    model: 'test-model', effort: 'high', readOnly: false,
   });
   const joinedAuthor = author.join('\n');
-  assert.match(joinedAuthor, /src=\/private\/factory\/repository\/.git,dst=\/workspace\/.git,readonly/);
-  assert.doesNotMatch(joinedAuthor, /auth\.json/);
-  assert.match(joinedAuthor, /CODEX_ACCESS_TOKEN/);
+  assert.equal(author[0], 'exec');
+  assert.match(joinedAuthor, /-C\n\/private\/factory\/repository/);
   assert.match(joinedAuthor, /--sandbox\nworkspace-write/);
   assert.doesNotMatch(joinedAuthor, /dangerously-bypass-approvals-and-sandbox/);
-  assert.match(joinedAuthor, /src=northset-deps-abc,dst=\/workspace\/node_modules,readonly/);
+  assert.doesNotMatch(joinedAuthor, /docker|--mount|auth\.json/);
   assert.match(joinedAuthor, /--output-schema/);
   assert.match(joinedAuthor, /--output-last-message/);
-  assert.doesNotMatch(joinedAuthor, /GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|AWS_/);
+  assert.match(joinedAuthor, /shell_environment_policy\.exclude/);
+  const clientEnvironment = codexProcessEnvironment({codexHome, accessToken: 'short-lived-model-token'});
+  assert.equal(clientEnvironment.CODEX_ACCESS_TOKEN, 'short-lived-model-token');
+  assert.equal(clientEnvironment.CODEX_HOME, codexHome);
+  assert.equal(clientEnvironment.GITHUB_TOKEN, undefined);
+  assert.equal(clientEnvironment.GH_TOKEN, undefined);
+  assert.equal(clientEnvironment.OPENAI_API_KEY, undefined);
+
+  const scout = codexHostArgs({
+    checkout,
+    schemaFile: `${outputRoot}/schema.json`, outputFile: `${outputRoot}/result.json`,
+    model: 'test-model', effort: 'medium', readOnly: true,
+  }).join('\n');
+  assert.match(scout, /--sandbox\nread-only/);
 
   const bootstrap = bootstrapDockerArgs({
     checkout, volume: 'northset-deps-abc', image: IMAGE,

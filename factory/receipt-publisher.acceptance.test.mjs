@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import {
   createReceiptPublisher,
+  createReceiptStatusPublisher,
   receiptUrlFor,
   runBounded,
 } from './receipt-publisher.mjs';
@@ -220,4 +221,83 @@ test('stale rebases append a new commit-specific proof and approval digest is ma
   assert.equal(rebasedProof.commit_oid, oid('c'));
   assert.equal(rebasedProof.base_oid, oid('e'));
   assert.equal(await git(['--git-dir', bare, 'rev-list', '--count', 'receipts']), '2');
+});
+
+test('receipt status reconciliation uses one non-force batch push, exact readback, and leaves proofs immutable', async (t) => {
+  const {root, bare} = await bareRepository(t);
+  const first = item('M-1000', 'b');
+  const second = item('M-1001', 'c');
+  const proofPublisher = createReceiptPublisher({
+    remoteUrl: bare, tempRoot: root, now: () => new Date('2026-07-19T12:00:00.000Z'),
+  });
+  await proofPublisher([first, second]);
+  const proofPaths = [first, second].map((entry) =>
+    `receipts/${entry.mission_id}/${entry.commit_oid}/proof.json`);
+  const beforeProofs = await Promise.all(proofPaths.map((relativePath) => remoteBytes(bare, relativePath)));
+
+  const calls = [];
+  const statusPublisher = createReceiptStatusPublisher({
+    remoteUrl: bare,
+    run: recordingRunner(calls),
+    tempRoot: root,
+    now: () => new Date('2026-07-19T12:05:00.000Z'),
+  });
+  const statuses = [first, second].map((entry, index) => ({
+    mission_id: entry.mission_id,
+    commit_oid: entry.commit_oid,
+    pr_number: 100 + index,
+    receipt_url: receiptUrlFor(entry.mission_id, entry.commit_oid),
+    pr_url: `https://github.com/upstream/project/pull/${100 + index}`,
+    pr_state: index === 0 ? 'OPEN' : 'MERGED',
+    merged: index === 1,
+    ci_state: 'SUCCESS',
+    attestation_state: index === 0 ? 'ATTESTATION_PENDING' : 'RECEIPT_ATTESTED',
+    attestation_url: index === 0 ? null : 'https://github.com/northset-oss/verification-pilot/attestations/1',
+    observed_at: '2026-07-19T12:04:00.000Z',
+  }));
+  const published = await statusPublisher(statuses.reverse());
+
+  const pushes = calls.filter((call) => call.args.includes('push'));
+  assert.equal(pushes.length, 1);
+  assert.doesNotMatch(pushes[0].args.join(' '), /--force|-f\b/);
+  assert.equal(published['M-1000'].status_commit_oid, published['M-1001'].status_commit_oid);
+  for (const [index, entry] of [first, second].entries()) {
+    const relativePath = `receipts/${entry.mission_id}/${entry.commit_oid}/publication.json`;
+    const bytes = await remoteBytes(bare, relativePath);
+    assert.equal(`${JSON.stringify(JSON.parse(bytes))}\n`, bytes.toString('utf8'));
+    const status = JSON.parse(bytes);
+    assert.equal(status.mission_id, entry.mission_id);
+    assert.equal(status.contribution_commit_oid, entry.commit_oid);
+    assert.equal(status.pr_number, 100 + index);
+    assert.equal(status.pr_state, index === 0 ? 'OPEN' : 'MERGED');
+    assert.equal(status.merged, index === 1);
+    assert.equal(status.ci_state, 'SUCCESS');
+    assert.equal(status.attestation_state,
+      index === 0 ? 'ATTESTATION_PENDING' : 'RECEIPT_ATTESTED');
+    assert.equal(published[entry.mission_id].status_url,
+      `https://github.com/northset-oss/verification-pilot/blob/receipts/${relativePath}`);
+    assert.deepEqual(await remoteBytes(bare, proofPaths[index]), beforeProofs[index]);
+  }
+
+  const adopted = await statusPublisher(statuses);
+  assert.deepEqual(adopted, published);
+  assert.equal(calls.filter((call) => call.args.includes('push')).length, 1);
+  assert.equal(await git(['--git-dir', bare, 'rev-list', '--count', 'receipts']), '2');
+});
+
+test('receipt status refuses to publish without its immutable proof', async (t) => {
+  const {root, bare} = await bareRepository(t);
+  await createReceiptPublisher({remoteUrl: bare, tempRoot: root})([item('M-1001', 'c')]);
+  const calls = [];
+  const statusPublisher = createReceiptStatusPublisher({
+    remoteUrl: bare, run: recordingRunner(calls), tempRoot: root,
+  });
+  await assert.rejects(() => statusPublisher([{
+    mission_id: 'M-1000', commit_oid: oid('b'), pr_number: 100,
+    receipt_url: receiptUrlFor('M-1000', oid('b')),
+    pr_url: 'https://github.com/upstream/project/pull/100', pr_state: 'OPEN',
+    merged: false, ci_state: null, attestation_state: 'ATTESTATION_PENDING',
+    attestation_url: null, observed_at: '2026-07-19T12:04:00.000Z',
+  }]), (error) => error.code === 'RECEIPT_STATUS_WITHOUT_PROOF');
+  assert.equal(calls.filter((call) => call.args.includes('push')).length, 0);
 });

@@ -356,15 +356,19 @@ async function publishOne(plan, {db, github, safety, now, repositoryState}) {
   }
   const stored = prFields(readback);
   const closed = String(stored.state ?? '').toUpperCase() === 'CLOSED';
+  const observedAt = timestamp(now);
   await checkpoint(db, plan.mission_id, {
     pr_number: stored.number,
     pr_url: stored.url,
     pr_head_oid: stored.head_oid,
     pr_base_branch: stored.base_branch,
+    pr_state: closed ? (stored.merged ? 'MERGED' : 'CLOSED') : 'OPEN',
+    merged: stored.merged === true,
+    outcome_recorded_at: closed ? observedAt : null,
     publication_state: 'SUBMITTED',
     attestation_state: 'ATTESTATION_PENDING',
     status_state: 'PENDING',
-    submitted_at: timestamp(now),
+    submitted_at: observedAt,
     last_error: null,
     last_error_detail: null,
   }, `${plan.mission_id} submission`);
@@ -374,7 +378,7 @@ async function publishOne(plan, {db, github, safety, now, repositoryState}) {
     await db.setRepositoryState(plan.repository, {
       open_northset_prs: Number(latest.open_northset_prs ?? 0) + 1,
       opened_today: Number(latest.opened_today ?? 0) + 1,
-      last_pr_at: timestamp(now),
+      last_pr_at: observedAt,
     });
   }
   return {mission_id: plan.mission_id, state: 'SUBMITTED', pr_number: stored.number, pr_url: stored.url,
@@ -599,7 +603,6 @@ export async function reconcileReceipt(missionIdValue, {
         attestation_error: error.message,
         last_error: `ATTESTATION_PENDING: ${error.message}`,
       });
-      return {mission_id: missionIdValue, state: 'SUBMITTED', attestation_state: 'ATTESTATION_PENDING'};
     }
   }
   try {
@@ -609,7 +612,7 @@ export async function reconcileReceipt(missionIdValue, {
       status_state: 'PUBLISHED',
       status_url: value(status?.status_url, status?.url),
       status_error: null,
-      last_error: null,
+      last_error: current.attestation_state === 'ATTESTATION_PENDING' ? current.last_error : null,
     });
   } catch (error) {
     current = await db.savePublication(missionIdValue, {
