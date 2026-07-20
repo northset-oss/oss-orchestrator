@@ -120,6 +120,20 @@ test('selector uses 14-day Node discovery records without semantic review or sna
   assert.doesNotMatch(sql, /reviews|evidence_key|snapshot_expires_at/);
 });
 
+test('selector discards clearly non-Node lake records before live preflight', async () => {
+  const selected = await selectCandidates({
+    workers: 2,
+    now: NOW,
+    query: async () => [
+      row(1, {raw_json: JSON.stringify({repository: {primary_language: 'TypeScript'}})}),
+      row(2, {raw_json: JSON.stringify({repository: {primary_language: 'TeX'}})}),
+      row(3, {primary_language: 'C++', raw_json: '{}'}),
+      row(4, {raw_json: JSON.stringify({repository: {primary_language: null}})}),
+    ],
+  });
+  assert.deepEqual(selected.map((item) => item.candidate), ['owner/repo1#1', 'owner/repo4#4']);
+});
+
 test('a generic repository policy snapshot is not treated as contribution invitation', async () => {
   const [selected] = await selectCandidates({
     workers: 1,

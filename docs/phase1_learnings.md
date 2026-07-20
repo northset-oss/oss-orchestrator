@@ -129,6 +129,14 @@ focused Jest command while the proposed PR text still said that command could no
 the receipt claim narrow and prevents valid execution evidence from being paired with misleading
 public prose.
 
+The first restarted source batch also exposed a lake-label bottleneck before worker execution. Of 16
+selected records, 15 were skipped and 12 were repositories whose stored primary language was clearly
+non-Node (including C, C++, Java, Shell, and TeX), despite their Node profile label. Those records
+consumed bounded live-preflight slots and left only one of eight workers occupied. The active selector
+now drops a conservative set of clearly non-Node primary languages before the GitHub read; web/Node
+languages and missing language data still proceed to the existing live checks. This is a throughput
+filter only: it neither relaxes issue-fit checks nor converts ambiguous candidates into GO results.
+
 ### Carry-forward lessons
 
 1. **Use exact outcome words.** A thank-you, approval, merge, green CI result, receipt publication,

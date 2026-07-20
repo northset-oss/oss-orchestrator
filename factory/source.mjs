@@ -6,6 +6,11 @@ import {isClaimText} from './claim-detection.mjs';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DISCOVERY_TTL_MS = 14 * DAY_MS;
 const DEFAULT_EXPECTED_MINUTES = 12;
+const CLEARLY_NON_NODE_PRIMARY_LANGUAGES = new Set([
+  'C', 'C++', 'C#', 'Dart', 'Dockerfile', 'Elixir', 'GDScript', 'Go', 'Java',
+  'Julia', 'Jupyter Notebook', 'Kotlin', 'Lua', 'Makefile', 'Nextflow', 'PHP',
+  'PowerShell', 'Python', 'R', 'Ruby', 'Rust', 'Shell', 'Swift', 'TeX',
+]);
 
 function assertWorkers(value) {
   if (!Number.isInteger(value) || value < 1 || value > 100) {
@@ -121,6 +126,12 @@ function normalizeLakeRow(row, attemptStats) {
   };
 }
 
+function clearlyNonNodePrimaryLanguage(row) {
+  const language = row.primary_language ??
+    parseJson(row.raw_json ?? row.raw, {})?.repository?.primary_language;
+  return CLEARLY_NON_NODE_PRIMARY_LANGUAGES.has(String(language ?? '').trim());
+}
+
 export async function selectCandidates({
   lakePath = 'candidate_lake.sqlite',
   query = (sql) => sqliteQuery(lakePath, sql),
@@ -138,7 +149,8 @@ export async function selectCandidates({
     i.candidate_display, i.candidate_key, i.issue_number, i.issue_node_id, i.profile,
     i.state, i.mechanical_score, i.mechanical_reasons_json, i.last_hydrated_at,
     i.invitation_kind, i.raw_json,
-    r.repo_display, r.repository_node_id, r.test_profile, r.invitation_label_map_json
+    r.repo_display, r.repository_node_id, r.primary_language, r.test_profile,
+    r.invitation_label_map_json
   FROM issues i
   JOIN repositories r ON r.repo_key=i.repo_key
   WHERE COALESCE(i.state,'OPEN') IN ('OPEN','open','REVIEWED')
@@ -158,6 +170,7 @@ export async function selectCandidates({
         Number.isFinite(observed) && observed >= now.getTime() - DISCOVERY_TTL_MS &&
         ['OPEN', 'open', 'REVIEWED', null, undefined].includes(row.state);
     })
+    .filter((row) => !clearlyNonNodePrimaryLanguage(row))
     .map((row) => normalizeLakeRow(row, attemptStats))
     .filter((candidate) => !excluded.has(candidate.candidate))
     .sort((left, right) => right.priority - left.priority ||
