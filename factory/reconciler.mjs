@@ -36,6 +36,7 @@ function normalizedPrState(pr) {
 
 function statusFacts(publication) {
   return JSON.stringify({
+    pr_head_oid: publication.pr_head_oid ?? null,
     pr_state: publication.pr_state ?? null,
     merged: publication.merged === true,
     ci_state: publication.ci_state ?? null,
@@ -55,11 +56,13 @@ async function saveFailure(db, missionId, code, error, now) {
   }, {now});
 }
 
-function statusItem(publication, observed) {
+function statusItem(publication, observed, mergeCommitOid = null) {
   const commitOid = publication.pushed_oid ?? publication.pr_head_oid;
   return {
     mission_id: publication.mission_id,
     commit_oid: commitOid,
+    pr_head_oid: publication.pr_head_oid ?? commitOid,
+    merge_commit_oid: mergeCommitOid,
     pr_number: publication.pr_number,
     receipt_url: receiptUrlFor(publication.mission_id, commitOid),
     pr_url: publication.pr_url,
@@ -142,24 +145,49 @@ export async function reconcilePublicationBatch({
         throw Object.assign(new Error(`pull request repository changed to ${returnedRepository}`),
           {code: 'RECONCILIATION_PR_MISMATCH'});
       }
-      const expectedHead = publicationBefore.pr_head_oid ?? publicationBefore.pushed_oid;
+      const expectedHead = publicationBefore.pushed_oid ?? publicationBefore.pr_head_oid;
       const returnedHead = pr.head_oid ?? pr.head_sha ?? pr.head?.sha;
-      if (!expectedHead || !returnedHead || returnedHead.toLowerCase() !== expectedHead.toLowerCase()) {
+      if (!expectedHead || !returnedHead) {
         throw Object.assign(new Error(`pull request head does not match stored head ${expectedHead ?? '(missing)'}`),
           {code: 'RECONCILIATION_PR_HEAD_MISMATCH'});
       }
+      const prState = normalizedPrState(pr);
+      const headDrift = returnedHead.toLowerCase() !== expectedHead.toLowerCase();
+      if (headDrift) {
+        if (prState !== 'MERGED') {
+          throw Object.assign(new Error(`pull request head does not match stored head ${expectedHead}`),
+            {code: 'RECONCILIATION_PR_HEAD_MISMATCH'});
+        }
+        const getPullRequestCommits = requiredMethod(github, 'getPullRequestCommits', 'github');
+        const commitList = await throughSafety(safety, {
+          kind: 'read', operation: 'reconcile_get_pull_request_commits', repository, pr_number: prNumber,
+          execute: () => getPullRequestCommits({repository, number: prNumber}),
+        });
+        const commits = Array.isArray(commitList) ? commitList : commitList?.commits;
+        if (!Array.isArray(commits) || !commits.some((oid) =>
+          String(oid).toLowerCase() === expectedHead.toLowerCase())) {
+          throw Object.assign(new Error('merged pull request no longer contains the attested contribution commit'),
+            {code: 'RECONCILIATION_CONTRIBUTION_MISSING'});
+        }
+      }
+      const mergeCommitOid = prState === 'MERGED'
+        ? pr.merge_commit_oid ?? pr.merge_commit_sha ?? null : null;
+      if (prState === 'MERGED' && !mergeCommitOid) {
+        throw Object.assign(new Error('merged pull request has no merge commit OID'),
+          {code: 'RECONCILIATION_MERGE_COMMIT_MISSING'});
+      }
 
       const commitStatus = await throughSafety(safety, {
-        kind: 'read', operation: 'reconcile_get_commit_status', repository, oid: expectedHead,
-        execute: () => getCommitStatus({repository, oid: expectedHead}),
+        kind: 'read', operation: 'reconcile_get_commit_status', repository, oid: returnedHead,
+        execute: () => getCommitStatus({repository, oid: returnedHead}),
       });
-      const prState = normalizedPrState(pr);
       const observed = observedAt(pr, publicationBefore, now);
       const observation = await recordObservation(missionId, {
         repository,
         prState,
         merged: pr.merged === true || Boolean(pr.merged_at),
         ciState: commitStatus?.found === false ? null : commitStatus?.state ?? null,
+        prHeadOid: returnedHead.toLowerCase(),
         observedAt: observed,
       });
       let publication = observation.publication;
@@ -209,7 +237,7 @@ export async function reconcilePublicationBatch({
 
       const factsChanged = statusFacts(publicationBefore) !== statusFacts(publication);
       if (publicationBefore.status_state !== 'PUBLISHED' || factsChanged) {
-        pendingStatuses.push({missionId, observed, item: statusItem(publication, observed)});
+        pendingStatuses.push({missionId, observed, item: statusItem(publication, observed, mergeCommitOid)});
       }
       results.push({
         mission_id: missionId,

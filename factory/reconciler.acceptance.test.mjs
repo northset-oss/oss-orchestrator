@@ -41,7 +41,7 @@ function fakeDb(seed = publication()) {
       return next;
     },
     async updateTaskState(taskId, state) { taskStates.push({taskId, state}); },
-    async recordPublicationObservation(missionId, {prState, merged, ciState, observedAt}) {
+    async recordPublicationObservation(missionId, {prState, merged, ciState, prHeadOid, observedAt}) {
       const current = publications.get(missionId);
       const closed = merged || prState === 'CLOSED' || prState === 'MERGED';
       const repositoryReleased = closed && !released;
@@ -51,6 +51,7 @@ function fakeDb(seed = publication()) {
         pr_state: merged || prState === 'MERGED' ? 'MERGED' : prState,
         merged: merged || prState === 'MERGED',
         ci_state: ciState,
+        pr_head_oid: prHeadOid ?? current.pr_head_oid,
         outcome_recorded_at: closed ? (current.outcome_recorded_at ?? observedAt) : current.outcome_recorded_at,
       };
       publications.set(missionId, next);
@@ -76,9 +77,11 @@ function harness({seed, prState = 'open', merged = false, attestor, statusPublis
       return {
         number: 17, repository: 'upstream/project', head_oid: HEAD,
         state: prState, merged, merged_at: merged ? '2026-07-19T13:00:00.000Z' : null,
+        merge_commit_oid: merged ? 'd'.repeat(40) : null,
         updated_at: '2026-07-19T13:00:00.000Z',
       };
     },
+    async getPullRequestCommits() { return {commits: [HEAD]}; },
     async getCommitStatus() { return {found: true, state: 'SUCCESS'}; },
     async getArtifactAttestation() { return {found: false}; },
     async createPullRequest() { prohibited.create += 1; throw new Error('must not create'); },
@@ -178,6 +181,45 @@ test('merged outcome releases the repository exactly once across restarts and pu
   assert.deepEqual(fixture.releases, ['upstream/project']);
   assert.equal(statusBatches.length, 1);
   assert.equal(statusBatches[0][0].pr_state, 'MERGED');
+  assert.equal(statusBatches[0][0].merge_commit_oid, 'd'.repeat(40));
+});
+
+test('merged maintainer head drift is accepted only when the attested contribution remains in the PR', async () => {
+  const finalHead = 'c'.repeat(40);
+  const fixture = harness({
+    prState: 'closed', merged: true,
+    attestor: async () => ({found: false}),
+    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
+      status_url: `https://example.test/${item.mission_id}/publication.json`,
+    }])),
+  });
+  fixture.github.getPullRequest = async () => ({
+    number: 17, repository: 'upstream/project', head_oid: finalHead,
+    state: 'closed', merged: true, merged_at: '2026-07-19T13:00:00.000Z',
+    updated_at: '2026-07-19T13:00:00.000Z', merge_commit_oid: 'd'.repeat(40),
+  });
+  fixture.github.getPullRequestCommits = async () => ({commits: [HEAD, finalHead]});
+  const result = await reconcilePublicationBatch(fixture);
+  assert.equal(result.results[0].pr_state, 'MERGED');
+  assert.equal((await fixture.db.getPublication('M-001')).pr_head_oid, finalHead);
+  assert.deepEqual(fixture.releases, ['upstream/project']);
+});
+
+test('merged head drift without the attested contribution fails closed', async () => {
+  const fixture = harness({
+    prState: 'closed', merged: true,
+    attestor: async () => ({found: false}),
+    statusPublisher: async () => { throw new Error('must not publish'); },
+  });
+  fixture.github.getPullRequest = async () => ({
+    number: 17, repository: 'upstream/project', head_oid: 'c'.repeat(40),
+    state: 'closed', merged: true, merged_at: '2026-07-19T13:00:00.000Z',
+    updated_at: '2026-07-19T13:00:00.000Z', merge_commit_oid: 'd'.repeat(40),
+  });
+  fixture.github.getPullRequestCommits = async () => ({commits: ['c'.repeat(40)]});
+  const result = await reconcilePublicationBatch(fixture);
+  assert.equal(result.results[0].code, 'RECONCILIATION_CONTRIBUTION_MISSING');
+  assert.deepEqual(fixture.releases, []);
 });
 
 test('a PR head mismatch is persisted as pending and cannot publish or mutate GitHub', async () => {

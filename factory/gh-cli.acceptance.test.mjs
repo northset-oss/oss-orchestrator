@@ -69,6 +69,7 @@ function apiPr(overrides = {}) {
     head: {ref: 'northset/m-1001', sha: 'a'.repeat(40), repo: {full_name: 'northset/project'}},
     mergeable: true,
     mergeable_state: 'clean',
+    merge_commit_sha: null,
     ...overrides,
   };
 }
@@ -166,6 +167,9 @@ test('H4 semantic REST adapter preserves exact OIDs, title, body, head, and requ
       }
       if (request.method === 'GET' && request.path.includes('/pulls?')) return structured([apiPr()]);
       if (request.method === 'POST') return structured(apiPr(), {status: 201});
+      if (request.path.includes('/pulls/17/commits?')) {
+        return structured([{sha: 'a'.repeat(40)}, {sha: 'b'.repeat(40)}]);
+      }
       if (request.path.endsWith('/pulls/17')) return structured(apiPr());
       throw new Error(`unexpected REST request ${request.path}`);
     },
@@ -202,6 +206,8 @@ test('H4 semantic REST adapter preserves exact OIDs, title, body, head, and requ
   assert.equal(readback.repository, 'upstream/project');
   assert.equal(readback.head_branch, 'northset/m-1001');
   assert.equal(readback.head_oid, 'a'.repeat(40));
+  assert.deepEqual(await github.getPullRequestCommits({repository: 'upstream/project', number: 17}),
+    {commits: ['a'.repeat(40), 'b'.repeat(40)]});
 });
 
 test('publisher adapter creates only the declared fork and rejects an unrelated repository', async () => {

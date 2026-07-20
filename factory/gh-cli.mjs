@@ -404,6 +404,7 @@ function pullRequest(value, repository) {
     updated_at: value.updated_at ?? null,
     closed_at: value.closed_at ?? null,
     merged_at: value.merged_at ?? null,
+    merge_commit_oid: value.merge_commit_sha ?? null,
   };
 }
 
@@ -598,6 +599,30 @@ export function createGhCliPublisherAdapter({
     const result = await transport.rest({method: 'GET', path: apiPath(repository, `pulls/${Number(number)}`)});
     return {status: result.httpStatus, headers: result.headers,
       ...pullRequest(bodyObject(result, 'get pull request'), repository)};
+  };
+
+  const getPullRequestCommits = async ({repository, number}) => {
+    if (!Number.isInteger(Number(number)) || Number(number) < 1) throw new TypeError('PR number must be positive');
+    const commits = [];
+    for (let page = 1; page <= 3; page += 1) {
+      const result = await transport.rest({method: 'GET',
+        path: `${apiPath(repository, `pulls/${Number(number)}/commits`)}?per_page=100&page=${page}`});
+      ensureSuccess(result, 'get pull request commits');
+      if (!Array.isArray(result.body)) {
+        throw new GhCliError('get pull request commits returned a non-array response',
+          'GH_RESPONSE_INVALID', result);
+      }
+      for (const commit of result.body) {
+        if (typeof commit?.sha !== 'string') {
+          throw new GhCliError('get pull request commits returned a commit without an OID',
+            'GH_RESPONSE_INVALID', result);
+        }
+        commits.push(commit.sha.toLowerCase());
+      }
+      if (result.body.length < 100) return {commits};
+    }
+    throw new GhCliError('pull request commit list exceeded GitHub maximum page count',
+      'GH_RESPONSE_INVALID');
   };
 
   const getCommitStatus = async ({repository, oid}) => {
@@ -835,5 +860,5 @@ export function createGhCliPublisherAdapter({
   };
 
   return {getFork, createFork, getBranch, pushBranch, findPullRequests, createPullRequest, getPullRequest,
-    getCommitStatus, getArtifactAttestation, graphql, finalLiveRecheck, deepOverlap};
+    getPullRequestCommits, getCommitStatus, getArtifactAttestation, graphql, finalLiveRecheck, deepOverlap};
 }

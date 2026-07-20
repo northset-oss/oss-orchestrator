@@ -316,6 +316,8 @@ test('receipt status reconciliation uses one non-force batch push, exact readbac
     pr_url: `https://github.com/upstream/project/pull/${100 + index}`,
     pr_state: index === 0 ? 'OPEN' : 'MERGED',
     merged: index === 1,
+    pr_head_oid: entry.commit_oid,
+    merge_commit_oid: index === 1 ? 'd'.repeat(40) : null,
     ci_state: 'SUCCESS',
     attestation_state: index === 0 ? 'ATTESTATION_PENDING' : 'RECEIPT_ATTESTED',
     attestation_url: index === 0 ? null : 'https://github.com/northset-oss/verification-pilot/attestations/1',
@@ -334,6 +336,8 @@ test('receipt status reconciliation uses one non-force batch push, exact readbac
     const status = JSON.parse(bytes);
     assert.equal(status.mission_id, entry.mission_id);
     assert.equal(status.contribution_commit_oid, entry.commit_oid);
+    assert.equal(status.pr_head_oid, entry.commit_oid);
+    assert.equal(status.merge_commit_oid, index === 1 ? 'd'.repeat(40) : null);
     assert.equal(status.pr_number, 100 + index);
     assert.equal(status.pr_state, index === 0 ? 'OPEN' : 'MERGED');
     assert.equal(status.merged, index === 1);

@@ -627,13 +627,21 @@ function statusFor(item) {
   }
   const ciState = item.ci_state ?? null;
   if (ciState !== null && !nonblank(ciState)) throw new TypeError(`${missionId} ci_state is invalid`);
+  const prHeadOid = validOid(item.pr_head_oid ?? commitOid, `${missionId} pr_head_oid`);
+  const mergeCommitOid = item.merge_commit_oid ?? null;
+  if (mergeCommitOid !== null) validOid(mergeCommitOid, `${missionId} merge_commit_oid`);
+  if (merged !== (mergeCommitOid !== null)) {
+    throw new TypeError(`${missionId} merge_commit_oid is inconsistent with merged state`);
+  }
   const attestationUrl = item.attestation_url ?? null;
   validHttpsUrl(attestationUrl, `${missionId} attestation_url`, {nullable: true});
   validTime(item.observed_at, `${missionId} observed_at`);
   const status = {
-    schema_version: 1,
+    schema_version: 2,
     mission_id: missionId,
     contribution_commit_oid: commitOid,
+    pr_head_oid: prHeadOid,
+    merge_commit_oid: mergeCommitOid,
     receipt_url: item.receipt_url,
     pr_url: item.pr_url,
     pr_number: prNumber,

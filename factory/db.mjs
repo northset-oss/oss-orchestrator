@@ -973,6 +973,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     prState,
     merged = false,
     ciState = null,
+    prHeadOid = null,
     observedAt = new Date(),
   } = {}) {
     if (typeof repository !== 'string' || !repository.includes('/')) {
@@ -990,11 +991,12 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       const previouslyClosed = current.outcome_recorded_at !== null || current.merged === true ||
         ['CLOSED', 'MERGED'].includes(String(current.pr_state ?? '').toUpperCase());
       const repositoryReleased = closed && !previouslyClosed;
-      connection.prepare(`UPDATE publications SET pr_state=?,merged=?,ci_state=?,
+      connection.prepare(`UPDATE publications SET pr_state=?,merged=?,ci_state=?,pr_head_oid=coalesce(?,pr_head_oid),
         outcome_recorded_at=?,updated_at=? WHERE mission_id=?`).run(
         merged === true || normalizedState === 'MERGED' ? 'MERGED' : normalizedState,
         merged === true || normalizedState === 'MERGED' ? 1 : 0,
         ciState,
+        prHeadOid,
         closed ? (current.outcome_recorded_at ?? observed) : current.outcome_recorded_at,
         observed,
         missionId,
