@@ -715,6 +715,7 @@ test('an approved fast-forward amendment updates the existing PR and resets proo
     tested_tree_oid: oid(902),
     patch_sha256: digest('amended patch'),
     pr_body: '## Summary\n\nCorrected after manual verification.\n',
+    planned_actions: ['update-upstream-pr'],
   });
   const newProof = `sha256:${'f'.repeat(64)}`;
   const recheckPlans = [];
@@ -751,6 +752,43 @@ test('an approved fast-forward amendment updates the existing PR and resets proo
   assert.equal(publication.attestation_url, null);
   assert.equal(publication.status_state, 'PENDING');
   assert.equal(publication.status_url, null);
+});
+
+test('a partially pushed amendment resumes from its exact public head and updates the existing PR', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  await publishBoard(db.board.board_digest, options(db, github));
+  const originalCommit = oid(1);
+  const amendedCommit = oid(903);
+  reapproveManifest(db, 'M-001', {
+    base_oid: originalCommit,
+    commit_oid: amendedCommit,
+    tested_tree_oid: oid(904),
+    patch_sha256: digest('partially pushed amendment'),
+    pr_body: '## Summary\n\nRecovered exact amendment.\n',
+    planned_actions: ['update-upstream-pr'],
+  });
+  await github.pushBranch({repository: 'northset/project-1', branch: 'northset/m-001',
+    oid: amendedCommit, force: false});
+  await db.savePublication('M-001', {
+    pushed_oid: amendedCommit,
+    publication_state: 'FAILED',
+    last_error: 'STORED_PR_MISMATCH',
+    last_error_detail: 'stale PR lookup after branch push',
+  });
+  const recheckPlans = [];
+
+  const result = await publishBoard(db.board.board_digest, options(db, github, {
+    liveRecheck: async (plan) => { recheckPlans.push(plan); return {clean: true}; },
+  }));
+
+  assert.equal(result.results[0].state, 'SUBMITTED');
+  assert.equal(github.count('create_pull_request'), 1);
+  assert.equal(github.count('update_pull_request'), 1);
+  assert.ok(recheckPlans.every((plan) => plan.amendment.head_oid === amendedCommit));
+  const publication = await db.getPublication('M-001');
+  assert.equal(publication.pr_head_oid, amendedCommit);
+  assert.equal(publication.publication_state, 'SUBMITTED');
 });
 
 test('a transient read failure cannot erase a factual submitted PR', async () => {

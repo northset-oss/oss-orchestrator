@@ -96,12 +96,28 @@ function approvalDigestFor(approval, id) {
   return values && typeof values === 'object' ? values[id] ?? null : null;
 }
 
+function submittedPr(publication) {
+  return publication?.publication_state === 'SUBMITTED' ||
+    (publication?.publication_state === 'FAILED' && publication.last_error === 'STORED_PR_MISMATCH');
+}
+
+function amendmentHead(publication, plan) {
+  if (!Array.isArray(plan.manifest?.planned_actions) ||
+      !plan.manifest.planned_actions.includes('update-upstream-pr')) return null;
+  if (!submittedPr(publication) || !publication.pr_number || !publication.pr_url) return null;
+  const oldHead = plan.base_oid;
+  const newHead = plan.commit_oid;
+  const storedHead = publication.pr_head_oid;
+  const pushedHead = publication.pushed_oid;
+  if (storedHead === oldHead && (pushedHead === oldHead || pushedHead === newHead)) return pushedHead;
+  if (storedHead === newHead && pushedHead === newHead) return newHead;
+  return null;
+}
+
 async function approvedAmendment(db, plan) {
   const publication = await db.getPublication(plan.mission_id);
-  return publication?.publication_state === 'SUBMITTED' &&
-    publication.pr_head_oid === plan.base_oid && publication.pushed_oid === plan.base_oid
-    ? {number: publication.pr_number, head_oid: plan.base_oid, url: publication.pr_url}
-    : null;
+  const headOid = amendmentHead(publication, plan);
+  return headOid ? {number: publication.pr_number, head_oid: headOid, url: publication.pr_url} : null;
 }
 
 function manifestFor(item) {
@@ -411,10 +427,9 @@ async function publishOne(plan, {
   db, github, safety, now, repositoryState, sleep, forkPollAttempts, forkPollIntervalMs,
 }) {
   const priorPublication = await db.getPublication(plan.mission_id);
-  const wasSubmitted = priorPublication?.publication_state === 'SUBMITTED' &&
+  const wasSubmitted = submittedPr(priorPublication) &&
     Number.isInteger(Number(priorPublication.pr_number)) && Boolean(priorPublication.pr_url);
-  const isApprovedAmendment = wasSubmitted && priorPublication.pr_head_oid === plan.base_oid &&
-    priorPublication.pushed_oid === plan.base_oid;
+  const isApprovedAmendment = amendmentHead(priorPublication, plan) !== null;
   await ensureFork(plan, {github, safety, sleep, forkPollAttempts, forkPollIntervalMs});
   const evidenceFailure = await ensureEvidenceAsset(plan, {github, safety});
   if (evidenceFailure) {
@@ -469,6 +484,15 @@ async function publishOne(plan, {
     base_branch: plan.base_branch,
   });
   const candidates = pullRequests(listed).filter((pr) => sameHeadCandidate(pr, plan));
+  if (isApprovedAmendment && candidates.length === 1) {
+    const observed = prFields(candidates[0]);
+    if (observed?.head_oid === priorPublication.pr_head_oid && observed.head_oid !== plan.commit_oid &&
+        Number(observed.number) === Number(priorPublication.pr_number) && observed.url === priorPublication.pr_url) {
+      const refreshed = await remoteRequest(safety, github, 'read', 'get_pull_request_after_push',
+        'getPullRequest', {repository: plan.repository, number: priorPublication.pr_number});
+      if (sameHeadCandidate(refreshed, plan)) candidates[0] = refreshed;
+    }
+  }
   const exact = candidates.filter((pr) => exactPr(pr, plan));
   if (exact.length > 1) {
     return failItem(db, plan, 'AMBIGUOUS_EXISTING_PRS',
