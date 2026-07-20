@@ -9,6 +9,7 @@ import {
   publishBoard,
   reconcileReceipt,
 } from './publisher.mjs';
+import {GitHubPublicLimitError} from './github-safety.mjs';
 
 const RECEIPT_PROOF_DIGEST = `sha256:${'c'.repeat(64)}`;
 const RECEIPT_BATCH_OID = 'd'.repeat(40);
@@ -472,6 +473,32 @@ test('durable artifact tampering refuses publication before any outbound action'
   assert.equal(github.events.length, 0);
 });
 
+test('artifact drift blocks a rerun without erasing an already submitted PR', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  await publishBoard(db.board.board_digest, options(db, github));
+  const outboundBefore = github.events.length;
+  const artifactVerifier = () => { throw new Error('durable patch digest changed'); };
+
+  const repeated = await publishBoard(db.board.board_digest, options(db, github, {artifactVerifier}));
+  assert.equal(repeated.results[0].state, 'SUBMITTED');
+  assert.equal(repeated.results[0].code, 'ARTIFACT_INTEGRITY_FAILED');
+  assert.equal((await db.getPublication('M-001')).publication_state, 'SUBMITTED');
+  assert.equal((await db.getPublication('M-001')).last_error, 'ARTIFACT_INTEGRITY_FAILED');
+  assert.equal(github.events.length, outboundBefore);
+
+  db.publications.set('M-001', {
+    ...db.publications.get('M-001'), publication_state: 'FAILED',
+  });
+  db.taskStates.set('TASK-001', {state: 'FAILED'});
+  const repaired = await publishBoard(db.board.board_digest, options(db, github, {artifactVerifier}));
+  assert.equal(repaired.results[0].state, 'SUBMITTED');
+  assert.equal(repaired.results[0].code, 'ARTIFACT_INTEGRITY_FAILED');
+  assert.equal((await db.getPublication('M-001')).publication_state, 'SUBMITTED');
+  assert.equal(db.taskStates.get('TASK-001').state, 'PR_OPENED');
+  assert.equal(github.events.length, outboundBefore);
+});
+
 test('each item gets another final live check immediately before its branch and PR', async () => {
   const db = new FakeDb(2);
   const github = new FakeGitHub();
@@ -505,6 +532,47 @@ test('canonical Pages availability does not gate an approved upstream PR', async
   assert.equal(result.results[0].state, 'SUBMITTED');
   assert.equal(github.count('push_branch'), 1);
   assert.equal(github.count('create_pull_request'), 1);
+});
+
+test('internal public cap defers approved bytes and resumes without another branch push', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  let blocked = true;
+  const safety = {
+    request: async (request) => {
+      if (blocked && request.kind === 'pr_create') {
+        throw new GitHubPublicLimitError('hourly PR cap reached');
+      }
+      return request.execute();
+    },
+  };
+  const first = await publishBoard(db.board.board_digest, options(db, github, {safety}));
+  assert.equal(first.results[0].state, 'APPROVED');
+  assert.equal(first.results[0].code, 'GITHUB_PUBLIC_LIMIT');
+  assert.equal(db.publications.get('M-001').publication_state, 'BRANCH_PUSHED');
+  assert.equal(db.publications.get('M-001').receipt_state, 'PUBLISHED');
+  assert.equal(db.publications.get('M-001').last_error, 'GITHUB_PUBLIC_LIMIT');
+  assert.equal(db.taskStates.has('TASK-001'), false);
+  assert.equal(github.count('push_branch'), 1);
+  assert.equal(github.count('create_pull_request'), 0);
+
+  db.publications.set('M-001', {
+    ...db.publications.get('M-001'),
+    publication_state: 'FAILED',
+    last_error: 'GITHUB_PUBLIC_LIMIT',
+  });
+  db.taskStates.set('TASK-001', {state: 'FAILED', detail: 'legacy cap handling'});
+  const repaired = await publishBoard(db.board.board_digest, options(db, github, {safety}));
+  assert.equal(repaired.results[0].state, 'APPROVED');
+  assert.equal(db.publications.get('M-001').publication_state, 'BRANCH_PUSHED');
+  assert.equal(db.taskStates.get('TASK-001').state, 'APPROVED');
+
+  blocked = false;
+  const resumed = await publishBoard(db.board.board_digest, options(db, github, {safety}));
+  assert.equal(resumed.results[0].state, 'SUBMITTED');
+  assert.equal(github.count('push_branch'), 1);
+  assert.equal(github.count('create_pull_request'), 1);
+  assert.equal(db.publications.get('M-001').last_error, null);
 });
 
 test('crash recovery adopts an exact PR that closed before its checkpoint retry', async () => {
@@ -575,10 +643,67 @@ test('rerunning a submitted board adopts the PR without double-counting reposito
   const github = new FakeGitHub();
   await publishBoard(db.board.board_digest, options(db, github));
   const first = await db.getRepositoryState('upstream1/project');
+  await db.savePublication('M-001', {
+    attestation_state: 'RECEIPT_ATTESTED',
+    status_state: 'PUBLISHED',
+  });
+  db.taskStates.set('TASK-001', {state: 'RECEIPT_ATTESTED'});
   const repeated = await publishBoard(db.board.board_digest, options(db, github));
   assert.equal(repeated.results[0].state, 'SUBMITTED');
   assert.equal(github.count('create_pull_request'), 1);
   assert.deepEqual(await db.getRepositoryState('upstream1/project'), first);
+  assert.equal((await db.getPublication('M-001')).attestation_state, 'RECEIPT_ATTESTED');
+  assert.equal((await db.getPublication('M-001')).status_state, 'PUBLISHED');
+  assert.equal(db.taskStates.get('TASK-001').state, 'RECEIPT_ATTESTED');
+});
+
+test('a transient read failure cannot erase a factual submitted PR', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  await publishBoard(db.board.board_digest, options(db, github));
+  const safety = {
+    request: async (request) => {
+      if (request.operation === 'find_pull_requests') {
+        throw Object.assign(new Error('GraphQL request timed out'), {code: 'GH_COMMAND_FAILED'});
+      }
+      return request.execute();
+    },
+  };
+  const repeated = await publishBoard(db.board.board_digest, options(db, github, {safety}));
+  assert.equal(repeated.results[0].state, 'SUBMITTED');
+  assert.equal(repeated.results[0].code, 'GH_COMMAND_FAILED');
+  assert.equal((await db.getPublication('M-001')).publication_state, 'SUBMITTED');
+  assert.equal((await db.getPublication('M-001')).last_error, 'GH_COMMAND_FAILED');
+  assert.equal(github.count('create_pull_request'), 1);
+
+  db.publications.set('M-001', {
+    ...db.publications.get('M-001'), publication_state: 'FAILED', last_error: 'GH_COMMAND_FAILED',
+  });
+  db.taskStates.set('TASK-001', {state: 'FAILED'});
+  const repaired = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(repaired.results[0].state, 'SUBMITTED');
+  assert.equal((await db.getPublication('M-001')).publication_state, 'SUBMITTED');
+  assert.equal(db.taskStates.get('TASK-001').state, 'PR_OPENED');
+});
+
+test('upstream title or body drift cannot erase a factual exact submission', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  await publishBoard(db.board.board_digest, options(db, github));
+  const stored = [...github.pullRequests.values()][0];
+  stored.body += '\nBot-added release notes.\n';
+
+  db.publications.set('M-001', {
+    ...db.publications.get('M-001'), publication_state: 'FAILED', last_error: 'STORED_PR_MISMATCH',
+  });
+  db.taskStates.set('TASK-001', {state: 'FAILED'});
+  const repeated = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(repeated.results[0].state, 'SUBMITTED');
+  assert.equal(repeated.results[0].code, 'STORED_PR_TEXT_DRIFT');
+  assert.equal((await db.getPublication('M-001')).publication_state, 'SUBMITTED');
+  assert.equal((await db.getPublication('M-001')).last_error, 'STORED_PR_TEXT_DRIFT');
+  assert.equal(db.taskStates.get('TASK-001').state, 'PR_OPENED');
+  assert.equal(github.count('create_pull_request'), 1);
 });
 
 test('a superseded mission cannot be resurrected under its previous approval', async () => {

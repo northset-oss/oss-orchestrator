@@ -13,7 +13,7 @@ const PRIORITIES = Object.freeze({
 const PUBLIC_LIMITS = Object.freeze({
   repositoryOpen: 1,
   ownerPerDay: 2,
-  perHour: 4,
+  perHour: 6,
   perDay: 30,
 });
 

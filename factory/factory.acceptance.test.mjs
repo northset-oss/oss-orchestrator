@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdtemp} from 'node:fs/promises';
+import {mkdtemp, rm} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -8,6 +8,7 @@ import {openFactoryDb} from './db.mjs';
 import {
   assertDeclaredTestsExecuted,
   assertPublicVerificationClaims,
+  createCommandDriver,
   createStageSemaphores,
   removeWorkTree,
   runFactoryCycle,
@@ -325,6 +326,82 @@ test('one infrastructure retry stays within the same attempt record', async (t) 
   assert.equal(calls, 2);
   assert.equal(db.stats().attempts, 1);
   assert.equal(db.stats().ready_items, 1);
+});
+
+test('one transient scout retry stays within the same attempt record', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  let calls = 0;
+  const driver = verifiedDriver({verified: 1});
+  const originalScout = driver.scout;
+  driver.scout = async (...args) => {
+    calls += 1;
+    if (calls === 1) {
+      const error = new Error('temporary model authentication failure');
+      error.transient = true;
+      error.infrastructure = true;
+      throw error;
+    }
+    return originalScout(...args);
+  };
+  await runFactoryCycle({db, workers: 1, driver});
+  assert.equal(calls, 2);
+  assert.equal(db.stats().attempts, 1);
+  assert.equal(db.stats().ready_items, 1);
+});
+
+test('provider control failures are recorded as infrastructure rather than worker quality', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  const driver = verifiedDriver({verified: 1});
+  driver.scout = async () => {
+    const error = new Error('host Codex sandbox rejected its output schema');
+    error.infrastructure = true;
+    throw error;
+  };
+  await runFactoryCycle({db, workers: 1, driver});
+  const task = db.listTasks({state: 'FAILED', limit: 1})[0];
+  const attempt = db.connection.prepare('SELECT * FROM attempts WHERE task_id=?').get(task.task_id);
+  assert.equal(attempt.outcome, 'FAILED');
+  assert.equal(attempt.failure_class, 'infrastructure');
+});
+
+test('an exhausted transient author retry is infrastructure, not a verification skip', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  let calls = 0;
+  const driver = verifiedDriver({verified: 1});
+  driver.author = async () => {
+    calls += 1;
+    const error = new Error('temporary model provider failure');
+    error.transient = true;
+    error.infrastructure = true;
+    throw error;
+  };
+  await runFactoryCycle({db, workers: 1, driver});
+  const task = db.listTasks({state: 'FAILED', limit: 1})[0];
+  const attempt = db.connection.prepare('SELECT * FROM attempts WHERE task_id=?').get(task.task_id);
+  assert.equal(calls, 2);
+  assert.equal(attempt.outcome, 'FAILED');
+  assert.equal(attempt.failure_class, 'infrastructure');
+});
+
+test('command driver recognizes narrow Codex control-plane failures', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'oss-factory-worker-errors-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const cases = [
+    ['host Codex sandbox failed: agent identity JWT payload is not valid JSON', true],
+    ["host Codex sandbox failed: invalid_json_schema for response_format 'codex_output_schema'", false],
+  ];
+  for (const [message, transient] of cases) {
+    const driver = createCommandDriver({
+      command: process.execPath,
+      args: ['-e', `process.stderr.write(${JSON.stringify(message)}); process.exit(1);`],
+      workRoot: root,
+    });
+    await assert.rejects(() => driver.scout(candidates(1)[0], root, {}), (error) =>
+      error.infrastructure === true && error.transient === transient);
+  }
 });
 
 test('one verifier failure is passed to exactly one second author attempt', async (t) => {

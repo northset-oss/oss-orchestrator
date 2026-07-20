@@ -108,6 +108,11 @@ test('N1b scout rejects workspace and PnP layouts before model or bootstrap work
   const yarnRc = await worker.handle({action: 'scout', task, checkout});
   assert.equal(yarnRc.decision, 'SKIP');
   assert.match(yarnRc.reason, /Yarn Berry/);
+
+  await rm(path.join(checkout, 'package.json'));
+  const missingRoot = await worker.handle({action: 'scout', task, checkout});
+  assert.equal(missingRoot.decision, 'SKIP');
+  assert.match(missingRoot.reason, /root package\.json/);
 });
 
 test('N2 the authenticated model client stays host-side and Docker plans remain credential-free', async (t) => {

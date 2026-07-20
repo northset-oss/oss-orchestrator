@@ -180,6 +180,15 @@ export function buildPreflightQuery(candidates, {northsetLogin = 'AysajanE'} = {
         rootPackage: object(expression: "HEAD:package.json") {
           ... on Blob { byteSize text }
         }
+        pnpmWorkspaceYaml: object(expression: "HEAD:pnpm-workspace.yaml") {
+          ... on Blob { byteSize }
+        }
+        pnpmWorkspaceYml: object(expression: "HEAD:pnpm-workspace.yml") {
+          ... on Blob { byteSize }
+        }
+        lernaConfig: object(expression: "HEAD:lerna.json") {
+          ... on Blob { byteSize }
+        }
         issue(number: ${issueNumber}) {
           id number title bodyText url state locked updatedAt
           assignees(first: 20) { nodes { login } }
@@ -223,7 +232,9 @@ export function normalizePreflight(candidate, data) {
   const rootPackage = parseJson(repository?.rootPackage?.text, null);
   const workspaces = rootPackage?.workspaces;
   const workspaceLayout = (Array.isArray(workspaces) && workspaces.length > 0) ||
-    (workspaces && typeof workspaces === 'object' && Object.keys(workspaces).length > 0);
+    (workspaces && typeof workspaces === 'object' && Object.keys(workspaces).length > 0) ||
+    [repository?.pnpmWorkspaceYaml, repository?.pnpmWorkspaceYml, repository?.lernaConfig]
+      .some((item) => Number(item?.byteSize) > 0);
   const yarnBerryLayout = /^yarn@(?:[2-9]|[1-9][0-9]+)(?:\.|$)/i
     .test(String(rootPackage?.packageManager ?? ''));
   const crossReferencedPrs = (issue?.timelineItems?.nodes ?? [])

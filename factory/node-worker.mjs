@@ -160,6 +160,7 @@ async function isFile(file) {
 }
 
 async function unsupportedNodeLayout(checkout) {
+  if (!await isFile(path.join(checkout, 'package.json'))) return 'root package.json is missing';
   let packageJson;
   try { packageJson = JSON.parse(await readFile(path.join(checkout, 'package.json'), 'utf8')); }
   catch (error) { throw new Error(`cannot parse package.json: ${error.message}`); }

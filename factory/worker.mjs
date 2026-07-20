@@ -229,9 +229,8 @@ async function processClaim(claim, {
   let checkout = null;
   try {
     checkout = await semaphores.clone.run(() => oneInfrastructureRetry(() => driver.checkout(task, attempt)));
-    const scout = await semaphores.scout.run(() => driver.scout(task, checkout, {
-      effort: 'medium', timeoutMs: 90_000,
-    }));
+    const scout = await semaphores.scout.run(() => oneInfrastructureRetry(() =>
+      driver.scout(task, checkout, {effort: 'medium', timeoutMs: 90_000})));
     if (!scout || scout.decision === 'SKIP') {
       db.finishAttempt(attempt.attempt_id, {
         outcome: 'SKIPPED', failureClass: 'candidate',
@@ -320,6 +319,7 @@ async function processClaim(claim, {
         const board = createBoardIfDue(db, {...boardPolicy, now: now()});
         return {task_id: task.task_id, state: 'READY', mission_id: ready.mission_id, board};
       } catch (error) {
+        if (error?.transient === true || error?.infrastructure === true) throw error;
         lastError = error;
         feedback = error.message;
         await driver.resetAfterFailure?.(task, checkout, {authorAttempt, error});
@@ -333,7 +333,8 @@ async function processClaim(claim, {
     return {task_id: task.task_id, state: 'SKIPPED', reason: lastError?.message ?? null};
   } catch (error) {
     db.finishAttempt(attempt.attempt_id, {
-      outcome: 'FAILED', failureClass: error?.transient ? 'infrastructure' : 'worker',
+      outcome: 'FAILED', failureClass: error?.transient || error?.infrastructure
+        ? 'infrastructure' : 'worker',
       durationMs: now().getTime() - began, error: error.message, now: now(),
     });
     return {task_id: task.task_id, state: 'FAILED', reason: error.message};
@@ -450,9 +451,13 @@ function runJsonCommand(command, args, payload, {
         return;
       }
       if (code !== 0) {
-        const error = new Error(`worker command failed: ${(stderr || stdout).trim() || `exit ${code}`}`);
+        const failureOutput = stderr || stdout;
+        const error = new Error(`worker command failed: ${failureOutput.trim() || `exit ${code}`}`);
+        error.infrastructure = /host Codex sandbox failed:[\s\S]*(?:agent identity JWT payload is not valid JSON|invalid_json_schema|usage[_ ]limit|model provider[^\n]*(?:unavailable|error))/i
+          .test(failureOutput);
         error.transient = /temporar|timed out|connection reset|econnreset|etimedout|eai_again|network unreachable|registry[^\n]*(?:unavailable|timeout)|cannot connect to the docker daemon/i
-          .test(stderr);
+          .test(failureOutput) ||
+          /host Codex sandbox failed:[\s\S]*agent identity JWT payload is not valid JSON/i.test(failureOutput);
         reject(error);
         return;
       }

@@ -163,7 +163,9 @@ test('attempt history can reorder the initial mechanical ranking', async () => {
 
 test('preflight query consolidates all live fields and repository-wide Northset PR search', () => {
   const query = buildPreflightQuery([candidate()]);
-  for (const expected of ['isArchived', 'isFork', 'defaultBranchRef', 'rootPackage', 'assignees', 'labels', 'comments', 'timelineItems']) {
+  for (const expected of ['isArchived', 'isFork', 'defaultBranchRef', 'rootPackage',
+    'pnpmWorkspaceYaml', 'pnpmWorkspaceYml', 'lernaConfig', 'assignees', 'labels', 'comments',
+    'timelineItems']) {
     assert.match(query, new RegExp(expected));
   }
   assert.match(query, /rootPackage: object[\s\S]*\.\.\. on Blob \{ byteSize text \}/);
@@ -263,6 +265,19 @@ test('live preflight rejects workspace metadata from the root package without a 
   });
   assert.equal(result.outcome, 'SKIP');
   assert.match(result.reasons.join(' '), /multi-package workspaces/);
+});
+
+test('live preflight rejects pnpm and lerna workspace sentinels without a worker attempt', async () => {
+  for (const marker of ['pnpmWorkspaceYaml', 'pnpmWorkspaceYml', 'lernaConfig']) {
+    const repository = graphRepository(1, {[marker]: {byteSize: 20}});
+    const [result] = await preflightCandidates([candidate(1)], {
+      github: {graphql: async () => ({data: {c0: repository, n0: {issueCount: 0}}})},
+      workers: 1,
+      now: NOW,
+    });
+    assert.equal(result.outcome, 'SKIP', marker);
+    assert.match(result.reasons.join(' '), /multi-package workspaces/, marker);
+  }
 });
 
 test('live preflight rejects Yarn Berry declared by the root package', async () => {

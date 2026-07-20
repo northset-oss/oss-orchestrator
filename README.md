@@ -7,6 +7,8 @@ publisher.
 
 The binding runtime policy is [OPERATING_CONTRACT.md](OPERATING_CONTRACT.md). The redesign rationale
 is [docs/oss_orchestrator_system_redesign_2026-07-19.md](docs/oss_orchestrator_system_redesign_2026-07-19.md).
+Phase-level observations and carry-forward lessons are recorded in
+[docs/phase1_learnings.md](docs/phase1_learnings.md).
 The retired campaign-v3 runtime is preserved under [archive/campaign-v3](archive/campaign-v3/) and is
 not part of the active path.
 

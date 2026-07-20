@@ -297,8 +297,20 @@ function sameHeadCandidate(pr, plan) {
     fields.base_branch === plan.base_branch && fields.head_branch === plan.branch;
 }
 
+function sameSubmittedIdentity(pr, plan, publication) {
+  const fields = prFields(pr);
+  return fields !== null && fields.repository === plan.repository &&
+    fields.base_branch === plan.base_branch && fields.head_branch === plan.branch &&
+    fields.head_oid === plan.commit_oid && Number(fields.number) === Number(publication?.pr_number) &&
+    fields.url === publication?.pr_url;
+}
+
 function isPaused(error) {
   return error?.code === 'GITHUB_PAUSED' || error?.code === 'PUBLISHER_CHECKPOINT_FAILED';
+}
+
+function isPublicLimit(error) {
+  return error?.code === 'GITHUB_PUBLIC_LIMIT';
 }
 
 async function checkpoint(db, id, patch, label) {
@@ -319,6 +331,34 @@ async function failItem(db, plan, code, detail, state = 'FAILED') {
   });
   await db.updateTaskState(plan.task_id, state === 'SUPERSEDED' ? 'SUPERSEDED' : 'FAILED', detail);
   return {mission_id: plan.mission_id, state, code, detail};
+}
+
+async function deferItem(db, plan, code, detail) {
+  await db.savePublication(plan.mission_id, {
+    mission_id: plan.mission_id,
+    task_id: plan.task_id,
+    last_error: code,
+    last_error_detail: detail,
+  });
+  return {mission_id: plan.mission_id, state: 'APPROVED', code, detail};
+}
+
+async function preserveSubmittedError(db, plan, error) {
+  const current = await db.getPublication(plan.mission_id);
+  if (current?.publication_state !== 'SUBMITTED' || !current.pr_url || !current.pr_number) return null;
+  const code = error?.code ?? 'PUBLICATION_READ_FAILED';
+  await db.savePublication(plan.mission_id, {
+    last_error: code,
+    last_error_detail: error.message,
+  });
+  return {
+    mission_id: plan.mission_id,
+    state: 'SUBMITTED',
+    code,
+    detail: error.message,
+    pr_number: current.pr_number,
+    pr_url: current.pr_url,
+  };
 }
 
 function cooldownReason(repositoryState, now) {
@@ -361,6 +401,8 @@ async function publishOne(plan, {
   db, github, safety, now, repositoryState, sleep, forkPollAttempts, forkPollIntervalMs,
 }) {
   const priorPublication = await db.getPublication(plan.mission_id);
+  const wasSubmitted = priorPublication?.publication_state === 'SUBMITTED' &&
+    Number.isInteger(Number(priorPublication.pr_number)) && Boolean(priorPublication.pr_url);
   await ensureFork(plan, {github, safety, sleep, forkPollAttempts, forkPollIntervalMs});
   const evidenceFailure = await ensureEvidenceAsset(plan, {github, safety});
   if (evidenceFailure) {
@@ -391,13 +433,15 @@ async function publishOne(plan, {
         `push returned ${pushedOid}, expected ${plan.commit_oid}`);
     }
   }
-  await checkpoint(db, plan.mission_id, {
-    mission_id: plan.mission_id,
-    task_id: plan.task_id,
-    branch: plan.branch,
-    pushed_oid: plan.commit_oid,
-    publication_state: 'BRANCH_PUSHED',
-  }, `${plan.mission_id} branch push`);
+  if (!wasSubmitted) {
+    await checkpoint(db, plan.mission_id, {
+      mission_id: plan.mission_id,
+      task_id: plan.task_id,
+      branch: plan.branch,
+      pushed_oid: plan.commit_oid,
+      publication_state: 'BRANCH_PUSHED',
+    }, `${plan.mission_id} branch push`);
+  }
 
   const listed = await remoteRequest(safety, github, 'read', 'find_pull_requests', 'findPullRequests', {
     repository: plan.repository,
@@ -412,13 +456,29 @@ async function publishOne(plan, {
       `more than one exact pull request exists for ${plan.branch}`);
   }
   if (candidates.length && exact.length === 0) {
+    if (wasSubmitted && candidates.length === 1 &&
+        sameSubmittedIdentity(candidates[0], plan, priorPublication)) {
+      await db.savePublication(plan.mission_id, {
+        last_error: 'STORED_PR_TEXT_DRIFT',
+        last_error_detail: 'the submitted pull request title or body was changed upstream after exact creation',
+      });
+      return {
+        mission_id: plan.mission_id,
+        state: 'SUBMITTED',
+        code: 'STORED_PR_TEXT_DRIFT',
+        detail: 'the submitted pull request title or body was changed upstream after exact creation',
+        pr_number: priorPublication.pr_number,
+        pr_url: priorPublication.pr_url,
+        pr_state: priorPublication.pr_state,
+      };
+    }
     return failItem(db, plan, 'STORED_PR_MISMATCH',
       `an existing pull request for ${plan.branch} has a different title, body, base, or head`);
   }
   let pullRequest = exact[0] ?? null;
   if (!pullRequest) {
     if (openPrCapReached(repositoryState)) {
-      return failItem(db, plan, 'PUBLICATION_REPOSITORY_BLOCKED', 'one-open-PR cap reached');
+      return deferItem(db, plan, 'GITHUB_PUBLIC_LIMIT', 'one-open-PR cap reached');
     }
     pullRequest = await remoteRequest(safety, github, 'pr_create', 'create_pull_request', 'createPullRequest', {
       repository: plan.repository,
@@ -452,7 +512,7 @@ async function publishOne(plan, {
   const stored = prFields(readback);
   const closed = String(stored.state ?? '').toUpperCase() === 'CLOSED';
   const observedAt = timestamp(now);
-  const alreadyCounted = priorPublication?.publication_state === 'SUBMITTED' &&
+  const alreadyCounted = wasSubmitted &&
     Number(priorPublication.pr_number) === stored.number && priorPublication.pr_url === stored.url;
   await checkpoint(db, plan.mission_id, {
     pr_number: stored.number,
@@ -463,13 +523,16 @@ async function publishOne(plan, {
     merged: stored.merged === true,
     outcome_recorded_at: closed ? observedAt : null,
     publication_state: 'SUBMITTED',
-    attestation_state: 'ATTESTATION_PENDING',
-    status_state: 'PENDING',
-    submitted_at: observedAt,
+    attestation_state: alreadyCounted
+      ? priorPublication.attestation_state : 'ATTESTATION_PENDING',
+    status_state: alreadyCounted ? priorPublication.status_state : 'PENDING',
+    submitted_at: alreadyCounted ? priorPublication.submitted_at : observedAt,
     last_error: null,
     last_error_detail: null,
   }, `${plan.mission_id} submission`);
-  await db.updateTaskState(plan.task_id, 'PR_OPENED');
+  await db.updateTaskState(plan.task_id,
+    alreadyCounted && priorPublication.attestation_state === 'RECEIPT_ATTESTED'
+      ? 'RECEIPT_ATTESTED' : 'PR_OPENED');
   if (!closed && !alreadyCounted && typeof db.setRepositoryState === 'function') {
     const latest = await db.getRepositoryState(plan.repository) ?? {};
     await db.setRepositoryState(plan.repository, {
@@ -541,6 +604,23 @@ export async function publishBoard(boardDigest, {
         detail: 'a superseded mission cannot be published under its previous approval'});
       continue;
     }
+    if (priorPublication?.publication_state === 'FAILED' &&
+        priorPublication.last_error === 'GITHUB_PUBLIC_LIMIT') {
+      await db.savePublication(id, {
+        publication_state: priorPublication.pushed_oid ? 'BRANCH_PUSHED' : 'APPROVED',
+      });
+      await db.updateTaskState(ready.task_id, 'APPROVED', priorPublication.last_error_detail);
+    }
+    if (priorPublication?.publication_state === 'FAILED' &&
+        ['GH_COMMAND_FAILED', 'STORED_PR_MISMATCH', 'ARTIFACT_INTEGRITY_FAILED']
+          .includes(priorPublication.last_error) &&
+        priorPublication.pr_url && Number.isInteger(Number(priorPublication.pr_number)) &&
+        priorPublication.pr_head_oid && priorPublication.pr_head_oid === priorPublication.pushed_oid) {
+      await db.savePublication(id, {publication_state: 'SUBMITTED'});
+      await db.updateTaskState(ready.task_id,
+        priorPublication.attestation_state === 'RECEIPT_ATTESTED' ? 'RECEIPT_ATTESTED' : 'PR_OPENED',
+        priorPublication.last_error_detail);
+    }
     if (value(ready.approval_state, 'APPROVED') !== 'APPROVED') {
       results.push({mission_id: id, state: 'FAILED', code: 'ITEM_NOT_APPROVED'});
       continue;
@@ -568,6 +648,12 @@ export async function publishBoard(boardDigest, {
     try {
       artifactVerifier(plan.manifest);
     } catch (error) {
+      error.code = 'ARTIFACT_INTEGRITY_FAILED';
+      const submitted = await preserveSubmittedError(db, plan, error);
+      if (submitted) {
+        results.push(submitted);
+        continue;
+      }
       results.push(await failItem(db, plan, 'ARTIFACT_INTEGRITY_FAILED', error.message));
       continue;
     }
@@ -612,6 +698,15 @@ export async function publishBoard(boardDigest, {
       clean.push({plan, repositoryState: live.repository_state ?? await db.getRepositoryState(plan.repository)});
     } catch (error) {
       if (isPaused(error)) throw error;
+      const submitted = await preserveSubmittedError(db, plan, error);
+      if (submitted) {
+        results.push(submitted);
+        continue;
+      }
+      if (isPublicLimit(error)) {
+        results.push(await deferItem(db, plan, error.code, error.message));
+        continue;
+      }
       results.push(await failItem(db, plan, error.code ?? 'PUBLICATION_FAILED', error.message));
     }
   }
@@ -692,6 +787,15 @@ export async function publishBoard(boardDigest, {
       }));
     } catch (error) {
       if (isPaused(error)) throw error;
+      const submitted = await preserveSubmittedError(db, plan, error);
+      if (submitted) {
+        results.push(submitted);
+        continue;
+      }
+      if (isPublicLimit(error)) {
+        results.push(await deferItem(db, plan, error.code, error.message));
+        continue;
+      }
       results.push(await failItem(db, plan, error.code ?? 'PUBLICATION_FAILED', error.message));
     }
   }
