@@ -153,6 +153,22 @@ configuration, not a source regression, and changing the contribution would not 
 reconciliation should classify secret-withheld fork checks separately, retain the exact log evidence,
 and avoid wasting author attempts or asking maintainers to rerun an inevitably identical job.
 
+The next local audit exposed three more preventable secondary losses. M-1044 was technically sound
+and built cleanly, but it was prepared against Swiish's stable `master` branch even though the current
+contribution guide requires feature work to branch from and target `develop`; its PR body also skipped
+the repository template. The two upstream branches happened to have identical trees, so the patch
+could be rebound without a source change, but branch and template requirements must be read before
+choosing the base. M-1048 was more serious: its regex-based source test passed while the changed
+ClojureScript had an unmatched delimiter and failed `cljs:release`. A source-contract test is useful
+regression evidence, but it cannot substitute for compiling the language actually changed.
+
+Those compiler checks initially could not run because Docker's internal disk was full even though the
+macOS host still had 132 GiB free. The mismatch came from unused mission dependency volumes and old
+builder cache. Removing only unused Northset dependency caches reclaimed about 8.9 GiB and immediately
+allowed M-1046's offline CSS and ClojureScript release builds to pass. Host free-space checks alone do
+not diagnose Docker capacity; when a verifier reports `No space left on device`, inspect Docker's own
+image, volume, and build-cache accounting before rejecting the candidate or weakening the check.
+
 ### Carry-forward lessons
 
 1. **Use exact outcome words.** A thank-you, approval, merge, green CI result, receipt publication,
