@@ -1,9 +1,10 @@
 import {spawn} from 'node:child_process';
 import path from 'node:path';
 
+import {isClaimText} from './claim-detection.mjs';
+
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
-const CLAIM_PATTERN = /\b(?:i(?:'m| am|'ll| will)?\s+(?:work(?:ing)?|take|claim|implement)(?:\s+on)?\s+(?:this|it)|can i work on this|please assign (?:this|it|me)|working on this|i opened (?:a )?pr|i have (?:a )?pr)\b/i;
 
 export class GhCliError extends Error {
   constructor(message, code, result = {}) {
@@ -206,7 +207,10 @@ function ensureSuccess(result, operation, allowed = []) {
 }
 
 function rawGitResult(result, operation) {
-  const structured = {...result, status: result.code === 0 ? 200 : 0, httpStatus: result.code === 0 ? 200 : 0,
+  const detail = String(result.stderr || result.stdout || '');
+  const statusMatch = /(?:requested URL returned error:\s*|\bHTTP(?:\/\S+)?\s+)([45][0-9]{2})\b/i.exec(detail);
+  const status = result.code === 0 ? 200 : statusMatch ? Number(statusMatch[1]) : 0;
+  const structured = {...result, status, httpStatus: status,
     headers: {}, body: null};
   if (result.timedOut) {
     const error = new GhCliError(`${operation} timed out`, 'ETIMEDOUT', structured);
@@ -216,11 +220,11 @@ function rawGitResult(result, operation) {
   }
   if (result.outputLimited) throw new GhCliError(`${operation} exceeded the output limit`, 'GIT_OUTPUT_LIMIT', structured);
   if (result.code !== 0) {
-    const detail = (result.stderr || result.stdout).trim() || `exit ${result.code}`;
-    const error = new GhCliError(`${operation} failed: ${detail}`, 'GIT_COMMAND_FAILED', structured);
-    if (/connection (?:reset|refused|timed out)|could not resolve host|network is unreachable|remote end hung up/i.test(detail)) {
+    const failureDetail = detail.trim() || `exit ${result.code}`;
+    const error = new GhCliError(`${operation} failed: ${failureDetail}`, 'GIT_COMMAND_FAILED', structured);
+    if (/connection (?:reset|refused|timed out)|could not resolve host|network is unreachable|remote end hung up/i.test(failureDetail)) {
       error.commandCode = error.code;
-      error.code = /could not resolve host/i.test(detail) ? 'EAI_AGAIN' : 'ECONNRESET';
+      error.code = /could not resolve host/i.test(failureDetail) ? 'EAI_AGAIN' : 'ECONNRESET';
     }
     throw error;
   }
@@ -428,7 +432,7 @@ function recentClaim(comments, northsetLogin, now) {
     const created = Date.parse(comment?.createdAt ?? '');
     return login && login.toLowerCase() !== northsetLogin.toLowerCase() &&
       comment?.author?.__typename !== 'Bot' && !/\[bot\]$/i.test(login) &&
-      Number.isFinite(created) && created >= cutoff && CLAIM_PATTERN.test(String(comment?.body ?? ''));
+      Number.isFinite(created) && created >= cutoff && isClaimText(comment?.body);
   }) ?? null;
 }
 

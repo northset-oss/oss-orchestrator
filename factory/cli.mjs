@@ -47,7 +47,7 @@ const COMMAND_BOOLEAN_FLAGS = Object.freeze({
   approve: new Set(),
   publish: new Set(),
   'github-status': new Set(),
-  'github-resume': new Set(),
+  'github-resume': new Set(['--acknowledge-forbidden']),
 });
 
 function requiredValue(argv, index, flag) {
@@ -202,6 +202,7 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
       reason: reason.trim(),
       clearedBy: parsed.get('--cleared-by') ?? env.OSS_FACTORY_APPROVED_BY ?? 'internal-user:aeziz',
       repository: parsed.get('--repository') ?? null,
+      acknowledgeForbidden: parsed.get('--acknowledge-forbidden') === true,
     };
   }
   return common;
@@ -326,6 +327,7 @@ export async function executeFactoryCli(argv, {
       reason: options.reason,
       clearedBy: options.clearedBy,
       transport,
+      acknowledgeForbidden: options.acknowledgeForbidden,
     });
     printJson(stdout, result);
     return result;

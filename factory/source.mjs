@@ -1,10 +1,11 @@
 import {spawn} from 'node:child_process';
 import path from 'node:path';
 
+import {isClaimText} from './claim-detection.mjs';
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DISCOVERY_TTL_MS = 14 * DAY_MS;
 const DEFAULT_EXPECTED_MINUTES = 12;
-const CLAIM_PATTERN = /\b(?:i(?:'m| am|'ll| will)?\s+(?:work(?:ing)?|take|claim|implement)(?:\s+on)?\s+(?:this|it)|can i work on this|please assign (?:this|it|me)|working on this|i opened (?:a )?pr|i have (?:a )?pr)\b/i;
 
 function assertWorkers(value) {
   if (!Number.isInteger(value) || value < 1 || value > 100) {
@@ -288,7 +289,7 @@ function recentExternalClaim(comments, northsetLogin, now) {
     const created = Date.parse(comment.createdAt ?? '');
     return comment.author && comment.author.toLowerCase() !== northsetLogin.toLowerCase() &&
       comment.authorType !== 'Bot' && !/\[bot\]$/i.test(comment.author) &&
-      Number.isFinite(created) && created >= cutoff && CLAIM_PATTERN.test(comment.body);
+      Number.isFinite(created) && created >= cutoff && isClaimText(comment.body);
   }) ?? null;
 }
 

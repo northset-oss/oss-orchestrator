@@ -79,6 +79,9 @@ test('parser provides stable paths and strictly validates command-specific argum
     /duplicate mission/);
   assert.throws(() => parseFactoryCliArgs(['publish', '--board', 'B-1'], {env: {}}), /sha256/);
   assert.throws(() => parseFactoryCliArgs(['github-resume'], {env: {}}), /--reason is required/);
+  assert.equal(parseFactoryCliArgs([
+    'github-resume', '--reason', 'reviewed', '--acknowledge-forbidden',
+  ], {env: {}}).acknowledgeForbidden, true);
 });
 
 test('run fills from the lake once and drains workers with the requested board policy', async () => {
@@ -539,6 +542,7 @@ test('github-status is read-only and github-resume performs one injected probe p
   let resumeOptions;
   const resumeResult = await executeFactoryCli([
     'github-resume', '--reason', 'founder reviewed cooldown', '--cleared-by', 'internal-user:owner',
+    '--acknowledge-forbidden',
   ], {
     env: {},
     stdout: resumeOutput.stream,
@@ -552,6 +556,7 @@ test('github-status is read-only and github-resume performs one injected probe p
   });
   assert.equal(resumeOptions.reason, 'founder reviewed cooldown');
   assert.equal(resumeOptions.clearedBy, 'internal-user:owner');
+  assert.equal(resumeOptions.acknowledgeForbidden, true);
   assert.equal(typeof resumeOptions.transport, 'function');
   assert.equal(resumeResult.paused, false);
 

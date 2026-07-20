@@ -246,6 +246,14 @@ test('N4 only recognizable Docker or registry bootstrap failures are retryable',
   await assert.rejects(() => transient.handle(payload), (error) =>
     error.transient === true && /temporary bootstrap infrastructure failure/.test(error.message));
 
+  const mountFailure = createNodeWorker({
+    run: runner('docker: Error response from daemon: error mounting dependency volume: ' +
+      'create mountpoint for /workspace/node_modules: read-only file system'),
+    image: IMAGE,
+  });
+  await assert.rejects(() => mountFailure.handle(payload), (error) =>
+    error.transient === true && /temporary bootstrap infrastructure failure/.test(error.message));
+
   const deterministic = createNodeWorker({run: runner('npm error: unsupported engine for this package'), image: IMAGE});
   await assert.rejects(() => deterministic.handle(payload), (error) =>
     error.transient !== true && /unsupported engine/.test(error.message));

@@ -66,6 +66,51 @@ test('G1 secondary limit stops the current and entire queued GitHub transport', 
   assert.deepEqual(calls, ['first']);
 });
 
+test('G1b any HTTP 403 pauses transport even when it is a permission denial', async (t) => {
+  const clock = await fixture(t, 'factory-github-forbidden');
+  let probes = 0;
+  const github = createGitHubSafety({
+    ...clock,
+    transport: async () => ({
+      status: 403,
+      headers: {'x-ratelimit-remaining': '4949'},
+      body: {message: 'Must have push access to view collaborator permission.'},
+    }),
+  });
+
+  await assert.rejects(
+    () => github.request({priority: 'live_preflight', kind: 'read', operation: 'collaborator_permission'}),
+    (error) => error instanceof GitHubPausedError && error.pause.kind === 'GITHUB_HTTP_403',
+  );
+  const pause = JSON.parse(await readFile(clock.pauseFile, 'utf8'));
+  assert.equal(pause.paused, true);
+  assert.equal(pause.kind, 'GITHUB_HTTP_403');
+  assert.match(pause.details, /Must have push access/);
+  const probe = async () => {
+    probes += 1;
+    return {status: 200, headers: {'x-ratelimit-remaining': '4949'}, body: {ok: true}};
+  };
+  await assert.rejects(() => resumeGitHub({
+    pauseFile: clock.pauseFile,
+    reason: 'operator reviewed permission denial',
+    clearedBy: 'internal-user:aeziz',
+    transport: probe,
+    now: clock.now,
+  }), (error) => error instanceof GitHubSafetyError && error.code === 'GITHUB_FORBIDDEN_REVIEW');
+  assert.equal(probes, 0);
+
+  const cleared = await resumeGitHub({
+    pauseFile: clock.pauseFile,
+    reason: 'operator reviewed permission denial',
+    clearedBy: 'internal-user:aeziz',
+    transport: probe,
+    acknowledgeForbidden: true,
+    now: clock.now,
+  });
+  assert.equal(probes, 1);
+  assert.equal(cleared.paused, false);
+});
+
 test('exit-zero GraphQL RATE_LIMITED is a structured secondary-limit signal', async (t) => {
   const clock = await fixture(t, 'factory-github-graphql-limit');
   const github = createGitHubSafety({
@@ -123,7 +168,7 @@ test('G2 Retry-After blocks early resume and later performs exactly one clean pr
   assert.equal(JSON.parse(await readFile(clock.pauseFile, 'utf8')).paused, false);
 });
 
-test('G3 primary exhaustion waits for reset and resumes automatically without a pause file', async (t) => {
+test('G3 primary-exhaustion HTTP 403 pauses instead of retrying automatically', async (t) => {
   const clock = await fixture(t, 'factory-github-primary');
   const calls = [];
   const resetSeconds = Math.floor((clock.now() + 3_000) / 1_000);
@@ -136,12 +181,38 @@ test('G3 primary exhaustion waits for reset and resumes automatically without a 
         : {status: 200, headers: {'x-ratelimit-remaining': '4999'}, body: {ok: true}};
     },
   });
-  const result = await github.request({priority: 'live_preflight', kind: 'read', operation: 'preflight'});
-  assert.equal(result.status, 200);
+  await assert.rejects(
+    () => github.request({priority: 'live_preflight', kind: 'read', operation: 'preflight'}),
+    (error) => error instanceof GitHubPausedError && error.pause.kind === 'GITHUB_PRIMARY_RATE_LIMIT',
+  );
+  assert.equal(calls.length, 1);
+  assert.deepEqual(clock.sleeps, []);
+  assert.equal((await github.status()).paused, true);
+  const pause = JSON.parse(await readFile(clock.pauseFile, 'utf8'));
+  assert.equal(pause.primary_reset_at, new Date(resetSeconds * 1_000).toISOString());
+
+  await assert.rejects(() => resumeGitHub({
+    pauseFile: clock.pauseFile,
+    reason: 'operator reviewed primary exhaustion',
+    clearedBy: 'internal-user:aeziz',
+    transport: async () => { calls.push(clock.now()); return {status: 200}; },
+    now: clock.now,
+  }), (error) => error instanceof GitHubSafetyError && error.code === 'GITHUB_PRIMARY_RESET_ACTIVE');
+  assert.equal(calls.length, 1);
+
+  clock.advance(3_000);
+  const cleared = await resumeGitHub({
+    pauseFile: clock.pauseFile,
+    reason: 'operator reviewed primary exhaustion',
+    clearedBy: 'internal-user:aeziz',
+    transport: async () => {
+      calls.push(clock.now());
+      return {status: 200, headers: {'x-ratelimit-remaining': '4999'}, body: {ok: true}};
+    },
+    now: clock.now,
+  });
   assert.equal(calls.length, 2);
-  assert.deepEqual(clock.sleeps, [3_000]);
-  assert.equal((await github.status()).paused, false);
-  await assert.rejects(() => readFile(clock.pauseFile), {code: 'ENOENT'});
+  assert.equal(cleared.paused, false);
 });
 
 test('G4 serial queue enforces mutation and search start spacing and priority order', async (t) => {

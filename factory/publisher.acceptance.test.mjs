@@ -259,6 +259,45 @@ function options(db, github, overrides = {}) {
   };
 }
 
+function addEvidenceAsset(db, id = 'M-001', overrides = {}) {
+  const current = db.ready.get(id);
+  const evidenceCommit = oid(500);
+  const evidencePath = '.github/test-evidence/focused.png';
+  const evidenceUrl = `https://raw.githubusercontent.com/${current.fork_repository}/${evidenceCommit}/${evidencePath}`;
+  const manifest = {
+    ...structuredClone(current.manifest),
+    pr_body: `${current.manifest.pr_body.trimEnd()}\n\n![Focused check](${evidenceUrl})\n`,
+    evidence_asset: {
+      repository: current.fork_repository,
+      branch: `northset/evidence-${id.toLowerCase()}`,
+      commit_oid: evidenceCommit,
+      path: evidencePath,
+      sha256: `sha256:${'e'.repeat(64)}`,
+      url: evidenceUrl,
+      ...overrides,
+    },
+  };
+  const ready = {
+    ...manifest,
+    manifest,
+    item_digest: readyItemDigest(manifest),
+    manifest_sha256: sha256(Buffer.from(canonical(manifest), 'utf8')),
+    approval_state: 'APPROVED',
+  };
+  db.ready.set(id, structuredClone(ready));
+  db.board.items = db.board.items.map((item) => item.mission_id === id ? structuredClone(ready) : item);
+  db.board.board_digest = boardDigest(db.board.items);
+  db.approval.board_digest = db.board.board_digest;
+  db.approval.approval_digest = batchApprovalDigest({
+    boardDigest: db.board.board_digest,
+    approvedMissionIds: db.approval.approved_ids,
+    rejectedMissionIds: db.approval.rejected_ids,
+    approvedBy: db.approval.approved_by,
+    approvedAt: db.approval.approved_at,
+  });
+  return manifest.evidence_asset;
+}
+
 test('publisher resumes after seven of twenty branch pushes without duplicates', async () => {
   const db = new FakeDb(20);
   const github = new FakeGitHub();
@@ -293,6 +332,51 @@ test('publisher creates a missing fork once, validates it through safety, and ad
   assert.equal(github.count('create_fork'), 1);
   assert.equal(requests.filter((item) => item.operation === 'create_fork').length, 1);
   assert.equal(requests.find((item) => item.operation === 'create_fork').kind, 'mutation');
+});
+
+test('publisher pushes an approved evidence commit before the PR branch and adopts both on retry', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  const evidence = addEvidenceAsset(db);
+
+  const first = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(first.results[0].state, 'SUBMITTED');
+  assert.deepEqual(github.events.filter((event) => event.operation === 'push_branch')
+    .map((event) => [event.branch, event.oid]), [
+    [evidence.branch, evidence.commit_oid],
+    ['northset/m-001', oid(1)],
+  ]);
+  assert.equal(github.count('create_pull_request'), 1);
+
+  const resumed = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(resumed.results[0].state, 'SUBMITTED');
+  assert.equal(github.count('push_branch'), 2);
+  assert.equal(github.count('create_pull_request'), 1);
+});
+
+test('publisher refuses a mismatched remote evidence branch before pushing the PR branch', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  const evidence = addEvidenceAsset(db);
+  const item = db.ready.get('M-001');
+  github.forks.set(item.fork_repository, item.repository);
+  github.branches.set(github.branchKey(evidence.repository, evidence.branch), oid(999));
+
+  const result = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(result.results[0].code, 'REMOTE_EVIDENCE_BRANCH_MISMATCH');
+  assert.equal(github.count('push_branch'), 0);
+  assert.equal(github.count('create_pull_request'), 0);
+});
+
+test('publisher rejects an evidence branch that collides with the approved PR branch before transport', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  addEvidenceAsset(db, 'M-001', {branch: 'northset/m-001'});
+
+  const result = await publishBoard(db.board.board_digest, options(db, github));
+  assert.equal(result.results[0].code, 'APPROVED_ITEM_INVALID');
+  assert.match(result.results[0].detail, /evidence and PR branches must be distinct/);
+  assert.equal(github.events.length, 0);
 });
 
 test('publisher adopts seven exact existing PRs after a crash without duplicates', async () => {

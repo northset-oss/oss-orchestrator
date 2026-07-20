@@ -452,6 +452,7 @@ function transientBootstrapFailure(error) {
   return /\b(?:EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETDOWN|ENETUNREACH|EHOSTUNREACH)\b/i.test(message) ||
     /temporary failure in name resolution|tls handshake timeout|socket hang up|network timeout/i.test(message) ||
     /cannot connect to (?:the )?docker daemon/i.test(message) ||
+    /error mounting [\s\S]*create mountpoint[\s\S]*read-only file system/i.test(message) ||
     /(?:registry|package registry)[^\n]{0,120}\b(?:500|502|503|504)\b/i.test(message);
 }
 

@@ -199,6 +199,30 @@ test('each hard live-preflight violation returns SKIP', async (t) => {
   }
 });
 
+test('recent common claim and collaborator-offer phrases block while stale interest expires', () => {
+  const phrases = [
+    "I'd like to take this one.",
+    'I’d like to take this one.',
+    'I’m working on this.',
+    'I would like to work on this.',
+    'I would love to work on this issue.',
+    'Please let me know if I can work on this.',
+    'This one is yours if you want it.',
+  ];
+  for (const body of phrases) {
+    const live = normalizedLive({issue: {comments: [{
+      author: 'Contributor', authorType: 'User', body, createdAt: NOW.toISOString(),
+    }]}});
+    assert.equal(evaluatePreflight(live, {now: NOW}).outcome, 'SKIP', body);
+  }
+
+  const stale = normalizedLive({issue: {comments: [{
+    author: 'Contributor', authorType: 'User', body: "I'd like to take this one.",
+    createdAt: new Date(NOW.getTime() - 46 * 24 * 60 * 60_000).toISOString(),
+  }]}});
+  assert.equal(evaluatePreflight(stale, {now: NOW}).outcome, 'GO');
+});
+
 test('ambiguous overlap escalates only after all hard checks pass', () => {
   const live = normalizedLive({issue: {
     crossReferencedPrs: [{state: 'CLOSED', url: 'https://github.com/o/r/pull/2'}],

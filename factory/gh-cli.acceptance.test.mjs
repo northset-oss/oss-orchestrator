@@ -153,6 +153,36 @@ test('H3b git clone binds an absolute checkout to the requested base OID', async
   assert.deepEqual(calls[5], ['-C', destination, 'rev-parse', '--verify', 'HEAD^{commit}']);
 });
 
+test('H3c a git HTTPS 403 pauses the production safety queue', async (t) => {
+  const directory = await temporary(t, 'factory-git-forbidden');
+  const fakeGit = await executable(directory, 'forbidden-git.mjs', `
+    process.stderr.write("fatal: unable to access 'https://github.com/northset/project.git/': " +
+      'The requested URL returned error: 403\\n');
+    process.exit(128);
+  `);
+  const pauseFile = path.join(directory, 'pause.json');
+  const transport = createGhCliTransport({gitExecutable: fakeGit});
+  const safety = createGitHubSafety({
+    pauseFile,
+    governorFile: path.join(directory, 'governor.json'),
+    transport,
+    mutationSpacingMs: 0,
+    searchSpacingMs: 0,
+  });
+  await assert.rejects(() => safety.request({
+    priority: 'final_submission',
+    kind: 'git_push',
+    operation: 'push_branch',
+    execute: () => transport({
+      operation: 'git_push',
+      repository_path: directory,
+      remote: 'origin',
+      refspec: 'refs/heads/main:refs/heads/main',
+    }),
+  }), (error) => error.code === 'GITHUB_PAUSED' && error.pause.kind === 'GITHUB_HTTP_403');
+  assert.equal(JSON.parse(await readFile(pauseFile, 'utf8')).kind, 'GITHUB_HTTP_403');
+});
+
 test('H4 semantic REST adapter preserves exact OIDs, title, body, head, and request bytes', async () => {
   const requests = [];
   const transport = fakeTransport({
@@ -294,7 +324,7 @@ test('H6 final live recheck accepts unchanged clean state and explains concrete 
   response = structuredClone(response);
   response.data.repository.ref.target.oid = 'e'.repeat(40);
   response.data.repository.issue.assignees.nodes = [{login: 'someone'}];
-  response.data.repository.issue.comments.nodes = [{body: 'I will work on this',
+  response.data.repository.issue.comments.nodes = [{body: 'I’d like to take this one.',
     createdAt: '2026-07-19T10:00:00Z', author: {login: 'contributor', __typename: 'User'}}];
   response.data.repository.issue.timelineItems.nodes = [{source: {__typename: 'PullRequest', number: 44,
     state: 'OPEN', headRefName: 'feature', repository: {nameWithOwner: 'someone/project'}}}];

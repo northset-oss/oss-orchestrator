@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {verifyReadyArtifacts} from './artifact-integrity.mjs';
-import {approveBoard} from './board.mjs';
+import {approveBoard, renderBoard} from './board.mjs';
 import {runBounded} from './node-worker.mjs';
 import {sha256} from './db.mjs';
 
@@ -56,6 +56,73 @@ test('durable READY artifacts bind the exact patch, base, commit, and tested tre
     commit_oid: manifest.commit_oid,
     tested_tree_oid: manifest.tested_tree_oid,
   });
+});
+
+test('durable READY artifacts bind a commit-pinned PR evidence asset', async (t) => {
+  const {manifest} = await fixture(t);
+  const repository = manifest.repository_path;
+  await git(['-C', repository, 'checkout', '-q', '--detach', manifest.base_oid]);
+  const evidencePath = '.github/test-evidence/focused.png';
+  await mkdir(path.join(repository, '.github', 'test-evidence'), {recursive: true});
+  const evidenceBytes = Buffer.from('fixture-png-bytes');
+  await writeFile(path.join(repository, evidencePath), evidenceBytes);
+  await git(['-C', repository, 'add', evidencePath]);
+  await git(['-C', repository, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+    'commit', '-q', '-m', 'docs: add test evidence']);
+  const evidenceCommit = await git(['-C', repository, 'rev-parse', 'HEAD']);
+  await git(['-C', repository, 'checkout', '-q', '--detach', manifest.commit_oid]);
+  const repositoryName = 'northset/project';
+  const evidenceUrl = `https://raw.githubusercontent.com/${repositoryName}/${evidenceCommit}/${evidencePath}`;
+  const withEvidence = {
+    ...manifest,
+    fork_repository: repositoryName,
+    branch: 'northset/m-1000',
+    pr_body: `Evidence: ${evidenceUrl}\n`,
+    evidence_asset: {
+      repository: repositoryName,
+      branch: 'northset/evidence-m-1000',
+      commit_oid: evidenceCommit,
+      path: evidencePath,
+      sha256: sha256(evidenceBytes),
+      url: evidenceUrl,
+    },
+  };
+
+  const verified = verifyReadyArtifacts(withEvidence);
+  assert.deepEqual(verified.evidence_asset, withEvidence.evidence_asset);
+  const board = renderBoard({
+    board_digest: `sha256:${'f'.repeat(64)}`,
+    items: [{mission_id: withEvidence.mission_id, manifest: withEvidence}],
+  });
+  assert.match(board, new RegExp(`Evidence public action: push .*${withEvidence.evidence_asset.branch}`));
+  assert.match(board, new RegExp(withEvidence.evidence_asset.commit_oid));
+  assert.match(board, new RegExp(withEvidence.evidence_asset.path.replaceAll('.', '\\.')));
+  assert.match(board, new RegExp(withEvidence.evidence_asset.sha256));
+  assert.match(board, /public actions/);
+  assert.throws(() => verifyReadyArtifacts({
+    ...withEvidence,
+    evidence_asset: {...withEvidence.evidence_asset, sha256: `sha256:${'0'.repeat(64)}`},
+  }), /evidence asset digest/);
+  assert.throws(() => verifyReadyArtifacts({
+    ...withEvidence,
+    evidence_asset: {...withEvidence.evidence_asset, branch: withEvidence.branch},
+  }), /evidence and PR branches must be distinct/);
+
+  await git(['-C', repository, 'checkout', '-q', '--detach', manifest.base_oid]);
+  await mkdir(path.join(repository, '.github', 'test-evidence'), {recursive: true});
+  await writeFile(path.join(repository, evidencePath), evidenceBytes);
+  await writeFile(path.join(repository, 'unapproved.txt'), 'extra evidence commit content\n');
+  await git(['-C', repository, 'add', evidencePath, 'unapproved.txt']);
+  await git(['-C', repository, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+    'commit', '-q', '-m', 'docs: add evidence with extra file']);
+  const extraCommit = await git(['-C', repository, 'rev-parse', 'HEAD']);
+  await git(['-C', repository, 'checkout', '-q', '--detach', manifest.commit_oid]);
+  const extraUrl = `https://raw.githubusercontent.com/${repositoryName}/${extraCommit}/${evidencePath}`;
+  assert.throws(() => verifyReadyArtifacts({
+    ...withEvidence,
+    pr_body: `Evidence: ${extraUrl}\n`,
+    evidence_asset: {...withEvidence.evidence_asset, commit_oid: extraCommit, url: extraUrl},
+  }), /evidence commit must change exactly the declared asset path/);
 });
 
 test('batch approval excludes only the item whose reviewed artifact bytes changed', async (t) => {

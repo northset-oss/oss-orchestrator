@@ -100,6 +100,28 @@ function manifestFor(item) {
   return item?.manifest && typeof item.manifest === 'object' ? item.manifest : item;
 }
 
+function evidenceAssetFor(snapshot, id, forkRepository, prBranch, patchCommit) {
+  const asset = snapshot.evidence_asset;
+  if (asset === undefined || asset === null) return null;
+  if (typeof asset !== 'object' || Array.isArray(asset)) {
+    throw new Error(`${id} evidence_asset must be an object`);
+  }
+  const repository = requiredString(asset.repository, `${id} evidence_asset.repository`);
+  if (repository !== forkRepository) throw new Error(`${id} evidence asset must target the approved fork`);
+  const branch = requiredString(asset.branch, `${id} evidence_asset.branch`);
+  const commitOid = requiredString(asset.commit_oid, `${id} evidence_asset.commit_oid`);
+  if (branch === prBranch) throw new Error(`${id} evidence and PR branches must be distinct`);
+  if (commitOid === patchCommit) throw new Error(`${id} evidence and patch commits must be distinct`);
+  return {
+    repository,
+    branch,
+    commit_oid: commitOid,
+    path: requiredString(asset.path, `${id} evidence_asset.path`),
+    sha256: requiredString(asset.sha256, `${id} evidence_asset.sha256`),
+    url: requiredString(asset.url, `${id} evidence_asset.url`),
+  };
+}
+
 function exactPlan(ready, immutable) {
   const manifest = manifestFor(ready);
   const snapshot = manifestFor(immutable);
@@ -128,6 +150,7 @@ function exactPlan(ready, immutable) {
   const receiptUrl = requiredString(snapshot.receipt_url, `${id} receipt_url`);
   const taskId = requiredString(value(immutable.task_id, snapshot.task_id),
     `${id} task_id`);
+  const evidenceAsset = evidenceAssetFor(snapshot, id, forkRepository, branch, commitOid);
   return {
     mission_id: id,
     task_id: taskId,
@@ -143,6 +166,7 @@ function exactPlan(ready, immutable) {
     receipt_claim: receiptClaim,
     receipt_url: receiptUrl,
     branch,
+    evidence_asset: evidenceAsset,
     manifest: snapshot,
   };
 }
@@ -201,6 +225,41 @@ async function ensureFork(plan, {github, safety, sleep, forkPollAttempts, forkPo
   const error = new Error(`fork ${plan.fork_repository} was not readable after creation`);
   error.code = 'FORK_NOT_READY';
   throw error;
+}
+
+async function ensureEvidenceAsset(plan, {github, safety}) {
+  const asset = plan.evidence_asset;
+  if (!asset) return null;
+  const branchResult = await remoteRequest(safety, github, 'read', 'get_evidence_branch', 'getBranch', {
+    repository: asset.repository,
+    upstream_repository: plan.repository,
+    branch: asset.branch,
+  });
+  const existing = foundBranch(branchResult);
+  if (existing && existing.oid !== asset.commit_oid) {
+    return {
+      code: 'REMOTE_EVIDENCE_BRANCH_MISMATCH',
+      detail: `remote evidence branch ${asset.branch} points to ${existing.oid}, expected ${asset.commit_oid}`,
+    };
+  }
+  if (!existing) {
+    const pushed = await remoteRequest(safety, github, 'git_push', 'push_evidence_branch', 'pushBranch', {
+      repository: asset.repository,
+      upstream_repository: plan.repository,
+      branch: asset.branch,
+      oid: asset.commit_oid,
+      repository_path: plan.repository_path,
+      force: false,
+    });
+    const pushedOid = value(pushed?.oid, pushed?.commit_oid, asset.commit_oid);
+    if (pushedOid !== asset.commit_oid) {
+      return {
+        code: 'PUSHED_EVIDENCE_OID_MISMATCH',
+        detail: `evidence push returned ${pushedOid}, expected ${asset.commit_oid}`,
+      };
+    }
+  }
+  return null;
 }
 
 function pullRequests(result) {
@@ -303,6 +362,10 @@ async function publishOne(plan, {
 }) {
   const priorPublication = await db.getPublication(plan.mission_id);
   await ensureFork(plan, {github, safety, sleep, forkPollAttempts, forkPollIntervalMs});
+  const evidenceFailure = await ensureEvidenceAsset(plan, {github, safety});
+  if (evidenceFailure) {
+    return failItem(db, plan, evidenceFailure.code, evidenceFailure.detail);
+  }
   const branchResult = await remoteRequest(safety, github, 'read', 'get_branch', 'getBranch', {
     repository: plan.fork_repository,
     upstream_repository: plan.repository,

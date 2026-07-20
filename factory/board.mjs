@@ -135,6 +135,7 @@ export function renderBoard(board) {
   for (const item of board.items) {
     const manifest = item.manifest;
     const files = (manifest.changed_files ?? []).map((file) => typeof file === 'string' ? file : file.path);
+    const evidence = manifest.evidence_asset;
     lines.push(
       '',
       `## ${item.mission_id} — ${manifest.repository}#${manifest.issue_number}`,
@@ -147,6 +148,12 @@ export function renderBoard(board) {
       '',
       `Fork target: \`${manifest.fork_repository}:${manifest.branch}\``,
       '',
+      ...(evidence ? [
+        `Evidence public action: push \`${inline(evidence.repository)}:${inline(evidence.branch)}\` at \`${inline(evidence.commit_oid)}\` before the PR branch.`,
+        '',
+        `Evidence asset: \`${inline(evidence.path)}\` — \`${inline(evidence.sha256)}\` — [commit-bound evidence URL](<${String(evidence.url).replaceAll('>', '%3E')}>)`,
+        '',
+      ] : []),
       manifest.invitation_summary ?? 'Invitation and occupancy were confirmed by the live preflight.',
       '',
       manifest.summary ?? '(no summary)',
@@ -182,6 +189,6 @@ export function renderBoard(board) {
       `Issue: ${manifest.issue_url}`,
     );
   }
-  lines.push('', 'Approval binds the exact item digests, patches, commits, checks, PR text, targets, and receipt claims shown above.', '');
+  lines.push('', 'Approval binds the exact item digests, patches, commits, checks, PR text, targets, public actions, and receipt claims shown above.', '');
   return lines.join('\n');
 }

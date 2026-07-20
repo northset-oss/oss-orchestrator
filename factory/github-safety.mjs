@@ -138,15 +138,19 @@ function inspectResult(result, nowMs) {
     /\baccount\b[^\n]{0,80}\b(?:suspended|restricted|disabled)\b/i.test(message);
   const secondaryText = `${message}\n${documentation}`;
   const exhaustedUntil = primaryReset(headers, body);
-  const secondary = exhaustedUntil === null && (status === 429 || retry !== null || rateLimitedGraphQl(body) ||
+  const rateOrAbuse403 = status === 403 && /\b(?:rate[ _-]*limit|abuse)\b/i.test(secondaryText);
+  const secondary = status === 403 || (exhaustedUntil === null &&
+    (status === 429 || retry !== null || rateLimitedGraphQl(body) ||
     ['GITHUB_SECONDARY_RATE_LIMIT', 'GITHUB_ABUSE_DETECTION', 'RETRY_AFTER'].includes(signal) ||
     /\bsecondary[ _-]+rate[ _-]+limit|\babuse[ -]+detection\b/i.test(secondaryText) ||
-    (status === 403 && /\b(?:rate[ _-]*limit|abuse)\b/i.test(secondaryText)));
+    rateOrAbuse403));
   const kind = platformRestriction ? 'GITHUB_ACCOUNT_RESTRICTION'
     : signal === 'GITHUB_ABUSE_DETECTION' || /\babuse[ -]+detection\b/i.test(secondaryText)
       ? 'GITHUB_ABUSE_DETECTION'
       : retry !== null ? 'GITHUB_RETRY_AFTER'
         : status === 429 ? 'GITHUB_HTTP_429'
+          : status === 403 && exhaustedUntil !== null ? 'GITHUB_PRIMARY_RATE_LIMIT'
+          : status === 403 && !rateOrAbuse403 ? 'GITHUB_HTTP_403'
           : 'GITHUB_SECONDARY_RATE_LIMIT';
   return {
     status,
@@ -293,6 +297,8 @@ function pauseFromInspection(inspection, now) {
     retry_after: inspection.retry?.seconds ?? null,
     retry_after_until: inspection.retry
       ? new Date(inspection.retry.untilMs).toISOString() : null,
+    primary_reset_at: inspection.primaryResetMs === null
+      ? null : new Date(inspection.primaryResetMs).toISOString(),
     details: inspection.message.slice(0, 500) || `GitHub response status ${inspection.status}`,
     cleared_at: null,
     cleared_by: null,
@@ -605,6 +611,7 @@ export async function resumeGitHub({
   reason,
   clearedBy,
   transport,
+  acknowledgeForbidden = false,
   now = () => Date.now(),
 } = {}) {
   if (typeof pauseFile !== 'string' || !pauseFile) throw new TypeError('pauseFile is required');
@@ -616,10 +623,19 @@ export async function resumeGitHub({
   if (pause.kind === 'GITHUB_ACCOUNT_RESTRICTION') {
     throw new GitHubSafetyError('GitHub account restriction requires founder/support review', 'GITHUB_RESTRICTION_REVIEW');
   }
+  if (pause.kind === 'GITHUB_HTTP_403' && acknowledgeForbidden !== true) {
+    throw new GitHubSafetyError('GitHub HTTP 403 requires explicit operator review', 'GITHUB_FORBIDDEN_REVIEW');
+  }
   const retryAt = Date.parse(pause.retry_after_until ?? '');
   if (Number.isFinite(retryAt) && timeMs(now) < retryAt) {
     throw new GitHubSafetyError('GitHub Retry-After interval has not elapsed', 'GITHUB_RETRY_AFTER_ACTIVE', {
       retry_at: new Date(retryAt).toISOString(),
+    });
+  }
+  const primaryResetAt = Date.parse(pause.primary_reset_at ?? '');
+  if (Number.isFinite(primaryResetAt) && timeMs(now) < primaryResetAt) {
+    throw new GitHubSafetyError('GitHub primary rate-limit reset has not elapsed', 'GITHUB_PRIMARY_RESET_ACTIVE', {
+      reset_at: new Date(primaryResetAt).toISOString(),
     });
   }
   let result;
