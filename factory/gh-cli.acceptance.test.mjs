@@ -330,7 +330,23 @@ test('H6 final live recheck accepts unchanged clean state and explains concrete 
   assert.deepEqual(await github.finalLiveRecheck(plan),
     {clean: true, reason: null, base_oid: baseOid, current_base_oid: baseOid,
       base_changed: false, refreshable: false, cooldown: null, issue_state: 'OPEN'});
-  response = structuredClone(response);
+  const cleanResponse = structuredClone(response);
+  response = structuredClone(cleanResponse);
+  response.data.repository.ref.target.oid = 'e'.repeat(40);
+  response.data.northset = {issueCount: 1, nodes: [{number: 17, state: 'OPEN',
+    repository: {nameWithOwner: 'upstream/project'}, headRefName: 'northset/m-1001',
+    headRefOid: baseOid, baseRefName: 'main'}]};
+  const amendmentPlan = {...plan, amendment: {number: 17, head_oid: baseOid,
+    url: 'https://github.com/upstream/project/pull/17'}};
+  assert.deepEqual(await github.finalLiveRecheck(amendmentPlan),
+    {clean: true, reason: null, base_oid: 'e'.repeat(40), current_base_oid: 'e'.repeat(40),
+      base_changed: false, refreshable: false, cooldown: null, issue_state: 'OPEN'});
+  response.data.northset.nodes[0].headRefOid = 'f'.repeat(40);
+  const movedAmendment = await github.finalLiveRecheck(amendmentPlan);
+  assert.equal(movedAmendment.clean, false);
+  assert.match(movedAmendment.reason, /existing amendment PR head moved/);
+
+  response = structuredClone(cleanResponse);
   response.data.repository.ref.target.oid = 'e'.repeat(40);
   response.data.repository.issue.assignees.nodes = [{login: 'someone'}];
   response.data.repository.issue.comments.nodes = [{body: 'I’d like to take this one.',

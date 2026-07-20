@@ -798,8 +798,20 @@ export function createGhCliPublisherAdapter({
       reasons.push(`issue is assigned${externalAssignees.length ? ` to ${externalAssignees.map((item) => item.login).join(', ')}` : ''}`);
     }
     const currentBaseOid = repo?.ref?.target?.oid ?? null;
-    const baseChanged = currentBaseOid !== expectedBaseOid;
-    if (baseChanged) reasons.push(`base branch moved from ${expectedBaseOid} to ${currentBaseOid}`);
+    const amendment = plan?.amendment;
+    const amendmentPr = amendment ? (result.data?.northset?.nodes ?? []).find((item) =>
+      item?.repository?.nameWithOwner === repository && Number(item.number) === Number(amendment.number) &&
+      item.headRefName === branch) : null;
+    const baseChanged = amendment ? false : currentBaseOid !== expectedBaseOid;
+    if (amendment && !amendmentPr) {
+      reasons.push(`existing amendment PR #${amendment.number} is no longer open on ${branch}`);
+    } else if (amendment && amendmentPr.headRefOid !== amendment.head_oid) {
+      reasons.push(`existing amendment PR head moved from ${amendment.head_oid} to ${amendmentPr.headRefOid}`);
+    } else if (amendment && amendmentPr.baseRefName !== baseBranch) {
+      reasons.push(`existing amendment PR base moved from ${baseBranch} to ${amendmentPr.baseRefName}`);
+    } else if (baseChanged) {
+      reasons.push(`base branch moved from ${expectedBaseOid} to ${currentBaseOid}`);
+    }
     if (issueState?.comments?.pageInfo?.hasPreviousPage) reasons.push('issue comment history is truncated');
     if (issueState?.timelineItems?.pageInfo?.hasPreviousPage) reasons.push('issue cross-reference history is truncated');
     const linkedOpen = (issueState?.timelineItems?.nodes ?? []).map((item) => item?.source)
