@@ -144,6 +144,15 @@ rejected it before boarding. Regenerating the exact patch and rebinding the pend
 the mismatch without changing source. Manual correction helpers must emit the same canonical patch
 format as the factory; the exact-byte admission check remains a useful hard gate.
 
+DragonFruit PR #417 exposed an upstream fork-CI failure that must not be confused with patch quality.
+The maintainer approved the contribution, but the repository's macOS workflow ran with `Secret source:
+None` on the fork PR and invoked `apple-actions/import-codesign-certs` without either required P12
+input. The advertised ad-hoc-signing fallback never ran because the certificate-import step failed
+first; a secondary status-comment job then hit an unrelated GitHub 503. This is repository workflow
+configuration, not a source regression, and changing the contribution would not repair it. Future
+reconciliation should classify secret-withheld fork checks separately, retain the exact log evidence,
+and avoid wasting author attempts or asking maintainers to rerun an inevitably identical job.
+
 ### Carry-forward lessons
 
 1. **Use exact outcome words.** A thank-you, approval, merge, green CI result, receipt publication,
