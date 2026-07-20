@@ -308,6 +308,10 @@ function hasInvitation(candidate, labels) {
   });
 }
 
+function isAlreadyInDevelopment(labels) {
+  return labels.some((label) => normalizedLabel(label) === 'in develop');
+}
+
 function recentExternalClaim(comments, northsetLogin, now) {
   const cutoff = now.getTime() - 45 * DAY_MS;
   return comments.find((comment) => {
@@ -330,6 +334,7 @@ export function evaluatePreflight(live, {northsetLogin = 'AysajanE', now = new D
     .filter((login) => login.toLowerCase() !== northsetLogin.toLowerCase());
   if (externalAssignees.length) reasons.push(`issue is assigned to ${externalAssignees.join(', ')}`);
   if (issue && !hasInvitation(live.candidate, issue.labels)) reasons.push('invitation label or policy is missing');
+  if (issue && isAlreadyInDevelopment(issue.labels)) reasons.push('issue is already implemented in the development branch');
   if (repository?.archived || repository?.fork) reasons.push('repository is archived or forked');
   if (repository && !repository.hasRootPackageJson) reasons.push('root package.json is missing');
   if (repository?.unsupportedNodeLayout) reasons.push(repository.unsupportedNodeLayout);

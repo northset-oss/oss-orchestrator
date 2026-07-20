@@ -197,6 +197,7 @@ test('each hard live-preflight violation returns SKIP', async (t) => {
     ['closed issue', normalizedLive({issue: {state: 'CLOSED'}}), /issue is closed/],
     ['external assignment', normalizedLive({issue: {assignees: ['someone']}}), /assigned/],
     ['missing invitation', normalizedLive({issue: {labels: []}}), /invitation/],
+    ['already in development', normalizedLive({issue: {labels: ['good first issue', 'in-develop']}}), /development branch/],
     ['archived repository', normalizedLive({repository: {archived: true}}), /archived/],
     ['missing root package', normalizedLive({repository: {hasRootPackageJson: false}}), /root package\.json/],
     ['unsupported workspace', normalizedLive({repository: {

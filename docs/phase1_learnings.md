@@ -169,6 +169,13 @@ allowed M-1046's offline CSS and ClojureScript release builds to pass. Host free
 not diagnose Docker capacity; when a verifier reports `No space left on device`, inspect Docker's own
 image, volume, and build-cache accounting before rejecting the candidate or weakening the check.
 
+M-1049 exposed a default-branch visibility trap. Devicon issue #2499 remained open because its
+accepted implementation was waiting on release promotion from `develop` to `master`; the live
+`in-develop` label and merged PR #2527 were the authoritative completion signals. Looking only at the
+open issue and default branch produced redundant, wrong-target work with stale brand assets. Live
+preflight now skips the exact `in-develop` state label before authoring, while ambiguous historical PR
+overlap continues through the existing deeper check.
+
 ### Carry-forward lessons
 
 1. **Use exact outcome words.** A thank-you, approval, merge, green CI result, receipt publication,
