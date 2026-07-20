@@ -137,6 +137,13 @@ now drops a conservative set of clearly non-Node primary languages before the Gi
 languages and missing language data still proceed to the existing live checks. This is a throughput
 filter only: it neither relaxes issue-fit checks nor converts ambiguous candidates into GO results.
 
+A corrected M-1042 attempt exposed a smaller artifact-production loss: its code, commit, tree, and
+clean verification were sound, but the manually saved patch used abbreviated index lines instead of
+the factory's canonical `git diff --binary --full-index` bytes. The durable-artifact admission check
+rejected it before boarding. Regenerating the exact patch and rebinding the pending local attempt fixed
+the mismatch without changing source. Manual correction helpers must emit the same canonical patch
+format as the factory; the exact-byte admission check remains a useful hard gate.
+
 ### Carry-forward lessons
 
 1. **Use exact outcome words.** A thank-you, approval, merge, green CI result, receipt publication,
