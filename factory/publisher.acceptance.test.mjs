@@ -717,9 +717,9 @@ test('an approved fast-forward amendment updates the existing PR and resets proo
     pr_body: '## Summary\n\nCorrected after manual verification.\n',
   });
   const newProof = `sha256:${'f'.repeat(64)}`;
-  let recheckPlan = null;
+  const recheckPlans = [];
   const result = await publishBoard(db.board.board_digest, options(db, github, {
-    liveRecheck: async (plan) => { recheckPlan = plan; return {clean: true}; },
+    liveRecheck: async (plan) => { recheckPlans.push(plan); return {clean: true}; },
     receiptPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
       mission_id: item.mission_id,
       receipt_url: item.receipt_url,
@@ -732,11 +732,14 @@ test('an approved fast-forward amendment updates the existing PR and resets proo
   assert.equal(result.results[0].state, 'SUBMITTED');
   assert.equal(github.count('create_pull_request'), 1);
   assert.equal(github.count('update_pull_request'), 1);
-  assert.deepEqual(recheckPlan.amendment, {
-    number: 1,
-    head_oid: originalCommit,
-    url: 'https://github.com/upstream1/project/pull/1',
-  });
+  assert.equal(recheckPlans.length, 2);
+  for (const recheckPlan of recheckPlans) {
+    assert.deepEqual(recheckPlan.amendment, {
+      number: 1,
+      head_oid: originalCommit,
+      url: 'https://github.com/upstream1/project/pull/1',
+    });
+  }
   assert.equal(github.branches.get(github.branchKey('northset/project-1', 'northset/m-001')),
     amendedCommit);
   const pr = [...github.pullRequests.values()][0];

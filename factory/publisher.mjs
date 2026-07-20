@@ -96,6 +96,14 @@ function approvalDigestFor(approval, id) {
   return values && typeof values === 'object' ? values[id] ?? null : null;
 }
 
+async function approvedAmendment(db, plan) {
+  const publication = await db.getPublication(plan.mission_id);
+  return publication?.publication_state === 'SUBMITTED' &&
+    publication.pr_head_oid === plan.base_oid && publication.pushed_oid === plan.base_oid
+    ? {number: publication.pr_number, head_oid: plan.base_oid, url: publication.pr_url}
+    : null;
+}
+
 function manifestFor(item) {
   return item?.manifest && typeof item.manifest === 'object' ? item.manifest : item;
 }
@@ -695,9 +703,10 @@ export async function publishBoard(boardDigest, {
   const clean = [];
   for (const plan of eligible) {
     try {
+      const amendment = await approvedAmendment(db, plan);
       const live = await throughSafety(safety, 'read', 'final_live_recheck', {
         repository: plan.repository,
-      }, () => liveRecheck(plan));
+      }, () => liveRecheck(amendment ? {...plan, amendment} : plan));
       if (live?.cooldown && typeof db.setRepositoryState === 'function') {
         await db.setRepositoryState(plan.repository, {
           cooldown_reason: live.cooldown.reason,
@@ -790,12 +799,7 @@ export async function publishBoard(boardDigest, {
 
   for (const {plan, repositoryState} of clean) {
     try {
-      const currentPublication = await db.getPublication(plan.mission_id);
-      const amendment = currentPublication?.publication_state === 'SUBMITTED' &&
-        currentPublication.pr_head_oid === plan.base_oid &&
-        currentPublication.pushed_oid === plan.base_oid
-        ? {number: currentPublication.pr_number, head_oid: plan.base_oid, url: currentPublication.pr_url}
-        : null;
+      const amendment = await approvedAmendment(db, plan);
       const live = await throughSafety(safety, 'read', 'final_live_recheck', {
         repository: plan.repository,
       }, () => liveRecheck(amendment ? {...plan, amendment} : plan));
