@@ -197,6 +197,7 @@ test('H4 semantic REST adapter preserves exact OIDs, title, body, head, and requ
       }
       if (request.method === 'GET' && request.path.includes('/pulls?')) return structured([apiPr()]);
       if (request.method === 'POST') return structured(apiPr(), {status: 201});
+      if (request.method === 'PATCH') return structured(apiPr(), {status: 200});
       if (request.path.includes('/pulls/17/commits?')) {
         return structured([{sha: 'a'.repeat(40)}, {sha: 'b'.repeat(40)}]);
       }
@@ -231,6 +232,14 @@ test('H4 semantic REST adapter preserves exact OIDs, title, body, head, and requ
   assert.deepEqual(createRequest.body, {
     title: 'Keep exact title', head: 'northset:northset/m-1001', base: 'main',
     body: 'Exact body with trailing spaces  \n', draft: false, maintainer_can_modify: true,
+  });
+  const updated = await github.updatePullRequest({repository: 'upstream/project', number: 17,
+    head_oid: 'a'.repeat(40), title: 'Keep exact title', body: 'Updated exact body.\n'});
+  assert.equal(updated.body, 'Exact body with trailing spaces  \n');
+  const updateRequest = requests.find((request) => request.method === 'PATCH');
+  assert.deepEqual(updateRequest, {
+    method: 'PATCH', path: '/repos/upstream/project/pulls/17',
+    body: {title: 'Keep exact title', body: 'Updated exact body.\n'},
   });
   const readback = await github.getPullRequest({repository: 'upstream/project', number: 17});
   assert.equal(readback.repository, 'upstream/project');

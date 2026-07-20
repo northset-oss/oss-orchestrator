@@ -31,6 +31,7 @@ function mission(index) {
     fork_repository: `northset/project-${index}`,
     repository_path: `/private/factory/M-${String(index).padStart(3, '0')}/repo`,
     base_branch: 'main',
+    base_oid: oid(index + 200),
     branch: `northset/${id.toLowerCase()}`,
     commit_oid: oid(index),
     tested_tree_oid: oid(index + 100),
@@ -168,8 +169,10 @@ class FakeGitHub {
     assert.equal(force, false);
     this.events.push({operation: 'push_branch', repository, branch, oid: commit});
     const key = this.branchKey(repository, branch);
-    assert.equal(this.branches.has(key), false, `duplicate push for ${key}`);
     this.branches.set(key, commit);
+    for (const pr of this.pullRequests.values()) {
+      if (pr.fork_repository === repository && pr.head_branch === branch) pr.head_oid = commit;
+    }
     return {status: 200, oid: commit};
   }
 
@@ -187,6 +190,7 @@ class FakeGitHub {
       number,
       url: `https://github.com/${payload.repository}/pull/${number}`,
       repository: payload.repository,
+      fork_repository: payload.fork_repository,
       base_branch: payload.base_branch,
       head_branch: payload.branch,
       head_oid: payload.head_oid,
@@ -195,6 +199,17 @@ class FakeGitHub {
       state: 'OPEN',
     };
     this.pullRequests.set(`${payload.repository}#${number}`, pr);
+    return structuredClone(pr);
+  }
+
+  async updatePullRequest(payload) {
+    this.events.push({operation: 'update_pull_request', repository: payload.repository,
+      number: payload.number});
+    const key = `${payload.repository}#${payload.number}`;
+    const pr = this.pullRequests.get(key);
+    assert.ok(pr, `missing pull request ${key}`);
+    assert.equal(pr.head_oid, payload.head_oid);
+    Object.assign(pr, {title: payload.title, body: payload.body});
     return structuredClone(pr);
   }
 
@@ -297,6 +312,30 @@ function addEvidenceAsset(db, id = 'M-001', overrides = {}) {
     approvedAt: db.approval.approved_at,
   });
   return manifest.evidence_asset;
+}
+
+function reapproveManifest(db, id, changes) {
+  const current = db.ready.get(id);
+  const manifest = {...structuredClone(current.manifest), ...structuredClone(changes)};
+  const ready = {
+    ...manifest,
+    manifest,
+    item_digest: readyItemDigest(manifest),
+    manifest_sha256: sha256(Buffer.from(canonical(manifest), 'utf8')),
+    approval_state: 'APPROVED',
+  };
+  db.ready.set(id, structuredClone(ready));
+  db.board.items = db.board.items.map((item) => item.mission_id === id ? structuredClone(ready) : item);
+  db.board.board_digest = boardDigest(db.board.items);
+  db.approval.board_digest = db.board.board_digest;
+  db.approval.approval_digest = batchApprovalDigest({
+    boardDigest: db.board.board_digest,
+    approvedMissionIds: db.approval.approved_ids,
+    rejectedMissionIds: db.approval.rejected_ids,
+    approvedBy: db.approval.approved_by,
+    approvedAt: db.approval.approved_at,
+  });
+  return ready;
 }
 
 test('publisher resumes after seven of twenty branch pushes without duplicates', async () => {
@@ -655,6 +694,53 @@ test('rerunning a submitted board adopts the PR without double-counting reposito
   assert.equal((await db.getPublication('M-001')).attestation_state, 'RECEIPT_ATTESTED');
   assert.equal((await db.getPublication('M-001')).status_state, 'PUBLISHED');
   assert.equal(db.taskStates.get('TASK-001').state, 'RECEIPT_ATTESTED');
+});
+
+test('an approved fast-forward amendment updates the existing PR and resets proof reconciliation', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  await publishBoard(db.board.board_digest, options(db, github));
+  const originalCommit = oid(1);
+  const amendedCommit = oid(901);
+  await db.savePublication('M-001', {
+    attestation_state: 'RECEIPT_ATTESTED',
+    attestation_url: 'https://example.test/old-attestation',
+    attested_at: '2026-07-19T12:05:00.000Z',
+    status_state: 'PUBLISHED',
+    status_url: 'https://example.test/old-status',
+  });
+  reapproveManifest(db, 'M-001', {
+    base_oid: originalCommit,
+    commit_oid: amendedCommit,
+    tested_tree_oid: oid(902),
+    patch_sha256: digest('amended patch'),
+    pr_body: '## Summary\n\nCorrected after manual verification.\n',
+  });
+  const newProof = `sha256:${'f'.repeat(64)}`;
+  const result = await publishBoard(db.board.board_digest, options(db, github, {
+    receiptPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
+      mission_id: item.mission_id,
+      receipt_url: item.receipt_url,
+      proof_sha256: newProof,
+      batch_commit_oid: RECEIPT_BATCH_OID,
+      batch_approval_digest: item.approval_digest,
+    }])),
+  }));
+
+  assert.equal(result.results[0].state, 'SUBMITTED');
+  assert.equal(github.count('create_pull_request'), 1);
+  assert.equal(github.count('update_pull_request'), 1);
+  assert.equal(github.branches.get(github.branchKey('northset/project-1', 'northset/m-001')),
+    amendedCommit);
+  const pr = [...github.pullRequests.values()][0];
+  assert.equal(pr.head_oid, amendedCommit);
+  assert.equal(pr.body, '## Summary\n\nCorrected after manual verification.\n');
+  const publication = await db.getPublication('M-001');
+  assert.equal(publication.receipt_proof_sha256, newProof);
+  assert.equal(publication.attestation_state, 'ATTESTATION_PENDING');
+  assert.equal(publication.attestation_url, null);
+  assert.equal(publication.status_state, 'PENDING');
+  assert.equal(publication.status_url, null);
 });
 
 test('a transient read failure cannot erase a factual submitted PR', async () => {

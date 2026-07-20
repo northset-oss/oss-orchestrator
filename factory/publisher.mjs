@@ -133,6 +133,7 @@ function exactPlan(ready, immutable) {
   const repositoryPath = requiredString(value(snapshot.repository_path, manifest.repository_path),
     `${id} repository_path`);
   const baseBranch = requiredString(snapshot.base_branch, `${id} base_branch`);
+  const baseOid = requiredString(snapshot.base_oid, `${id} base_oid`);
   const commitOid = requiredString(value(snapshot.commit_oid, snapshot.patch_commit), `${id} commit_oid`);
   const testedTreeOid = requiredString(snapshot.tested_tree_oid,
     `${id} tested_tree_oid`);
@@ -158,6 +159,7 @@ function exactPlan(ready, immutable) {
     fork_repository: forkRepository,
     repository_path: repositoryPath,
     base_branch: baseBranch,
+    base_oid: baseOid,
     commit_oid: commitOid,
     tested_tree_oid: testedTreeOid,
     patch_sha256: patchSha256,
@@ -403,6 +405,8 @@ async function publishOne(plan, {
   const priorPublication = await db.getPublication(plan.mission_id);
   const wasSubmitted = priorPublication?.publication_state === 'SUBMITTED' &&
     Number.isInteger(Number(priorPublication.pr_number)) && Boolean(priorPublication.pr_url);
+  const isApprovedAmendment = wasSubmitted && priorPublication.pr_head_oid === plan.base_oid &&
+    priorPublication.pushed_oid === plan.base_oid;
   await ensureFork(plan, {github, safety, sleep, forkPollAttempts, forkPollIntervalMs});
   const evidenceFailure = await ensureEvidenceAsset(plan, {github, safety});
   if (evidenceFailure) {
@@ -415,10 +419,12 @@ async function publishOne(plan, {
   });
   const existingBranch = foundBranch(branchResult);
   if (existingBranch && existingBranch.oid !== plan.commit_oid) {
-    return failItem(db, plan, 'REMOTE_BRANCH_MISMATCH',
-      `remote branch ${plan.branch} points to ${existingBranch.oid}, expected ${plan.commit_oid}`);
+    if (!isApprovedAmendment || existingBranch.oid !== plan.base_oid) {
+      return failItem(db, plan, 'REMOTE_BRANCH_MISMATCH',
+        `remote branch ${plan.branch} points to ${existingBranch.oid}, expected ${plan.commit_oid}`);
+    }
   }
-  if (!existingBranch) {
+  if (!existingBranch || existingBranch.oid !== plan.commit_oid) {
     const pushed = await remoteRequest(safety, github, 'git_push', 'push_branch', 'pushBranch', {
       repository: plan.fork_repository,
       upstream_repository: plan.repository,
@@ -441,6 +447,11 @@ async function publishOne(plan, {
       pushed_oid: plan.commit_oid,
       publication_state: 'BRANCH_PUSHED',
     }, `${plan.mission_id} branch push`);
+  } else if (isApprovedAmendment) {
+    await checkpoint(db, plan.mission_id, {
+      branch: plan.branch,
+      pushed_oid: plan.commit_oid,
+    }, `${plan.mission_id} amendment branch push`);
   }
 
   const listed = await remoteRequest(safety, github, 'read', 'find_pull_requests', 'findPullRequests', {
@@ -455,8 +466,23 @@ async function publishOne(plan, {
     return failItem(db, plan, 'AMBIGUOUS_EXISTING_PRS',
       `more than one exact pull request exists for ${plan.branch}`);
   }
+  let pullRequest = exact[0] ?? null;
   if (candidates.length && exact.length === 0) {
-    if (wasSubmitted && candidates.length === 1 &&
+    if (isApprovedAmendment && candidates.length === 1 &&
+        sameSubmittedIdentity(candidates[0], plan, priorPublication)) {
+      pullRequest = await remoteRequest(safety, github, 'mutation', 'update_pull_request',
+        'updatePullRequest', {
+          repository: plan.repository,
+          number: priorPublication.pr_number,
+          head_oid: plan.commit_oid,
+          title: plan.pr_title,
+          body: plan.pr_body,
+        });
+      if (!exactPr(pullRequest, plan)) {
+        return failItem(db, plan, 'PR_UPDATE_RESPONSE_INVALID',
+          'updated pull request does not match the exact approved head and text');
+      }
+    } else if (wasSubmitted && candidates.length === 1 &&
         sameSubmittedIdentity(candidates[0], plan, priorPublication)) {
       await db.savePublication(plan.mission_id, {
         last_error: 'STORED_PR_TEXT_DRIFT',
@@ -471,11 +497,11 @@ async function publishOne(plan, {
         pr_url: priorPublication.pr_url,
         pr_state: priorPublication.pr_state,
       };
+    } else {
+      return failItem(db, plan, 'STORED_PR_MISMATCH',
+        `an existing pull request for ${plan.branch} has a different title, body, base, or head`);
     }
-    return failItem(db, plan, 'STORED_PR_MISMATCH',
-      `an existing pull request for ${plan.branch} has a different title, body, base, or head`);
   }
-  let pullRequest = exact[0] ?? null;
   if (!pullRequest) {
     if (openPrCapReached(repositoryState)) {
       return deferItem(db, plan, 'GITHUB_PUBLIC_LIMIT', 'one-open-PR cap reached');
@@ -737,6 +763,9 @@ export async function publishBoard(boardDigest, {
       if (!/^[a-f0-9]{40}$/.test(batchCommitOid)) {
         throw new Error(`${plan.mission_id} receipt batch_commit_oid is invalid`);
       }
+      const previousPublication = await db.getPublication(plan.mission_id);
+      const proofChanged = Boolean(previousPublication?.receipt_proof_sha256) &&
+        previousPublication.receipt_proof_sha256 !== proofSha256;
       await db.savePublication(plan.mission_id, {
         mission_id: plan.mission_id,
         task_id: plan.task_id,
@@ -746,6 +775,15 @@ export async function publishBoard(boardDigest, {
         receipt_proof_sha256: proofSha256,
         receipt_batch_commit_oid: batchCommitOid,
         receipt_approval_digest: approvalDigest,
+        ...(proofChanged ? {
+          attestation_state: 'ATTESTATION_PENDING',
+          attestation_url: null,
+          attested_at: null,
+          attestation_error: null,
+          status_state: 'PENDING',
+          status_url: null,
+          status_error: null,
+        } : {}),
       });
     }
   }

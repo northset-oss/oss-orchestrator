@@ -598,6 +598,24 @@ export function createGhCliPublisherAdapter({
     return {status: result.httpStatus, headers: result.headers, ...pr};
   };
 
+  const updatePullRequest = async ({repository, number, head_oid: headOid, title, body}) => {
+    if (!Number.isInteger(Number(number)) || Number(number) < 1) {
+      throw new TypeError('PR number must be positive');
+    }
+    const payload = {
+      title: requiredString(title, 'pull request title'),
+      body: requiredString(body, 'pull request body'),
+    };
+    const result = await transport.rest({method: 'PATCH',
+      path: apiPath(repository, `pulls/${Number(number)}`), body: payload});
+    const pr = pullRequest(bodyObject(result, 'update pull request'), repository);
+    if (pr.head_oid !== requiredString(headOid, 'head_oid')) {
+      throw new GhCliError(`updated PR head ${pr.head_oid} does not match approved ${headOid}`,
+        'PR_HEAD_MISMATCH', result);
+    }
+    return {status: result.httpStatus, headers: result.headers, ...pr};
+  };
+
   const getPullRequest = async ({repository, number}) => {
     if (!Number.isInteger(Number(number)) || Number(number) < 1) throw new TypeError('PR number must be positive');
     const result = await transport.rest({method: 'GET', path: apiPath(repository, `pulls/${Number(number)}`)});
@@ -863,6 +881,7 @@ export function createGhCliPublisherAdapter({
       : {clean: true, reason: null};
   };
 
-  return {getFork, createFork, getBranch, pushBranch, findPullRequests, createPullRequest, getPullRequest,
+  return {getFork, createFork, getBranch, pushBranch, findPullRequests, createPullRequest, updatePullRequest,
+    getPullRequest,
     getPullRequestCommits, getCommitStatus, getArtifactAttestation, graphql, finalLiveRecheck, deepOverlap};
 }
