@@ -139,6 +139,13 @@ test('PR text cannot deny that its exact clean verifier command ran and passed',
     patched_observation: {command, result: 'PASS', exit_code: 0},
   }), /PR body says the clean verifier command did not run/);
 
+  assert.throws(() => assertPublicVerificationClaims({
+    pr_body: '## Testing\n\nThe focused Jest command could not run locally. Static assertions passed.',
+  }, {
+    patched_observation: {command: 'npm test -- --runInBand src/__tests__/selectors.test.js',
+      result: 'PASS', exit_code: 0},
+  }), /PR body says the clean verifier command did not run/);
+
   assert.doesNotThrow(() => assertPublicVerificationClaims({
     pr_body: `## Testing\n- \`${command}\` passed in the clean verifier\n- npm run lint was not run`,
   }, {

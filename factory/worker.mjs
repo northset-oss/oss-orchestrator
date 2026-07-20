@@ -192,8 +192,10 @@ export function assertPublicVerificationClaims(authored, verification) {
   const command = verification?.patched_observation?.command;
   if (typeof command !== 'string' || !command.trim()) return;
   const contradictory = /\b(?:could not|couldn't|did not run|was not run|not run|blocked|unavailable|failed to (?:start|run))\b/i;
+  const focusedCheck = /\bfocused\b[^.\n]{0,120}\b(?:command|check|test(?:s|ing)?)\b/i;
   const line = String(authored?.pr_body ?? '').split(/\r?\n/)
-    .find((candidate) => candidate.includes(command) && contradictory.test(candidate));
+    .find((candidate) => contradictory.test(candidate) &&
+      (candidate.includes(command) || focusedCheck.test(candidate)));
   if (line) {
     throw new Error('PR body says the clean verifier command did not run, but its patched observation passed');
   }
