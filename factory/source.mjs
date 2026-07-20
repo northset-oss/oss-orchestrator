@@ -7,7 +7,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DISCOVERY_TTL_MS = 14 * DAY_MS;
 const DEFAULT_EXPECTED_MINUTES = 12;
 const CLEARLY_NON_NODE_PRIMARY_LANGUAGES = new Set([
-  'C', 'C++', 'C#', 'Dart', 'Dockerfile', 'Elixir', 'GDScript', 'Go', 'Java',
+  'C', 'C++', 'C#', 'Clojure', 'ClojureScript', 'Dart', 'Dockerfile', 'Elixir',
+  'GDScript', 'Go', 'Java',
   'Julia', 'Jupyter Notebook', 'Kotlin', 'Lua', 'Makefile', 'Nextflow', 'PHP',
   'PowerShell', 'Python', 'R', 'Ruby', 'Rust', 'Shell', 'Swift', 'TeX',
 ]);

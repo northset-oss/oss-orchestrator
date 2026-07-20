@@ -129,6 +129,7 @@ test('selector discards clearly non-Node lake records before live preflight', as
       row(2, {raw_json: JSON.stringify({repository: {primary_language: 'TeX'}})}),
       row(3, {primary_language: 'C++', raw_json: '{}'}),
       row(4, {raw_json: JSON.stringify({repository: {primary_language: null}})}),
+      row(5, {primary_language: 'Clojure', raw_json: '{}'}),
     ],
   });
   assert.deepEqual(selected.map((item) => item.candidate), ['owner/repo1#1', 'owner/repo4#4']);
