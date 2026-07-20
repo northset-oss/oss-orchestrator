@@ -105,6 +105,30 @@ palette-dependent readability, so repository-native visual contrast conventions 
 UI changes. The unboarded M-1036 also demonstrates that a large multi-file item with only one focused
 test and blocked lint must surface that risk rather than entering review with empty warnings.
 
+The next READY-board audit exposed a more important first-pass quality bottleneck: a green clean
+verifier can prove the authored test without proving that the patch implements the maintainer's
+actual contract. M-1037's test mocked the data hook and never asserted the search parameters, so it
+missed the issue discussion's agreed `indexed_date` query. M-1042's synthetic mutation test similarly
+did not cover an existing matching ancestor or overlapping roots, leaving a credible browser behavior
+regression. These are authoring/test-design losses, not verifier-integrity failures; the cheapest
+response is to reject the current bytes and make the corrected test exercise the disputed boundary.
+
+Repository-specific contribution instructions are another demonstrated early-screening need.
+M-1043 added and advertised a test even though that repository explicitly requests hands-on Linux
+verification and says not to add test references, while M-1041's exact PR title/body ignored its
+template and misstated why lint could not complete. Reading the nearest `AGENTS.md`, contribution
+guide, AI policy, and PR template before authoring is therefore part of issue fit, not post-publication
+polish. By contrast, M-1040's missing build evidence was an eliminable secondary limitation: its exact
+patched tree built successfully in the pinned, secret-free dependency environment. Missing evidence
+should be repaired when it is cheap; a requirement mismatch should not be papered over with more
+checks.
+
+Finally, M-1037 demonstrated a stale-claims path in the active runtime: the clean verifier passed the
+focused Jest command while the proposed PR text still said that command could not run. Commit
+`e303ac1` now rejects that generic contradiction before READY on the next factory restart. This keeps
+the receipt claim narrow and prevents valid execution evidence from being paired with misleading
+public prose.
+
 ### Carry-forward lessons
 
 1. **Use exact outcome words.** A thank-you, approval, merge, green CI result, receipt publication,
