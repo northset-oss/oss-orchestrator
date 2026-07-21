@@ -100,6 +100,48 @@ export function readyPerMinutePriority(mechanicalScore, stats = {}) {
   return probability / expectedMinutes;
 }
 
+function relationshipHas(values, key) {
+  if (!key) return false;
+  const normalized = String(key).toLowerCase();
+  if (values instanceof Set || values instanceof Map) return values.has(normalized) || values.has(key);
+  if (Array.isArray(values)) return values.some((value) => String(value).toLowerCase() === normalized);
+  return Boolean(values?.[normalized] ?? values?.[key]);
+}
+
+export function convertibilityMultiplier(row, relationships = {}, now = new Date()) {
+  let multiplier = 1;
+  const raw = parseJson(row.raw_json ?? row.raw, {});
+  const ownerNodeId = row.owner_node_id ?? raw.repository?.owner?.node_id ??
+    raw.repository?.owner?.nodeId ?? null;
+  const ownerLogin = row.owner_login ?? raw.repository?.owner?.login ??
+    (String(row.repo_display ?? raw.repository?.name_with_owner ?? '').split('/')[0] || null);
+  const repository = row.repo_display ?? raw.repository?.name_with_owner ?? null;
+  const starsValue = row.stars ?? raw.repository?.stars ?? raw.repository?.stargazer_count;
+  const stars = starsValue === null || starsValue === undefined || starsValue === ''
+    ? Number.NaN : Number(starsValue);
+  const archived = row.archived ?? raw.repository?.archived;
+  const pushedAt = row.pushed_at ?? raw.repository?.pushed_at;
+
+  if (String(ownerNodeId ?? '').startsWith('O_')) multiplier += 0.15;
+  if (String(ownerNodeId ?? '').startsWith('U_')) multiplier -= 0.05;
+  if (Number.isFinite(stars) && stars >= 0) {
+    multiplier += Math.min(0.15, Math.log10(stars + 1) * 0.05);
+    if (stars < 50 && String(ownerNodeId ?? '').startsWith('U_')) multiplier -= 0.1;
+  }
+  if (archived === true || archived === 1 || archived === '1') multiplier -= 0.3;
+  else if (archived === false || archived === 0 || archived === '0') multiplier += 0.05;
+  const pushed = Date.parse(pushedAt ?? '');
+  if (Number.isFinite(pushed) && now instanceof Date && Number.isFinite(now.getTime())) {
+    const ageDays = (now.getTime() - pushed) / DAY_MS;
+    if (ageDays <= 180) multiplier += 0.1;
+    else if (ageDays <= 365) multiplier += 0.05;
+    else if (ageDays > 730) multiplier -= 0.05;
+  }
+  if (relationshipHas(relationships.repositories, repository)) multiplier += 0.25;
+  else if (relationshipHas(relationships.owners, ownerLogin)) multiplier += 0.15;
+  return clamp(multiplier, 0.5, 1.6);
+}
+
 function statsFor(candidate, attemptStats) {
   if (typeof attemptStats === 'function') return attemptStats(candidate) ?? {};
   if (attemptStats instanceof Map) return attemptStats.get(candidate) ?? attemptStats.get(candidate.toLowerCase()) ?? {};
@@ -122,10 +164,11 @@ function invitationDetails(row, raw) {
   };
 }
 
-function normalizeLakeRow(row, attemptStats) {
+function normalizeLakeRow(row, attemptStats, relationships, now) {
   const parts = candidateParts(row.candidate_display ?? row.candidate ?? row.candidate_key);
   const raw = parseJson(row.raw_json ?? row.raw, {});
-  const priority = readyPerMinutePriority(row.mechanical_score, statsFor(parts.candidate, attemptStats));
+  const priority = readyPerMinutePriority(row.mechanical_score, statsFor(parts.candidate, attemptStats)) *
+    convertibilityMultiplier(row, relationships, now);
   return {
     candidate: parts.candidate,
     repository: String(row.repo_display ?? raw.repository?.name_with_owner ?? `${parts.owner}/${parts.repo}`),
@@ -154,6 +197,7 @@ export async function selectCandidates({
   limit,
   excludeCandidates = [],
   attemptStats = {},
+  relationships = {},
   now = new Date(),
 } = {}) {
   const selectedLimit = boundedLimit(workers, limit);
@@ -165,7 +209,8 @@ export async function selectCandidates({
     i.state, i.mechanical_score, i.mechanical_reasons_json, i.last_hydrated_at,
     i.invitation_kind, i.raw_json,
     r.repo_display, r.repository_node_id, r.primary_language, r.test_profile,
-    r.invitation_label_map_json
+    r.invitation_label_map_json, r.stars, r.fork, r.archived, r.owner_login,
+    r.owner_node_id, r.pushed_at
   FROM issues i
   JOIN repositories r ON r.repo_key=i.repo_key
   WHERE COALESCE(i.state,'OPEN') IN ('OPEN','open','REVIEWED')
@@ -186,7 +231,7 @@ export async function selectCandidates({
         ['OPEN', 'open', 'REVIEWED', null, undefined].includes(row.state);
     })
     .filter((row) => !clearlyNonNodePrimaryLanguage(row))
-    .map((row) => normalizeLakeRow(row, attemptStats))
+    .map((row) => normalizeLakeRow(row, attemptStats, relationships, now))
     .filter((candidate) => !excluded.has(candidate.candidate))
     .sort((left, right) => right.priority - left.priority ||
       right.mechanicalScore - left.mechanicalScore || left.candidate.localeCompare(right.candidate))
@@ -378,11 +423,27 @@ function recentExternalClaim(comments, northsetLogin, now) {
   }) ?? null;
 }
 
-export function evaluatePreflight(live, {northsetLogin = 'AysajanE', now = new Date()} = {}) {
+function doNotAuthorPause(live, entries) {
+  const repository = String(live.repository?.nameWithOwner ?? live.candidate?.repository ?? '').toLowerCase();
+  const owner = repository.split('/')[0];
+  return (entries ?? []).find((entry) => {
+    const pausedRepository = String(entry.repository ?? '').toLowerCase();
+    const pausedOwner = String(entry.owner_login ?? entry.owner ?? '').toLowerCase();
+    return pausedRepository === repository || (pausedOwner && pausedOwner === owner);
+  }) ?? null;
+}
+
+export function evaluatePreflight(live, {
+  northsetLogin = 'AysajanE',
+  now = new Date(),
+  doNotAuthor = [],
+} = {}) {
   if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error('now must be a valid Date');
   const reasons = [];
   const repository = live.repository;
   const issue = live.issue;
+  const pause = doNotAuthorPause(live, doNotAuthor);
+  if (pause) reasons.push(`repository owner is on the do-not-author pause list (${pause.reason_code ?? 'maintainer signal'})`);
   if (!repository) reasons.push('repository is missing or inaccessible');
   if (!issue) reasons.push('issue is missing or inaccessible');
   if (issue && issue.state !== 'OPEN') reasons.push(`issue is ${String(issue.state).toLowerCase()}`);
@@ -426,6 +487,7 @@ export async function preflightCandidates(candidates, {
   limit,
   northsetLogin = 'AysajanE',
   now = new Date(),
+  doNotAuthor = [],
 } = {}) {
   if (!github || typeof github.graphql !== 'function') throw new Error('github.graphql is required');
   const selected = candidates.slice(0, boundedLimit(workers, limit));
@@ -439,7 +501,7 @@ export async function preflightCandidates(candidates, {
       repository: data[`c${index}`] ?? null,
       northset: data[`n${index}`] ?? null,
     });
-    return {...evaluatePreflight(live, {northsetLogin, now}), candidate};
+    return {...evaluatePreflight(live, {northsetLogin, now, doNotAuthor}), candidate};
   });
   if (typeof github.deepOverlap === 'function') {
     for (let index = 0; index < results.length; index += 1) {
@@ -484,9 +546,11 @@ export function createSource({lakePath = 'candidate_lake.sqlite', query, db, git
       lakePath,
       query: lakeQuery,
       attemptStats: options?.attemptStats ?? db?.candidateAttemptStats?.() ?? {},
+      relationships: options?.relationships ?? db?.priorMergeRelationships?.() ?? {},
     }),
     preflight: (candidates, options) => preflightCandidates(candidates, {
       ...options, github, northsetLogin: options?.northsetLogin ?? northsetLogin,
+      doNotAuthor: options?.doNotAuthor ?? db?.listDoNotAuthor?.() ?? [],
     }),
     enqueue: (results) => enqueueCandidates(results, {db}),
     async fill(options) {

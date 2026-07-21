@@ -176,6 +176,33 @@ test('attempt history can reorder the initial mechanical ranking', async () => {
   assert.deepEqual(selected.map((item) => item.candidate), ['owner/repo2#2', 'owner/repo1#1']);
 });
 
+test('offline convertibility favors organizations, live popularity, and prior merged relationships', async () => {
+  let sql = '';
+  const selected = await selectCandidates({
+    workers: 2,
+    limit: 4,
+    now: NOW,
+    relationships: {repositories: new Set(['owner/repo3'])},
+    query: async (value) => {
+      sql = value;
+      return [
+        row(1, {mechanical_score: 80, owner_node_id: 'U_1', stars: 2, archived: 0,
+          pushed_at: '2023-01-01T00:00:00Z'}),
+        row(2, {mechanical_score: 80, owner_node_id: 'O_2', stars: 1_000, archived: 0,
+          pushed_at: '2026-07-01T00:00:00Z'}),
+        row(3, {mechanical_score: 80}),
+        row(4, {mechanical_score: 80}),
+      ];
+    },
+  });
+  assert.deepEqual(selected.map((item) => item.candidate), [
+    'owner/repo2#2', 'owner/repo3#3', 'owner/repo4#4', 'owner/repo1#1',
+  ]);
+  for (const column of ['stars', 'archived', 'owner_login', 'owner_node_id', 'pushed_at']) {
+    assert.match(sql, new RegExp(`r\\.${column}`));
+  }
+});
+
 test('preflight query consolidates all live fields and repository-wide Northset PR search', () => {
   const query = buildPreflightQuery([candidate()]);
   for (const expected of ['isArchived', 'isFork', 'defaultBranchRef', 'rootPackage', 'rootReadme',
@@ -192,6 +219,17 @@ test('preflight query consolidates all live fields and repository-wide Northset 
 
 test('clean invited live state returns GO', () => {
   assert.deepEqual(evaluatePreflight(normalizedLive(), {now: NOW}).outcome, 'GO');
+});
+
+test('verification-prospect owner pauses authoring across that owner repositories', () => {
+  const result = evaluatePreflight(normalizedLive(), {
+    now: NOW,
+    doNotAuthor: [{
+      repository: 'owner/another-repo', owner_login: 'OWNER', reason_code: 'ai_policy_concern',
+    }],
+  });
+  assert.equal(result.outcome, 'SKIP');
+  assert.match(result.reasons.join(' '), /do-not-author pause list \(ai_policy_concern\)/);
 });
 
 test('each hard live-preflight violation returns SKIP', async (t) => {

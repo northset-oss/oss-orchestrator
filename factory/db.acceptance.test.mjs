@@ -88,6 +88,43 @@ test('schema v5 adds per-attempt reasons without rewriting existing attempts', a
   assert.equal(db.connection.prepare("SELECT reason FROM attempts WHERE attempt_id='ATTEMPT-1'").get().reason, null);
 });
 
+test('prior merges route ranking and verification prospects persist the owner pause list', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-targeting-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'), {missionStart: 1});
+  t.after(() => db.close());
+  const {claim} = enqueueAndClaim(db);
+  const ready = db.finishVerifiedReady(claim.attempt.attempt_id, {
+    repository: 'owner/repo', pr_title: 'fix: bounded issue', pr_body: 'Fix it.',
+  }, {
+    patchSha256: `sha256:${'b'.repeat(64)}`,
+    commitOid: 'c'.repeat(40),
+    verification: {ok: true},
+  });
+  db.savePublication(ready.mission_id, {
+    task_id: ready.task_id, publication_state: 'SUBMITTED', pr_state: 'MERGED', merged: true,
+  });
+
+  const relationships = db.priorMergeRelationships();
+  assert.equal(relationships.repositories.has('owner/repo'), true);
+  assert.equal(relationships.owners.has('owner'), true);
+
+  db.recordVerificationProspect({
+    repository: 'Owner/Repo',
+    owner: 'Owner',
+    reasonCode: 'not_wanted',
+    missionId: ready.mission_id,
+    observedAt: '2026-07-21T15:00:00Z',
+  });
+  assert.deepEqual(db.listDoNotAuthor(), [{
+    repository: 'Owner/Repo',
+    owner_login: 'Owner',
+    reason_code: 'not_wanted',
+    mission_id: ready.mission_id,
+    observed_at: '2026-07-21T15:00:00.000Z',
+  }]);
+});
+
 function enqueueAndClaim(db) {
   const [task] = db.enqueueTasks([{
     candidate: 'owner/repo#123',

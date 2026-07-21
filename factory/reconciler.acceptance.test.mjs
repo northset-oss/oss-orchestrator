@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {reconcilePublicationBatch} from './reconciler.mjs';
+import {reasonCodeFromFollowUp, reconcilePublicationBatch} from './reconciler.mjs';
 
 const HEAD = 'b'.repeat(40);
 const PROOF = `sha256:${'a'.repeat(64)}`;
@@ -25,14 +25,18 @@ function fakeDb(seed = publication()) {
   const publications = new Map([[seed.mission_id, {...seed}]]);
   let released = false;
   const taskStates = [];
+  const prospects = [];
   return {
     publications,
     taskStates,
+    prospects,
     async listReconciliationCandidates({limit}) {
       return [...publications.values()].filter((item) => item.publication_state === 'SUBMITTED').slice(0, limit);
     },
     async getReadyItem(missionId) {
-      return {mission_id: missionId, manifest: {repository: 'upstream/project', commit_oid: HEAD}};
+      return {mission_id: missionId, manifest: {
+        repository: 'upstream/project', commit_oid: HEAD, verification: {ok: true},
+      }};
     },
     async getPublication(missionId) { return publications.get(missionId) ?? null; },
     async savePublication(missionId, patch) {
@@ -57,10 +61,19 @@ function fakeDb(seed = publication()) {
       publications.set(missionId, next);
       return {publication: next, repository_released: repositoryReleased};
     },
+    async recordVerificationProspect(record) { prospects.push(structuredClone(record)); return record; },
   };
 }
 
-function harness({seed, prState = 'open', merged = false, attestor, statusPublisher} = {}) {
+function harness({
+  seed,
+  prState = 'open',
+  merged = false,
+  attestor,
+  statusPublisher,
+  appendDemand = () => {},
+  demandDir = 'runs/demand',
+} = {}) {
   const db = fakeDb(seed);
   const safetyCalls = [];
   const releases = [];
@@ -93,7 +106,10 @@ function harness({seed, prState = 'open', merged = false, attestor, statusPublis
     async createPullRequest() { prohibited.create += 1; throw new Error('must not create'); },
     async closePullRequest() { prohibited.close += 1; throw new Error('must not close'); },
   };
-  return {db, safety, github, safetyCalls, releases, prohibited, attestor, statusPublisher};
+  return {
+    db, safety, github, safetyCalls, releases, prohibited, attestor, statusPublisher,
+    appendDemand, demandDir,
+  };
 }
 
 test('attestation failure remains pending, publishes factual status, and restart never duplicates a PR', async () => {
@@ -341,4 +357,99 @@ test('follow-up summary exposes contributor comments without relabeling maintain
     call.operation === 'reconcile_get_pull_request_follow_up' && call.kind === 'read'));
   assert.equal(fixture.prohibited.create, 0);
   assert.equal(fixture.prohibited.close, 0);
+});
+
+test('maintainer AI-policy rejection becomes telemetry and an owner-level verification prospect', async () => {
+  const fixture = harness({
+    prState: 'closed',
+    attestor: async () => ({found: false}),
+    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
+      status_url: `https://example.test/${item.mission_id}/publication.json`,
+    }])),
+  });
+  fixture.github.getPullRequestFollowUp = async () => ({
+    author_login: 'AysajanE',
+    review_decision: 'CHANGES_REQUESTED',
+    comments: [],
+    reviews: [{
+      author_login: 'maintainer', author_type: 'User', author_association: 'OWNER',
+      body: 'We do not accept AI-generated patches in this project.',
+      state: 'CHANGES_REQUESTED', submitted_at: '2026-07-19T12:30:00Z',
+    }],
+    threads: [],
+  });
+
+  const result = await reconcilePublicationBatch(fixture);
+  assert.equal(result.results[0].reason_code, 'ai_policy_concern');
+  assert.equal(result.results[0].verification_prospect, true);
+  assert.deepEqual(fixture.db.prospects, [{
+    repository: 'upstream/project',
+    owner: 'upstream',
+    reasonCode: 'ai_policy_concern',
+    missionId: 'M-001',
+    observedAt: '2026-07-19T13:00:00.000Z',
+  }]);
+  assert.equal(reasonCodeFromFollowUp({latest_reviews_by_maintainer: [], maintainer_comments: []}), 'unknown');
+});
+
+test('terminal reconciliation emits exact shadow acceptance and merged demand signal schemas once', async () => {
+  const appended = [];
+  const fixture = harness({
+    prState: 'closed',
+    merged: true,
+    appendDemand: (file, record) => appended.push({file, record: structuredClone(record)}),
+    demandDir: '/tmp/factory-demand-test',
+    attestor: async () => ({found: false}),
+    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
+      status_url: `https://example.test/${item.mission_id}/publication.json`,
+    }])),
+  });
+  fixture.github.getCommitStatus = async () => ({
+    found: true, state: 'SUCCESS', total_count: 1, updated_at: '2026-07-19T11:59:00Z',
+  });
+  fixture.github.getPullRequestFollowUp = async () => ({
+    author_login: 'AysajanE', review_decision: 'APPROVED', comments: [],
+    reviews: [{
+      author_login: 'maintainer', author_type: 'User', author_association: 'MEMBER',
+      body: 'The verification receipt made this straightforward.', state: 'APPROVED',
+      submitted_at: '2026-07-19T12:30:00Z',
+    }],
+    threads: [],
+  });
+
+  await reconcilePublicationBatch(fixture);
+  await reconcilePublicationBatch(fixture);
+  const shadow = appended.filter((entry) => entry.file.endsWith('/shadow_acceptance.jsonl'));
+  const proto = appended.filter((entry) => entry.file.endsWith('/proto_signals.jsonl'));
+  assert.equal(shadow.length, 1);
+  assert.deepEqual(Object.keys(shadow[0].record), [
+    'ts', 'mission_id', 'repo', 'declared_check_passed', 'would_release',
+    'both_sides_would_accept', 'human_override', 'reason',
+  ]);
+  assert.equal(shadow[0].record.declared_check_passed, true);
+  assert.equal(shadow[0].record.would_release, true);
+  assert.equal(shadow[0].record.both_sides_would_accept, 'yes');
+  assert.deepEqual(proto.map((entry) => entry.record.signal), [
+    'merged_without_ci_rerun', 'maintainer_cited_receipt', 'fast_merge_after_receipt',
+  ]);
+  for (const entry of proto) {
+    assert.deepEqual(Object.keys(entry.record), [
+      'ts', 'mission_id', 'repo', 'signal', 'evidence', 'confidence',
+    ]);
+  }
+});
+
+test('demand append failures remain non-blocking reconciliation telemetry', async () => {
+  const fixture = harness({
+    prState: 'closed',
+    merged: true,
+    appendDemand: () => { throw new Error('disk unavailable'); },
+    attestor: async () => ({found: false}),
+    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
+      status_url: `https://example.test/${item.mission_id}/publication.json`,
+    }])),
+  });
+  const result = await reconcilePublicationBatch(fixture);
+  assert.equal(result.results[0].pr_state, 'MERGED');
+  assert.ok(result.results[0].demand_errors.every((error) => error === 'disk unavailable'));
 });

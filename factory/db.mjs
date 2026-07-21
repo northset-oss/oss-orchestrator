@@ -3,7 +3,7 @@ import {mkdirSync} from 'node:fs';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 
-export const FACTORY_SCHEMA_VERSION = 6;
+export const FACTORY_SCHEMA_VERSION = 7;
 export const TASK_STATES = Object.freeze([
   'DISCOVERED', 'QUEUED', 'WORKING', 'VERIFIED', 'READY', 'APPROVED',
   'PR_OPENED', 'RECEIPT_ATTESTED', 'SKIPPED', 'FAILED',
@@ -334,6 +334,13 @@ CREATE TABLE IF NOT EXISTS repository_state(
   last_pr_at TEXT,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS verification_prospects(
+  repository TEXT PRIMARY KEY COLLATE NOCASE,
+  owner_login TEXT NOT NULL COLLATE NOCASE,
+  reason_code TEXT NOT NULL,
+  mission_id TEXT NOT NULL,
+  observed_at TEXT NOT NULL
+);
 `;
 
 export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
@@ -444,6 +451,10 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       connection.exec('ROLLBACK');
       throw error;
     }
+  }
+  if (version === 6) {
+    connection.prepare("UPDATE factory_meta SET value='7' WHERE key='schema_version'").run();
+    version = 7;
   }
   if (version !== FACTORY_SCHEMA_VERSION) throw new Error(`unsupported factory schema version ${version}`);
 
@@ -1190,6 +1201,43 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     return getRepositoryState(repository);
   }
 
+  function priorMergeRelationships() {
+    const rows = connection.prepare(`SELECT DISTINCT lower(t.repository) AS repository,
+      lower(substr(t.repository,1,instr(t.repository,'/')-1)) AS owner
+      FROM publications p LEFT JOIN ready_items r ON r.mission_id=p.mission_id
+      JOIN tasks t ON t.task_id=coalesce(p.task_id,r.task_id)
+      WHERE p.merged=1 OR upper(coalesce(p.pr_state,''))='MERGED'`).all();
+    return {
+      repositories: new Set(rows.map((row) => row.repository)),
+      owners: new Set(rows.map((row) => row.owner)),
+    };
+  }
+
+  function recordVerificationProspect({repository, owner, reasonCode, missionId, observedAt = new Date()} = {}) {
+    if (typeof repository !== 'string' || !repository.includes('/')) {
+      throw new Error('verification prospect requires repository owner/name');
+    }
+    const ownerLogin = owner ?? repository.split('/')[0];
+    if (!['ai_policy_concern', 'not_wanted'].includes(reasonCode)) {
+      throw new Error('verification prospect requires an AI-policy or not-wanted reason');
+    }
+    if (typeof missionId !== 'string' || !missionId) throw new Error('verification prospect requires mission_id');
+    connection.prepare(`INSERT INTO verification_prospects(
+      repository,owner_login,reason_code,mission_id,observed_at
+    ) VALUES(?,?,?,?,?) ON CONFLICT(repository) DO UPDATE SET
+      owner_login=excluded.owner_login,reason_code=excluded.reason_code,
+      mission_id=excluded.mission_id,observed_at=excluded.observed_at`).run(
+      repository, ownerLogin, reasonCode, missionId, iso(observedAt),
+    );
+    return connection.prepare('SELECT * FROM verification_prospects WHERE repository=?').get(repository);
+  }
+
+  function listDoNotAuthor() {
+    return connection.prepare(`SELECT repository,owner_login,reason_code,mission_id,observed_at
+      FROM verification_prospects ORDER BY lower(owner_login),lower(repository)`).all()
+      .map((row) => ({...row}));
+  }
+
   function stats() {
     const row = connection.prepare(`SELECT
       (SELECT count(*) FROM tasks) AS tasks,
@@ -1247,6 +1295,9 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     getRepositoryState,
     getPublicActionState,
     setRepositoryState,
+    priorMergeRelationships,
+    recordVerificationProspect,
+    listDoNotAuthor,
     candidateAttemptStats,
     stats,
   };
