@@ -1082,6 +1082,18 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       ORDER BY updated_at,mission_id LIMIT ?`).all(...states, limit).map(mapPublication);
   }
 
+  function listWarmRepositories() {
+    return connection.prepare(`SELECT t.repository,
+      coalesce(max(rs.owner_login),substr(t.repository,1,instr(t.repository,'/')-1)) AS maintainer_login,
+      min(p.mission_id) AS mission_id,max(rs.last_pr_at) AS last_pr_at
+      FROM publications p
+      JOIN tasks t ON t.task_id=p.task_id
+      LEFT JOIN repository_state rs ON lower(rs.repository)=lower(t.repository)
+      WHERE p.pr_state='MERGED' OR p.merged=1
+      GROUP BY lower(t.repository)
+      ORDER BY lower(t.repository)`).all();
+  }
+
   function listReconciliationCandidates({limit = 30} = {}) {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
       throw new Error('reconciliation limit must be an integer from 1 through 1000');
@@ -1289,6 +1301,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     savePublication,
     getPublication,
     listPublications,
+    listWarmRepositories,
     listReconciliationCandidates,
     recordPublicationObservation,
     updateTaskState,

@@ -514,6 +514,7 @@ const FINAL_RECHECK_QUERY = `query FactoryFinalLiveRecheck(
 const FOLLOW_UP_QUERY = `query FactoryPullRequestFollowUp($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     nameWithOwner
+    owner { login __typename }
     pullRequest(number: $number) {
       number url reviewDecision author { login }
       comments(last: 100) {
@@ -536,6 +537,20 @@ const FOLLOW_UP_QUERY = `query FactoryPullRequestFollowUp($owner: String!, $name
             nodes { url body createdAt updatedAt authorAssociation author { login __typename } }
           }
         }
+      }
+    }
+  }
+}`;
+
+const OPEN_PULL_REQUESTS_QUERY = `query FactoryOpenPullRequests($owner: String!, $name: String!, $limit: Int!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequests(first: $limit, states: OPEN, orderBy: {field: CREATED_AT, direction: ASC}) {
+      nodes {
+        number title url authorAssociation createdAt updatedAt isCrossRepository mergeable reviewDecision
+        author { login }
+        reviews(first: 1) { totalCount }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
   }
@@ -648,6 +663,49 @@ export function createGhCliPublisherAdapter({
       'GH_RESPONSE_INVALID', result);
     return {status: result.httpStatus, headers: result.headers,
       pull_requests: result.body.map((pr) => pullRequest(pr, repository))};
+  };
+
+  const findOpenPullRequests = async (repository, {limit = 30} = {}) => {
+    const normalizedRepository = validRepository(repository);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new TypeError('open pull request limit must be an integer from 1 through 100');
+    }
+    const {owner, name} = repositoryParts(normalizedRepository);
+    const result = await transport.graphql({
+      query: OPEN_PULL_REQUESTS_QUERY,
+      variables: {owner, name, limit},
+    });
+    const body = bodyObject(result, 'find open pull requests');
+    if (Array.isArray(body.errors) && body.errors.length) {
+      throw new GhCliError(`find open pull requests failed: ${body.errors.map((item) => item.message).join('; ')}`,
+        'GH_GRAPHQL_ERROR', result);
+    }
+    const repo = body.data?.repository;
+    if (!repo || String(repo.nameWithOwner).toLowerCase() !== normalizedRepository.toLowerCase() ||
+        !Array.isArray(repo.pullRequests?.nodes)) {
+      throw new GhCliError('find open pull requests returned an invalid repository response',
+        'GH_RESPONSE_INVALID', result);
+    }
+    return {
+      status: result.httpStatus,
+      headers: result.headers,
+      owner_login: repo.owner?.login ?? owner,
+      owner_type: repo.owner?.__typename ?? null,
+      pull_requests: repo.pullRequests.nodes.map((pr) => ({
+        number: Number(pr.number),
+        title: pr.title,
+        url: pr.url,
+        author_login: pr.author?.login ?? null,
+        author_association: pr.authorAssociation ?? null,
+        created_at: pr.createdAt ?? null,
+        updated_at: pr.updatedAt ?? null,
+        is_cross_repository: pr.isCrossRepository === true,
+        mergeable: pr.mergeable ?? null,
+        review_decision: pr.reviewDecision ?? null,
+        reviewer_count: Number(pr.reviews?.totalCount ?? 0),
+        ci_state: pr.commits?.nodes?.at(-1)?.commit?.statusCheckRollup?.state ?? null,
+      })),
+    };
   };
 
   const createPullRequest = async ({
@@ -1031,7 +1089,8 @@ export function createGhCliPublisherAdapter({
       : {clean: true, reason: null};
   };
 
-  return {getFork, createFork, getBranch, pushBranch, findPullRequests, createPullRequest, updatePullRequest,
+  return {getFork, createFork, getBranch, pushBranch, findPullRequests, findOpenPullRequests,
+    createPullRequest, updatePullRequest,
     getPullRequest, getPullRequestFollowUp,
     getPullRequestCommits, getCommitStatus, getArtifactAttestation, graphql, finalLiveRecheck, deepOverlap};
 }
