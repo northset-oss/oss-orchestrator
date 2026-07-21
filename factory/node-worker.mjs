@@ -35,7 +35,10 @@ const VERIFY_TIMEOUT_MS = 10 * 60_000;
 export const SCOUT_SCHEMA = Object.freeze({
   type: 'object',
   additionalProperties: false,
-  required: ['decision', 'reason', 'test_command', 'install_command', 'target_files', 'estimated_risk'],
+  required: [
+    'decision', 'reason', 'test_command', 'install_command', 'target_files', 'estimated_risk',
+    'pre_work_rule', 'pre_work_evidence', 'required_checks',
+  ],
   properties: {
     decision: {type: 'string', enum: ['GO', 'SKIP']},
     reason: {type: 'string'},
@@ -43,6 +46,9 @@ export const SCOUT_SCHEMA = Object.freeze({
     install_command: {type: 'string'},
     target_files: {type: 'array', items: {type: 'string'}},
     estimated_risk: {type: 'string', enum: ['GREEN', 'AMBER', 'RED']},
+    pre_work_rule: {type: 'string'},
+    pre_work_evidence: {type: 'string'},
+    required_checks: {type: 'array', items: {type: 'string'}},
   },
 });
 
@@ -360,11 +366,15 @@ async function defaultCodexRunner({
 
 function issueText(task) {
   const issue = task.issue_snapshot ?? {};
+  const comments = Array.isArray(issue.comments) ? issue.comments : [];
   return [
     `Repository: ${task.repository}`,
     `Issue: ${task.candidate ?? `${task.repository}#${task.issue_number}`}`,
     `Title: ${issue.title ?? ''}`,
     `Body:\n${issue.body ?? issue.bodyText ?? ''}`,
+    `Labels: ${JSON.stringify(issue.labels ?? [])}`,
+    `Assignees: ${JSON.stringify(issue.assignees ?? [])}`,
+    `Existing issue comments:\n${comments.length ? JSON.stringify(comments, null, 2) : '(none)'}`,
   ].join('\n\n');
 }
 
@@ -372,11 +382,22 @@ function scoutPrompt(task) {
   return `${issueText(task)}
 
 Inspect this checkout read-only. Decide whether this is a small, testable Node contribution suitable
-for the standard lane. Read the repository's contribution and pull-request instructions. Select one
-exact focused test command and likely target files. Do not change files. Return an empty
-install_command to use the lockfile-based default. SKIP if the issue is unclear, too broad, needs
-secrets/services, is Red risk, or requires a committed filename or content derived from the future
-pull-request number; that cannot be bound in the one-approval standard lane. Return only
+for the standard lane. Read all repository contribution and pull-request instructions, including
+CONTRIBUTING files and pull-request templates. In pre_work_rule, quote or precisely summarize any
+rule requiring a contributor to comment, claim, ask permission, or otherwise communicate publicly
+before starting. In pre_work_evidence, return an exact, non-empty quote from an existing issue
+comment by AysajanE that satisfies that rule; an issue or another person's comment is not evidence.
+Leave both fields empty if there is no such rule. SKIP when pre_work_rule is non-empty and no such
+comment exists. Never perform the public action yourself.
+
+List in required_checks every exact, feasible, non-network command the repository says must be run
+locally before a pull request, such as its full tests, typecheck, lint, or build. Select a single
+test_command that runs the focused issue test first and then every required_checks command on the
+patched checkout. SKIP if a mandatory pre-PR check needs secrets, a service, or network access and
+there is no documented non-network alternative. Select likely target files. Do not change files.
+Return an empty install_command to use the lockfile-based default. SKIP if the issue is unclear, too
+broad, needs secrets/services, is Red risk, or requires a committed filename or content derived from
+the future pull-request number; that cannot be bound in the one-approval standard lane. Return only
 the requested structured result. Do not call GitHub or any network service other than the model API.`;
 }
 
@@ -396,22 +417,40 @@ feature_implementation, add a focused behavior test that fails on the clean base
 non-empty output marker without describing the missing new behavior as a regression. For
 coverage_addition, report the added test paths; those tests must pass on both base and patched code.
 For existing_check_repair or test_infrastructure_fix, the declared existing check must fail on base.
-Run the focused check after the fix. If an honest, bounded patch is not possible, return SKIP.
-Write a factual PR title/body without claiming maintainer approval, production readiness, guaranteed
+The single test_command must run the focused check first and then every repository-required command
+listed in Scout decision.required_checks. Run that complete command after the fix; it is the exact
+command the clean verifier and receipt will bind. Follow repository-specific pull-request title and
+commit-subject conventions: pr_title becomes the canonical commit subject. Accurately list the exact
+complete command in the PR body. If an honest, bounded patch is not possible, return SKIP. Write a
+factual PR title/body without claiming maintainer approval, production readiness, guaranteed
 correctness, or that checks beyond the reported commands passed. Return only the output-schema JSON.
 Never call GitHub.`;
 }
 
-function assertScout(result) {
+function assertScout(result, task = {}) {
   if (!result || !['GO', 'SKIP'].includes(result.decision)) throw new Error('scout returned an invalid decision');
   if (typeof result.reason !== 'string') throw new Error('scout omitted reason');
   if (result.decision === 'GO' && !String(result.test_command ?? '').trim()) throw new Error('scout omitted test command');
   result.target_files = safeRelativePaths(result.target_files ?? [], 'scout target_files');
+  result.pre_work_rule = String(result.pre_work_rule ?? '').trim();
+  result.pre_work_evidence = String(result.pre_work_evidence ?? '').trim();
+  result.required_checks = [...new Set((result.required_checks ?? [])
+    .map((check) => String(check).trim()).filter(Boolean))];
+  const comments = Array.isArray(task.issue_snapshot?.comments) ? task.issue_snapshot.comments : [];
+  const evidencePresent = result.pre_work_evidence && comments.some((comment) => {
+    const author = typeof comment?.author === 'string' ? comment.author : comment?.author?.login;
+    return String(author ?? '').toLowerCase() === 'aysajane' &&
+      String(comment?.body ?? '').includes(result.pre_work_evidence);
+  });
+  if (result.decision === 'GO' && result.pre_work_rule && !evidencePresent) {
+    result.decision = 'SKIP';
+    result.reason = `required pre-work public communication was not completed: ${result.pre_work_rule}`;
+  }
   if (!['GREEN', 'AMBER', 'RED'].includes(result.estimated_risk)) throw new Error('scout returned invalid risk');
   return result;
 }
 
-function assertAuthor(result) {
+function assertAuthor(result, scout = {}) {
   if (!result || !['PATCH', 'SKIP'].includes(result.outcome)) throw new Error('author returned an invalid outcome');
   if (result.outcome === 'SKIP') return result;
   for (const field of ['pr_title', 'pr_body', 'summary', 'test_command']) {
@@ -421,6 +460,13 @@ function assertAuthor(result) {
   result.test_only_paths = safeRelativePaths(result.test_only_paths ?? [], 'author test_only_paths');
   result.checks = (result.checks ?? []).map(String).filter((item) => item.trim());
   if (!result.checks.length) result.checks = [result.test_command];
+  const normalizedTestCommand = result.test_command.replace(/\s+/g, ' ').trim();
+  const verifiedSteps = new Set(normalizedTestCommand.split(/\s*&&\s*/));
+  const missingRequired = (scout.required_checks ?? []).filter((check) =>
+    !verifiedSteps.has(String(check).replace(/\s+/g, ' ').trim()));
+  if (missingRequired.length) {
+    throw new Error(`author test_command omits required repository checks: ${missingRequired.join(', ')}`);
+  }
   if (['regression_fix', 'feature_implementation'].includes(result.claim_type)) {
     if (!result.test_only_paths.length) throw new Error(`${result.claim_type} requires a test-only path`);
     if (!String(result.base_failure_contains ?? '').trim()) {
@@ -618,6 +664,9 @@ export function createNodeWorker({
         install_command: '',
         target_files: [],
         estimated_risk: 'GREEN',
+        pre_work_rule: '',
+        pre_work_evidence: '',
+        required_checks: [],
       };
     }
     const result = await codexRunner({
@@ -631,7 +680,7 @@ export function createNodeWorker({
       timeoutMs: Math.min(Number(payload.timeoutMs ?? SCOUT_TIMEOUT_MS), SCOUT_TIMEOUT_MS),
       codexHomeSource,
     });
-    return assertScout(result);
+    return assertScout(result, payload.task);
   }
 
   async function bootstrap(payload) {
@@ -698,7 +747,7 @@ export function createNodeWorker({
       timeoutMs: Math.min(Number(payload.timeoutMs ?? AUTHOR_TIMEOUT_MS), AUTHOR_TIMEOUT_MS),
       codexHomeSource,
       dependencyMaterial: payload.dependencyMaterial,
-    }));
+    }), payload.scout);
     if (result.outcome === 'SKIP') return result;
     const artifactRoot = await mkdtemp(path.join(path.dirname(payload.checkout), '.northset-author-'));
     try {
