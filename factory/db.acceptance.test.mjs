@@ -63,6 +63,31 @@ test('schema v1 publication checkpoints migrate additively and retain async reco
   assert.equal(saved.last_error_detail, 'retry asynchronously');
 });
 
+test('schema v5 adds per-attempt reasons without rewriting existing attempts', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-attempt-reason-migration-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const database = path.join(root, 'factory.sqlite');
+  const legacy = new DatabaseSync(database);
+  legacy.exec(`
+    CREATE TABLE factory_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    INSERT INTO factory_meta(key,value) VALUES('schema_version','5'),('next_mission_number','1000');
+    CREATE TABLE attempts(
+      attempt_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,attempt_number INTEGER NOT NULL,
+      started_at TEXT NOT NULL,finished_at TEXT,model TEXT,outcome TEXT,failure_class TEXT,
+      duration_ms INTEGER,patch_sha256 TEXT,commit_oid TEXT,verification_json TEXT
+    );
+    INSERT INTO attempts(attempt_id,task_id,attempt_number,started_at,outcome,failure_class)
+      VALUES('ATTEMPT-1','TASK-1',1,'2026-07-19T12:00:00.000Z','FAILED','infrastructure');
+  `);
+  legacy.close();
+
+  const db = openFactoryDb(database);
+  t.after(() => db.close());
+  assert.equal(Number(db.connection.prepare("SELECT value FROM factory_meta WHERE key='schema_version'").get().value),
+    FACTORY_SCHEMA_VERSION);
+  assert.equal(db.connection.prepare("SELECT reason FROM attempts WHERE attempt_id='ATTEMPT-1'").get().reason, null);
+});
+
 function enqueueAndClaim(db) {
   const [task] = db.enqueueTasks([{
     candidate: 'owner/repo#123',
@@ -73,6 +98,33 @@ function enqueueAndClaim(db) {
   }], {now: '2026-07-19T12:00:00.000Z'});
   return {task, claim: db.claimNextTask({now: '2026-07-19T12:01:00.000Z'})};
 }
+
+test('preflight skips retain their exact decision in the existing task snapshot', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-preflight-decision-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'));
+  t.after(() => db.close());
+  const observedAt = '2026-07-21T19:00:00.000Z';
+  const [task] = db.recordPreflightOutcomes([{
+    outcome: 'SKIP',
+    reasons: ['repository policy prohibits AI-generated contributions (README.md)'],
+    candidate: {
+      candidate: 'owner/repo#123', repository: 'owner/repo', issueNumber: 123, priority: 0.9,
+    },
+    liveState: {
+      repository: {nameWithOwner: 'owner/repo', defaultOid: 'a'.repeat(40)},
+      issue: {number: 123, state: 'OPEN'},
+    },
+  }], {now: observedAt});
+
+  assert.deepEqual(task.live_state.preflight_decision, {
+    version: 1,
+    outcome: 'SKIP',
+    reasons: ['repository policy prohibits AI-generated contributions (README.md)'],
+    observed_at: observedAt,
+  });
+  assert.deepEqual(task.issue_snapshot, {number: 123, state: 'OPEN'});
+});
 
 test('one exhausted infrastructure attempt can re-enter only after a fresh enqueue', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-infrastructure-retry-'));
@@ -89,6 +141,7 @@ test('one exhausted infrastructure attempt can re-enter only after a fresh enque
     outcome: 'FAILED', failureClass: 'infrastructure', error: 'clone timed out',
     now: '2026-07-19T12:02:00.000Z',
   });
+  assert.equal(db.getAttempt(first.attempt.attempt_id).reason, 'clone timed out');
 
   const [requeued] = db.enqueueTasks([{...record, base_oid: 'b'.repeat(40)}], {
     now: '2026-07-19T12:03:00.000Z',
@@ -103,6 +156,7 @@ test('one exhausted infrastructure attempt can re-enter only after a fresh enque
     outcome: 'FAILED', failureClass: 'worker', error: 'deterministic worker failure',
     now: '2026-07-19T12:05:00.000Z',
   });
+  assert.equal(db.getAttempt(second.attempt.attempt_id).reason, 'deterministic worker failure');
   const [terminal] = db.enqueueTasks([record], {now: '2026-07-19T12:06:00.000Z'});
   assert.equal(terminal.task_id, task.task_id);
   assert.equal(terminal.state, 'FAILED');
@@ -343,6 +397,7 @@ test('rejected unpublished READY bytes can be replaced by a new verified attempt
     model: 'test-model',
     outcome: 'VERIFIED',
     failure_class: null,
+    reason: null,
     duration_ms: 654,
     patch_sha256: secondVerification.patch_sha256,
     commit_oid: secondVerification.commit_oid,

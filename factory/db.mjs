@@ -3,7 +3,7 @@ import {mkdirSync} from 'node:fs';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 
-export const FACTORY_SCHEMA_VERSION = 5;
+export const FACTORY_SCHEMA_VERSION = 6;
 export const TASK_STATES = Object.freeze([
   'DISCOVERED', 'QUEUED', 'WORKING', 'VERIFIED', 'READY', 'APPROVED',
   'PR_OPENED', 'RECEIPT_ATTESTED', 'SKIPPED', 'FAILED',
@@ -145,6 +145,7 @@ function mapAttempt(row) {
     model: row.model,
     outcome: row.outcome,
     failure_class: row.failure_class,
+    reason: row.reason ?? null,
     duration_ms: row.duration_ms,
     patch_sha256: row.patch_sha256,
     commit_oid: row.commit_oid,
@@ -239,6 +240,7 @@ CREATE TABLE IF NOT EXISTS attempts(
   model TEXT,
   outcome TEXT,
   failure_class TEXT,
+  reason TEXT,
   duration_ms INTEGER,
   patch_sha256 TEXT,
   commit_oid TEXT,
@@ -421,6 +423,19 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       ]) {
         if (!columns.has(name)) connection.exec(`ALTER TABLE publications ADD COLUMN ${name} ${definition}`);
       }
+      connection.prepare("UPDATE factory_meta SET value='5' WHERE key='schema_version'").run();
+      connection.exec('COMMIT');
+      version = 5;
+    } catch (error) {
+      connection.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  if (version === 5) {
+    const columns = new Set(connection.prepare('PRAGMA table_info(attempts)').all().map((row) => row.name));
+    connection.exec('BEGIN IMMEDIATE');
+    try {
+      if (!columns.has('reason')) connection.exec('ALTER TABLE attempts ADD COLUMN reason TEXT');
       connection.prepare("UPDATE factory_meta SET value=? WHERE key='schema_version'")
         .run(String(FACTORY_SCHEMA_VERSION));
       connection.exec('COMMIT');
@@ -490,6 +505,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
   }
 
   function recordPreflightOutcomes(records, {now = new Date()} = {}) {
+    const observedAt = iso(now);
     const skipped = records.filter((record) => record?.outcome !== 'GO').map((record) => {
       const candidate = record.candidate;
       const live = record.liveState;
@@ -501,7 +517,15 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
         priority: candidate.priority,
         state: 'SKIPPED',
         base_oid: live?.repository?.defaultOid ?? null,
-        live_state: live ?? {},
+        live_state: {
+          ...(live ?? {}),
+          preflight_decision: {
+            version: 1,
+            outcome: String(record.outcome),
+            reasons: Array.isArray(record.reasons) ? record.reasons.map(String) : [],
+            observed_at: observedAt,
+          },
+        },
         issue_snapshot: live?.issue ?? {},
       };
     });
@@ -549,7 +573,8 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
         JOIN tasks t ON t.task_id=a.task_id
         WHERE t.state='WORKING' AND a.finished_at IS NULL`).all();
       const finish = connection.prepare(`UPDATE attempts SET finished_at=?,outcome='FAILED',
-        failure_class='infrastructure',duration_ms=NULL WHERE attempt_id=? AND finished_at IS NULL`);
+        failure_class='infrastructure',reason='recovered after interrupted worker',duration_ms=NULL
+        WHERE attempt_id=? AND finished_at IS NULL`);
       const requeue = connection.prepare(`UPDATE tasks SET state='QUEUED',worker_id=NULL,
         last_error='recovered after interrupted worker',updated_at=? WHERE task_id=? AND state='WORKING'`);
       for (const attempt of attempts) {
@@ -575,9 +600,9 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       if (!attempt) throw new Error(`unknown attempt ${attemptId}`);
       if (attempt.finished_at) throw new Error(`attempt ${attemptId} is already finished`);
       const finishedAt = iso(now);
-      connection.prepare(`UPDATE attempts SET finished_at=?,outcome=?,failure_class=?,duration_ms=?,patch_sha256=?,
+      connection.prepare(`UPDATE attempts SET finished_at=?,outcome=?,failure_class=?,reason=?,duration_ms=?,patch_sha256=?,
         commit_oid=?,verification_json=? WHERE attempt_id=?`).run(
-        finishedAt, outcome, failureClass, durationMs, patchSha256, commitOid,
+        finishedAt, outcome, failureClass, error, durationMs, patchSha256, commitOid,
         verification === null ? null : json(verification), attemptId,
       );
       connection.prepare(`UPDATE tasks SET state=?,last_error=?,worker_id=NULL,updated_at=? WHERE task_id=?`)
