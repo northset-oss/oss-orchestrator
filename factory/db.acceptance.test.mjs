@@ -444,3 +444,122 @@ test('rejected unpublished READY bytes can be replaced by a new verified attempt
   assert.equal(db.getTask(task.task_id).attempt_count, 2);
   assert.equal(db.connection.prepare("SELECT value FROM factory_meta WHERE key='next_mission_number'").get().value, '43');
 });
+
+test('unboarded pending READY bytes can be replaced atomically by a new verified attempt', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-pending-ready-replacement-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'), {missionStart: 42});
+  t.after(() => db.close());
+  const {task, claim} = enqueueAndClaim(db);
+  const first = db.finishVerifiedReady(claim.attempt.attempt_id, {
+    pr_title: 'feat: first verified version',
+    pr_body: 'Implement the first verified version.',
+  }, {
+    patchSha256: `sha256:${'b'.repeat(64)}`,
+    commitOid: 'c'.repeat(40),
+    verification: {ok: true, claim_type: 'feature_implementation'},
+    now: '2026-07-19T12:02:00.000Z',
+  });
+
+  assert.throws(() => db.replacePendingVerifiedReady(first.mission_id, () => {
+    throw new Error('replacement manifest failed');
+  }, {
+    patchSha256: `sha256:${'d'.repeat(64)}`,
+    commitOid: 'e'.repeat(40),
+    verification: {ok: true},
+    now: '2026-07-19T12:03:00.000Z',
+  }), /replacement manifest failed/);
+  assert.deepEqual(db.getReadyItem(first.mission_id), first);
+  assert.equal(db.getTask(task.task_id).attempt_count, 1);
+  assert.equal(db.connection.prepare('SELECT count(*) AS count FROM attempts WHERE task_id=?')
+    .get(task.task_id).count, 1);
+
+  const verification = {
+    ok: true,
+    claim_type: 'feature_implementation',
+    patch_sha256: `sha256:${'f'.repeat(64)}`,
+    commit_oid: '1'.repeat(40),
+  };
+  const replacement = db.replacePendingVerifiedReady(
+    first.mission_id,
+    (missionId, callbackTask, attempt) => {
+      assert.equal(missionId, 'M-042');
+      assert.equal(callbackTask.task_id, task.task_id);
+      assert.equal(callbackTask.state, 'READY');
+      assert.equal(attempt.attempt_number, 2);
+      assert.equal(attempt.outcome, 'VERIFIED');
+      return {
+        pr_title: 'feat: corrected verified version',
+        pr_body: 'Implement the corrected verified version.',
+        patch_sha256: verification.patch_sha256,
+        commit_oid: verification.commit_oid,
+      };
+    },
+    {
+      durationMs: 654,
+      patchSha256: verification.patch_sha256,
+      commitOid: verification.commit_oid,
+      verification,
+      riskTier: 'AMBER',
+      model: 'test-model',
+      now: '2026-07-19T12:04:00.000Z',
+    },
+  );
+
+  assert.equal(replacement.mission_id, first.mission_id);
+  assert.notEqual(replacement.attempt_id, first.attempt_id);
+  assert.equal(replacement.approval_state, 'PENDING');
+  assert.equal(replacement.board_id, null);
+  assert.equal(replacement.risk_tier, 'AMBER');
+  assert.equal(replacement.manifest.pr_title, 'feat: corrected verified version');
+  assert.equal(db.getAttempt(first.attempt_id).commit_oid, 'c'.repeat(40));
+  assert.equal(db.getAttempt(replacement.attempt_id).attempt_number, 2);
+  assert.equal(db.getTask(task.task_id).state, 'READY');
+  assert.equal(db.getTask(task.task_id).attempt_count, 2);
+  assert.equal(db.connection.prepare("SELECT value FROM factory_meta WHERE key='next_mission_number'").get().value, '43');
+});
+
+test('pending READY replacement rejects boarded, settled, published, and non-READY items', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-pending-ready-replacement-guards-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'), {missionStart: 42});
+  t.after(() => db.close());
+  const {task, claim} = enqueueAndClaim(db);
+  const ready = db.finishVerifiedReady(claim.attempt.attempt_id, {
+    pr_title: 'feat: verified version',
+    pr_body: 'Implement the verified version.',
+  }, {
+    patchSha256: `sha256:${'b'.repeat(64)}`,
+    commitOid: 'c'.repeat(40),
+    verification: {ok: true},
+  });
+
+  const replace = () => db.replacePendingVerifiedReady(ready.mission_id, {
+    pr_title: 'feat: replacement',
+    pr_body: 'Implement the replacement.',
+  });
+  db.connection.prepare("UPDATE ready_items SET board_id='B-BOUND' WHERE mission_id=?")
+    .run(ready.mission_id);
+  assert.throws(replace, /unboarded pending READY item/);
+  db.connection.prepare('UPDATE ready_items SET board_id=NULL WHERE mission_id=?').run(ready.mission_id);
+
+  for (const state of ['APPROVED', 'REJECTED', 'SUPERSEDED']) {
+    db.connection.prepare('UPDATE ready_items SET approval_state=? WHERE mission_id=?')
+      .run(state, ready.mission_id);
+    assert.throws(replace, /only a pending READY item/);
+  }
+  db.connection.prepare("UPDATE ready_items SET approval_state='PENDING' WHERE mission_id=?")
+    .run(ready.mission_id);
+
+  db.savePublication(ready.mission_id, {publication_state: 'APPROVED'});
+  assert.throws(replace, /published mission/);
+  db.connection.prepare('DELETE FROM publications WHERE mission_id=?').run(ready.mission_id);
+
+  db.updateTaskState(task.task_id, 'FAILED');
+  assert.throws(replace, /only a READY task/);
+
+  assert.equal(db.getTask(task.task_id).attempt_count, 1);
+  assert.equal(db.connection.prepare('SELECT count(*) AS count FROM attempts WHERE task_id=?')
+    .get(task.task_id).count, 1);
+  assert.equal(db.getReadyItem(ready.mission_id).attempt_id, ready.attempt_id);
+});

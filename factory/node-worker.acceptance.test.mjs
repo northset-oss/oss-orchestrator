@@ -62,12 +62,16 @@ function ok(stdout = '') {
 
 test('N1 scout uses the bounded structured read-only contract', async (t) => {
   const {checkout, task} = await repository(t);
+  task.issue_snapshot.labels = ['good first issue'];
+  task.issue_snapshot.comments = [{author: 'AysajanE', body: 'I would like to work on this.'}];
   let invocation;
   const worker = createNodeWorker({image: IMAGE, codexRunner: async (options) => {
     invocation = options;
     return {
       decision: 'GO', reason: 'small focused correction', test_command: 'node --test test/value.test.mjs',
       target_files: ['src/value.mjs', 'test/value.test.mjs'], estimated_risk: 'GREEN',
+      pre_work_rule: 'Comment before starting.',
+      pre_work_evidence: 'I would like to work on this.', required_checks: [],
     };
   }});
   const result = await worker.handle({
@@ -80,12 +84,61 @@ test('N1 scout uses the bounded structured read-only contract', async (t) => {
   assert.match(invocation.prompt, /Inspect this checkout read-only/);
   assert.match(invocation.prompt, /empty\s+install_command/);
   assert.match(invocation.prompt, /future\s+pull-request number/);
+  assert.match(invocation.prompt, /Existing issue comments/);
+  assert.match(invocation.prompt, /I would like to work on this/);
+  assert.match(invocation.prompt, /pre_work_rule/);
+  assert.match(invocation.prompt, /required_checks/);
   assert.match(invocation.prompt, /Never call GitHub|Do not call GitHub/);
   assert.deepEqual(new Set(SCOUT_SCHEMA.required), new Set(Object.keys(SCOUT_SCHEMA.properties)));
+  assert.equal(result.decision, 'GO');
   assert.deepEqual(result.target_files, ['src/value.mjs', 'test/value.test.mjs']);
 });
 
-test('N1b scout rejects workspace and PnP layouts before model or bootstrap work', async (t) => {
+test('N1b scout skips when mandatory pre-work communication has no issue evidence', async (t) => {
+  const {checkout, task} = await repository(t);
+  task.issue_snapshot.comments = [{author: 'someone-else', body: 'I would like to work on this.'}];
+  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => ({
+    decision: 'GO', reason: 'the patch itself is bounded',
+    test_command: 'node --test test/value.test.mjs && npm test && npm run typecheck',
+    install_command: '', target_files: ['src/value.mjs', 'test/value.test.mjs'],
+    estimated_risk: 'GREEN',
+    pre_work_rule: 'Comment on medium issues before starting work.',
+    pre_work_evidence: 'I would like to work on this.',
+    required_checks: ['npm test', 'npm run typecheck'],
+  })});
+
+  const result = await worker.handle({action: 'scout', task, checkout});
+  assert.equal(result.decision, 'SKIP');
+  assert.match(result.reason, /required pre-work public communication was not completed/);
+  assert.deepEqual(result.required_checks, ['npm test', 'npm run typecheck']);
+});
+
+test('N1c author must bind every required repository check into the verifier command', async (t) => {
+  const {checkout, task} = await repository(t);
+  let invocation;
+  const worker = createNodeWorker({image: IMAGE, codexRunner: async (options) => {
+    invocation = options;
+    return {
+      outcome: 'PATCH', reason: 'implemented focused correction',
+      pr_title: 'fix: return expected value',
+      pr_body: '## Test\n\n`npm test -- test/value.test.mjs && npm run typecheck`',
+      summary: 'Return the expected value.', claim_type: 'regression_fix',
+      test_command: 'npm test -- test/value.test.mjs && npm run typecheck',
+      test_only_paths: ['test/value.test.mjs'], base_failure_contains: 'EXPECTED_TWO',
+      checks: ['npm test -- test/value.test.mjs && npm run typecheck'],
+    };
+  }});
+
+  await assert.rejects(() => worker.handle({
+    action: 'author', task, checkout,
+    scout: {required_checks: ['npm test', 'npm run typecheck'], estimated_risk: 'GREEN'},
+  }), /author test_command omits required repository checks: npm test/);
+  assert.match(invocation.prompt, /pr_title becomes the canonical commit subject/);
+  assert.match(invocation.prompt, /exact\s+command the clean verifier and receipt will bind/);
+  assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');
+});
+
+test('N1d scout rejects workspace and PnP layouts before model or bootstrap work', async (t) => {
   const {checkout, task} = await repository(t);
   const worker = createNodeWorker({image: IMAGE, codexRunner: async () => assert.fail('no model call')});
   await writeFile(path.join(checkout, 'package.json'), JSON.stringify({
