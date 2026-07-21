@@ -153,6 +153,29 @@ test('H3b git clone binds an absolute checkout to the requested base OID', async
   assert.deepEqual(calls[5], ['-C', destination, 'rev-parse', '--verify', 'HEAD^{commit}']);
 });
 
+test('git fetch honors a validated positive integer depth', async (t) => {
+  const directory = await temporary(t, 'factory-git-fetch-depth');
+  const log = path.join(directory, 'git-calls.log');
+  const fakeGit = await executable(directory, 'fake-git.mjs', `
+    import {appendFile} from 'node:fs/promises';
+    await appendFile(process.env.FAKE_GIT_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
+  `);
+  const transport = createGhCliTransport({gitExecutable: fakeGit,
+    env: {...process.env, FAKE_GIT_LOG: log}});
+  await transport({operation: 'git_fetch', repository_path: directory, remote: 'origin',
+    refspec: '+refs/heads/main:refs/remotes/refresh/main', depth: 1});
+  const calls = (await readFile(log, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls, [[
+    '-C', directory, 'fetch', '--no-tags', '--depth=1', '--', 'origin',
+    '+refs/heads/main:refs/remotes/refresh/main',
+  ]]);
+  for (const depth of [0, -1, 1.5, '1']) {
+    await assert.rejects(() => transport({operation: 'git_fetch', repository_path: directory,
+      remote: 'origin', refspec: 'main', depth}), /fetch depth must be a positive integer/);
+  }
+  assert.equal((await readFile(log, 'utf8')).trim().split('\n').length, 1);
+});
+
 test('H3c a git transport timeout is retryable infrastructure', async (t) => {
   const directory = await temporary(t, 'factory-git-timeout');
   const slowGit = await executable(directory, 'slow-git.mjs', 'setTimeout(() => {}, 10_000);');

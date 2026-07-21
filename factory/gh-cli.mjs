@@ -381,7 +381,12 @@ export function createGhCliTransport({
         const repositoryPath = requiredString(request.repository_path, 'repository_path');
         const remote = requiredString(request.remote ?? 'origin', 'fetch remote');
         const refspecs = Array.isArray(request.refspecs) ? request.refspecs : [request.refspec].filter(Boolean);
-        const args = ['-C', repositoryPath, 'fetch', '--no-tags', '--', remote, ...refspecs];
+        if (request.depth !== undefined && (!Number.isInteger(request.depth) || request.depth < 1)) {
+          throw new TypeError('fetch depth must be a positive integer');
+        }
+        const args = ['-C', repositoryPath, 'fetch', '--no-tags'];
+        if (request.depth !== undefined) args.push(`--depth=${request.depth}`);
+        args.push('--', remote, ...refspecs);
         return git(args, {operation: 'git fetch'});
       }
       case 'git_push': {

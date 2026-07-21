@@ -621,6 +621,7 @@ export async function executeFactoryCli(argv, {
               repository_path: context.repository_path,
               remote: `https://github.com/${plan.repository}.git`,
               refspec: `+refs/heads/${plan.base_branch}:refs/remotes/northset-refresh/${plan.base_branch}`,
+              depth: 1,
             }),
           });
           return {base_oid: context.expected_oid ?? live.current_base_oid};

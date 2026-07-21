@@ -672,11 +672,13 @@ test('publish uses the production receipt prepublication adapter by default', as
   let receiptOptions;
   let staleOptions;
   let publicationOptions;
+  const transportRequests = [];
   const receiptPublisher = async () => ({commit_oid: '1'.repeat(40)});
   await executeFactoryCli(['publish', '--board', BOARD], {
     env: {},
     stdout: output().stream,
     dependencies: baseDependencies(db, {
+      transport: async (request) => { transportRequests.push(request); return {status: 200}; },
       github: {finalLiveRecheck: async () => ({clean: true})},
       createSafety: () => ({request: async (request) => request.execute()}),
       createReceiptPublisher: (options) => {
@@ -697,6 +699,14 @@ test('publish uses the production receipt prepublication adapter by default', as
   assert.equal(publicationOptions.receiptPublisher, receiptPublisher);
   assert.equal(typeof publicationOptions.refreshStale, 'function');
   assert.equal(staleOptions.artifactRoot, FACTORY_DEFAULTS.artifactRoot);
+  assert.deepEqual(await staleOptions.fetchBase(
+    {repository: 'owner/repo', base_branch: 'main'},
+    {current_base_oid: 'a'.repeat(40)},
+    {repository_path: '/tmp/repo', expected_oid: 'a'.repeat(40)},
+  ), {base_oid: 'a'.repeat(40)});
+  assert.equal(transportRequests.length, 1);
+  assert.equal(transportRequests[0].operation, 'git_fetch');
+  assert.equal(transportRequests[0].depth, 1);
   assert.equal(db.closed, true);
 });
 
