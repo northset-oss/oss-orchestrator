@@ -74,6 +74,42 @@ function enqueueAndClaim(db) {
   return {task, claim: db.claimNextTask({now: '2026-07-19T12:01:00.000Z'})};
 }
 
+test('one exhausted infrastructure attempt can re-enter only after a fresh enqueue', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-infrastructure-retry-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'));
+  t.after(() => db.close());
+  const record = {
+    candidate: 'owner/repo#123', repository: 'owner/repo', issue_number: 123,
+    profile: 'node', base_oid: 'a'.repeat(40), state: 'QUEUED',
+  };
+  const [task] = db.enqueueTasks([record], {now: '2026-07-19T12:00:00.000Z'});
+  const first = db.claimNextTask({now: '2026-07-19T12:01:00.000Z'});
+  db.finishAttempt(first.attempt.attempt_id, {
+    outcome: 'FAILED', failureClass: 'infrastructure', error: 'clone timed out',
+    now: '2026-07-19T12:02:00.000Z',
+  });
+
+  const [requeued] = db.enqueueTasks([{...record, base_oid: 'b'.repeat(40)}], {
+    now: '2026-07-19T12:03:00.000Z',
+  });
+  assert.equal(requeued.state, 'QUEUED');
+  assert.equal(requeued.base_oid, 'b'.repeat(40));
+  assert.equal(requeued.attempt_count, 1);
+  assert.equal(requeued.last_error, null);
+
+  const second = db.claimNextTask({now: '2026-07-19T12:04:00.000Z'});
+  db.finishAttempt(second.attempt.attempt_id, {
+    outcome: 'FAILED', failureClass: 'worker', error: 'deterministic worker failure',
+    now: '2026-07-19T12:05:00.000Z',
+  });
+  const [terminal] = db.enqueueTasks([record], {now: '2026-07-19T12:06:00.000Z'});
+  assert.equal(terminal.task_id, task.task_id);
+  assert.equal(terminal.state, 'FAILED');
+  assert.equal(terminal.attempt_count, 2);
+  assert.equal(terminal.last_error, 'deterministic worker failure');
+});
+
 test('successful verification closes its attempt and creates READY atomically', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-ready-'));
   t.after(() => rm(root, {recursive: true, force: true}));
@@ -113,6 +149,102 @@ test('successful verification closes its attempt and creates READY atomically', 
     verification,
   });
   assert.equal(db.connection.prepare("SELECT value FROM factory_meta WHERE key='next_mission_number'").get().value, '43');
+});
+
+test('unapproved duplicate work and a stale open board can be superseded without owner decisions', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-supersede-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'), {missionStart: 1});
+  t.after(() => db.close());
+  db.enqueueTasks([
+    {
+      candidate: 'owner/first#1',
+      repository: 'owner/first',
+      issue_number: 1,
+      profile: 'node',
+      base_oid: 'a'.repeat(40),
+    },
+    {
+      candidate: 'owner/second#2',
+      repository: 'owner/second',
+      issue_number: 2,
+      profile: 'node',
+      base_oid: 'b'.repeat(40),
+    },
+  ]);
+  const ready = [];
+  for (let index = 0; index < 2; index += 1) {
+    const claim = db.claimNextTask();
+    ready.push(db.finishVerifiedReady(claim.attempt.attempt_id, {
+      pr_title: `fix: bounded issue ${index + 1}`,
+      pr_body: `Fix bounded issue ${index + 1}.`,
+    }, {
+      patchSha256: `sha256:${String(index + 1).repeat(64)}`,
+      commitOid: String(index + 2).repeat(40),
+      verification: {ok: true},
+    }));
+  }
+  const boardDigest = `sha256:${'e'.repeat(64)}`;
+  db.insertBoard({boardId: 'B-STALE', boardDigest, items: ready});
+  db.replaceReadyManifest(ready[1].mission_id, {
+    ...db.getReadyItem(ready[1].mission_id).manifest,
+    base_oid: 'd'.repeat(40),
+  });
+
+  const closed = db.supersedeBoard(boardDigest, {reason: 'base moved before review'});
+  assert.equal(closed.state, 'SUPERSEDED');
+  assert.equal(db.getCurrentBoard(), null);
+  assert.equal(db.getReadyItem(ready[0].mission_id).board_id, null);
+  assert.equal(db.getTask(ready[0].task_id).state, 'READY');
+  assert.equal(db.getTask(ready[0].task_id).last_error, 'base moved before review');
+  assert.equal(db.getReadyItem(ready[1].mission_id).board_id, null);
+  assert.equal(db.getTask(ready[1].task_id).last_error, null);
+
+  db.replaceReadyManifest(ready[0].mission_id, {
+    ...db.getReadyItem(ready[0].mission_id).manifest,
+    base_oid: 'c'.repeat(40),
+  });
+  assert.equal(db.getTask(ready[0].task_id).state, 'READY');
+  assert.equal(db.getTask(ready[0].task_id).last_error, null);
+  assert.equal(db.getTask(ready[0].task_id).base_oid, 'c'.repeat(40));
+
+  const superseded = db.supersedeReady(ready[1].mission_id, {
+    reason: 'linked merged PR already implements the issue',
+  });
+  assert.equal(superseded.approval_state, 'SUPERSEDED');
+  assert.equal(db.getTask(ready[1].task_id).state, 'SUPERSEDED');
+  assert.equal(db.getTask(ready[1].task_id).last_error, 'linked merged PR already implements the issue');
+  assert.deepEqual(db.listReady({unboarded: true}).map((item) => item.mission_id), [ready[0].mission_id]);
+});
+
+test('a settled publication with a stale error remains eligible for one cleanup observation', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-stale-publication-error-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'), {missionStart: 42});
+  t.after(() => db.close());
+  const {claim} = enqueueAndClaim(db);
+  const ready = db.finishVerifiedReady(claim.attempt.attempt_id, {
+    pr_title: 'fix: bounded issue',
+    pr_body: 'Fix the bounded issue.',
+  }, {
+    patchSha256: `sha256:${'b'.repeat(64)}`,
+    commitOid: 'c'.repeat(40),
+    verification: {ok: true},
+    now: '2026-07-19T12:02:00.000Z',
+  });
+  db.savePublication(ready.mission_id, {
+    publication_state: 'SUBMITTED',
+    attestation_state: 'RECEIPT_ATTESTED',
+    outcome_recorded_at: '2026-07-19T13:00:00.000Z',
+    status_state: 'PUBLISHED',
+    last_error: 'GH_COMMAND_FAILED',
+    last_error_detail: 'temporary status timeout',
+  });
+
+  assert.deepEqual(db.listReconciliationCandidates({limit: 10}).map((item) => item.mission_id),
+    [ready.mission_id]);
+  db.savePublication(ready.mission_id, {last_error: null, last_error_detail: null});
+  assert.deepEqual(db.listReconciliationCandidates({limit: 10}), []);
 });
 
 test('manifest callback failure rolls back attempt, task, READY item, and mission allocation', async (t) => {

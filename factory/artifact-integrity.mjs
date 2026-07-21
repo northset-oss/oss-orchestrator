@@ -95,6 +95,38 @@ function git(repositoryPath, args, {spawn = spawnSync} = {}) {
   return Buffer.from(result.stdout ?? '');
 }
 
+function lines(bytes) {
+  const result = [];
+  let start = 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] !== 0x0a) continue;
+    result.push(bytes.subarray(start, index));
+    start = index + 1;
+  }
+  result.push(bytes.subarray(start));
+  return result;
+}
+
+function exactPatchRepresentation(reviewed, generated) {
+  if (reviewed.equals(generated)) return true;
+  const reviewedLines = lines(reviewed);
+  const generatedLines = lines(generated);
+  if (reviewedLines.length !== generatedLines.length) return false;
+  let compactIndex = false;
+  for (let index = 0; index < reviewedLines.length; index += 1) {
+    if (reviewedLines[index].equals(generatedLines[index])) continue;
+    if ([...reviewedLines[index], ...generatedLines[index]].some((byte) => byte > 0x7f)) return false;
+    const short = reviewedLines[index].toString('ascii')
+      .match(/^index ([0-9a-f]{7,39})\.\.([0-9a-f]{7,39})(.*)$/);
+    const full = generatedLines[index].toString('ascii')
+      .match(/^index ([0-9a-f]{40})\.\.([0-9a-f]{40})(.*)$/);
+    if (!short || !full || short[3] !== full[3] ||
+        !full[1].startsWith(short[1]) || !full[2].startsWith(short[2])) return false;
+    compactIndex = true;
+  }
+  return compactIndex;
+}
+
 /** Rebind mutable review links to the immutable patch, base, commit, and tree before authorization. */
 export function verifyReadyArtifacts(manifest, options = {}) {
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
@@ -131,8 +163,13 @@ export function verifyReadyArtifacts(manifest, options = {}) {
   if (parents.length !== 2 || parents[0] !== commitOid || parents[1] !== baseOid) {
     throw new Error(`${mission} durable commit is not exactly one commit on approved base ${baseOid}`);
   }
-  const generatedPatch = git(repositoryPath, ['diff', '--binary', '--full-index', baseOid, commitOid], options);
-  if (!generatedPatch.equals(patch)) {
+  const generatedPatch = git(repositoryPath, [
+    '-c', 'core.quotePath=true',
+    'diff', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', '--no-color',
+    '--src-prefix=a/', '--dst-prefix=b/', '--diff-algorithm=myers', '--indent-heuristic',
+    '--unified=3', '--no-renames', baseOid, commitOid,
+  ], options);
+  if (!exactPatchRepresentation(patch, generatedPatch)) {
     throw new Error(`${mission} durable patch bytes do not match the approved commit diff`);
   }
   const evidenceAsset = verifyEvidenceAsset(manifest, repositoryPath, baseOid, options);

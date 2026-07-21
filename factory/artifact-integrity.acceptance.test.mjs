@@ -50,12 +50,46 @@ async function fixture(t, missionId = 'M-1000') {
 
 test('durable READY artifacts bind the exact patch, base, commit, and tested tree', async (t) => {
   const {manifest} = await fixture(t);
-  assert.deepEqual(verifyReadyArtifacts(manifest), {
+  const expected = {
     patch_sha256: manifest.patch_sha256,
     base_oid: manifest.base_oid,
     commit_oid: manifest.commit_oid,
     tested_tree_oid: manifest.tested_tree_oid,
+  };
+  assert.deepEqual(verifyReadyArtifacts(manifest), expected);
+  await git(['-C', manifest.repository_path, 'config', 'diff.noprefix', 'true']);
+  assert.deepEqual(verifyReadyArtifacts(manifest), expected);
+});
+
+test('durable READY artifacts accept the exact canonical seven-character index diff', async (t) => {
+  const {manifest} = await fixture(t);
+  const compact = await runBounded('git', [
+    '-C', manifest.repository_path, 'diff', '--binary', '--abbrev=7',
+    manifest.base_oid, manifest.commit_oid,
+  ], {timeoutMs: 30_000});
+  assert.equal(compact.code, 0, compact.stderr);
+  await writeFile(manifest.patch_path, compact.stdout);
+  const compactManifest = {...manifest, patch_sha256: sha256(Buffer.from(compact.stdout))};
+
+  assert.deepEqual(verifyReadyArtifacts(compactManifest), {
+    patch_sha256: compactManifest.patch_sha256,
+    base_oid: manifest.base_oid,
+    commit_oid: manifest.commit_oid,
+    tested_tree_oid: manifest.tested_tree_oid,
   });
+});
+
+test('durable READY artifacts reject a rehashed noncanonical diff', async (t) => {
+  const {manifest} = await fixture(t);
+  const noPrefix = await runBounded('git', [
+    '-C', manifest.repository_path, 'diff', '--binary', '--full-index', '--no-prefix',
+    manifest.base_oid, manifest.commit_oid,
+  ], {timeoutMs: 30_000});
+  assert.equal(noPrefix.code, 0, noPrefix.stderr);
+  await writeFile(manifest.patch_path, noPrefix.stdout);
+  const rehashed = {...manifest, patch_sha256: sha256(Buffer.from(noPrefix.stdout))};
+
+  assert.throws(() => verifyReadyArtifacts(rehashed), /durable patch bytes do not match/);
 });
 
 test('durable READY artifacts bind a commit-pinned PR evidence asset', async (t) => {

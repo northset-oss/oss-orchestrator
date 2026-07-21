@@ -82,6 +82,12 @@ function harness({seed, prState = 'open', merged = false, attestor, statusPublis
       };
     },
     async getPullRequestCommits() { return {commits: [HEAD]}; },
+    async getPullRequestFollowUp() {
+      return {
+        number: 17, url: 'https://github.com/upstream/project/pull/17', author_login: 'AysajanE',
+        review_decision: null, comments: [], reviews: [], threads: [], history_truncated: false,
+      };
+    },
     async getCommitStatus() { return {found: true, state: 'SUCCESS'}; },
     async getArtifactAttestation() { return {found: false}; },
     async createPullRequest() { prohibited.create += 1; throw new Error('must not create'); },
@@ -157,6 +163,30 @@ test('status batch failure is recoverable and retries once on the next bounded i
   assert.equal(statusAttempts, 2);
   assert.equal(fixture.prohibited.create, 0);
   assert.equal(fixture.prohibited.close, 0);
+});
+
+test('a successful complete observation clears a resolved transient error', async () => {
+  const fixture = harness({
+    seed: publication({
+      pr_state: 'OPEN',
+      ci_state: 'SUCCESS',
+      attestation_state: 'RECEIPT_ATTESTED',
+      attestation_url: 'https://example.test/attestations/1',
+      attested_at: '2026-07-19T13:00:00.000Z',
+      status_state: 'PUBLISHED',
+      status_url: 'https://example.test/M-001/publication.json',
+      last_error: 'GH_COMMAND_FAILED',
+      last_error_detail: 'temporary status timeout',
+    }),
+    statusPublisher: async () => { throw new Error('unchanged facts must not republish status'); },
+  });
+
+  const result = await reconcilePublicationBatch(fixture);
+  const saved = await fixture.db.getPublication('M-001');
+  assert.equal(result.processed, 1);
+  assert.equal(saved.last_error, null);
+  assert.equal(saved.last_error_detail, null);
+  assert.equal(saved.status_state, 'PUBLISHED');
 });
 
 test('merged outcome releases the repository exactly once across restarts and publishes one final status', async () => {
@@ -235,6 +265,80 @@ test('a PR head mismatch is persisted as pending and cannot publish or mutate Gi
   assert.equal(result.results[0].code, 'RECONCILIATION_PR_HEAD_MISMATCH');
   assert.match((await fixture.db.getPublication('M-001')).last_error, /RECONCILIATION_PR_HEAD_MISMATCH/);
   assert.equal(fixture.safetyCalls.filter((call) => call.kind === 'git_push').length, 0);
+  assert.equal(fixture.prohibited.create, 0);
+  assert.equal(fixture.prohibited.close, 0);
+});
+
+test('follow-up summary exposes contributor comments without relabeling maintainer activity', async () => {
+  const fixture = harness({
+    attestor: async () => ({found: false}),
+    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
+      status_url: `https://example.test/${item.mission_id}/publication.json`,
+    }])),
+  });
+  fixture.github.getPullRequestFollowUp = async () => ({
+    number: 17,
+    url: 'https://github.com/upstream/project/pull/17',
+    author_login: 'AysajanE',
+    review_decision: 'CHANGES_REQUESTED',
+    comments: [{
+      author_login: 'AysajanE', author_type: 'User', author_association: 'NONE',
+      url: 'https://github.com/upstream/project/pull/17#issuecomment-3',
+      body: 'Implemented the requested change.', created_at: '2026-07-19T19:51:40Z',
+      updated_at: '2026-07-19T19:51:40Z',
+    }, {
+      author_login: 'Jo-Con-El', author_type: 'User', author_association: 'CONTRIBUTOR',
+      url: 'https://github.com/upstream/project/pull/17#issuecomment-4',
+      body: 'Please leave a note on the issue before starting.', created_at: '2026-07-19T22:01:10Z',
+      updated_at: '2026-07-19T22:01:10Z',
+    }, {
+      author_login: 'release-helper[bot]', author_type: 'Bot', author_association: 'CONTRIBUTOR',
+      url: 'https://github.com/upstream/project/pull/17#issuecomment-5',
+      body: 'Automated status.', created_at: '2026-07-19T22:02:10Z',
+      updated_at: '2026-07-19T22:02:10Z',
+    }],
+    reviews: [{
+      author_login: 'reviewer-one', author_type: 'User', author_association: 'MEMBER',
+      url: 'https://github.com/upstream/project/pull/17#pullrequestreview-1',
+      body: 'Feature is not correctly covered.', state: 'CHANGES_REQUESTED',
+      submitted_at: '2026-07-13T09:42:13Z', commit_oid: 'a'.repeat(40),
+    }, {
+      author_login: 'reviewer-two', author_type: 'User', author_association: 'MEMBER',
+      url: 'https://github.com/upstream/project/pull/17#pullrequestreview-2',
+      body: '', state: 'APPROVED', submitted_at: '2026-07-19T21:46:36Z', commit_oid: HEAD,
+    }],
+    threads: [{
+      is_resolved: false, is_outdated: true, path: 'src/index.mjs', line: null, original_line: 12,
+      history_truncated: false,
+      comments: [{
+        author_login: 'reviewer-two', author_type: 'User', author_association: 'MEMBER',
+        url: 'https://github.com/upstream/project/pull/17#discussion_r1',
+        body: 'Please simplify this.', created_at: '2026-07-19T19:30:50Z',
+        updated_at: '2026-07-19T19:30:50Z',
+      }],
+    }],
+    history_truncated: true,
+  });
+
+  const result = await reconcilePublicationBatch(fixture);
+  const followUp = result.results[0].follow_up;
+  assert.equal(followUp.review_decision, 'CHANGES_REQUESTED');
+  assert.deepEqual(followUp.latest_reviews_by_maintainer.map((review) => review.state),
+    ['CHANGES_REQUESTED', 'APPROVED']);
+  assert.equal(followUp.author_comments[0].body, 'Implemented the requested change.');
+  assert.deepEqual(followUp.external_comments.map((comment) => comment.author_login),
+    ['Jo-Con-El', 'reviewer-two']);
+  assert.equal(followUp.external_comments[0].author_association, 'CONTRIBUTOR');
+  assert.equal(followUp.maintainer_comments.length, 0);
+  assert.equal(followUp.unresolved_threads[0].is_outdated, true);
+  assert.equal(followUp.latest_change_request_at, '2026-07-13T09:42:13Z');
+  assert.equal(followUp.latest_author_activity_at, '2026-07-19T19:51:40Z');
+  assert.equal(followUp.latest_external_activity_at, '2026-07-19T22:01:10Z');
+  assert.equal(followUp.author_activity_after_latest_change_request, true);
+  assert.equal(followUp.history_truncated, true);
+  assert.equal(result.results[0].follow_up_error, null);
+  assert.ok(fixture.safetyCalls.some((call) =>
+    call.operation === 'reconcile_get_pull_request_follow_up' && call.kind === 'read'));
   assert.equal(fixture.prohibited.create, 0);
   assert.equal(fixture.prohibited.close, 0);
 });

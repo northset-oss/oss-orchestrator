@@ -166,6 +166,8 @@ test('S1 clean moved-base refresh keeps the mission and approved artifact while 
   assert.deepEqual(next.verification.test_only_paths, ['test/value.test.mjs']);
   assert.equal(next.patch_sha256, next.verification.patch_sha256);
   assert.equal(next.tested_tree_oid, next.verification.tested_tree_oid);
+  assert.equal(next.verification_path, path.join(path.dirname(next.repository_path), 'verification.json'));
+  assert.deepEqual(JSON.parse(await readFile(next.verification_path, 'utf8')), next.verification);
   assert.equal(next.changed_lines, next.verification.changed_lines);
   assert.equal(next.receipt_url, receiptUrlFor('M-1200', next.commit_oid));
   assert.equal(next.pr_body, fixture.manifest.pr_body.replaceAll(

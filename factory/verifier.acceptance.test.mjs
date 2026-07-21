@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  assertDcoIdentity,
   assertPatchCommitBinding,
   bootstrapDependencies,
   buildProof,
@@ -55,6 +56,20 @@ function fakeRunner({base = 1, patched = 0, onPlan = null} = {}) {
       : {code: patched, stdout: 'patched', stderr: patched ? 'failed' : ''};
   };
 }
+
+test('commit identity rejects the personal Gmail fallback', async (t) => {
+  const fixture = await makeGitFixture(t);
+  await git(fixture.root,
+    '-c', 'user.name=Aysajan Eziz',
+    '-c', 'user.email=aysajan1986@gmail.com',
+    'commit', '--amend', '--no-edit', '--reset-author');
+  const commitOid = await git(fixture.root, 'rev-parse', 'HEAD');
+
+  await assert.rejects(
+    () => assertDcoIdentity(fixture.root, commitOid),
+    /commit identity must be Aysajan Eziz <aeziz@northset\.ai>/,
+  );
+});
 
 function input(fixture, claimType) {
   return {
@@ -127,6 +142,17 @@ test('V1b proof v2 separates executed evidence from declared checks that were no
   }]);
   assert.deepEqual(proof.limitations, ['The full npm test suite was not executed.']);
   assert.equal(proof.executed_commands.some((command) => /npm test/.test(command.command)), false);
+
+  assert.throws(() => buildProof({
+    task: {task_id: 'TASK-1', candidate: 'owner/repo#1', repository: 'owner/repo', issue_number: 1},
+    verification,
+    manifest: {
+      base_oid: fixture.baseOid,
+      checks: ['node --test'],
+      checks_not_run: ['repository-wide checks were not rerun'],
+      receipt_claim: {type: 'regression_fix', statement: 'Focused regression evidence only.'},
+    },
+  }), /checks_not_run entries require nonblank check and reason strings/);
 });
 
 test('V2 existing check repair records an existing failure and patched success', async (t) => {

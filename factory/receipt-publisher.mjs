@@ -380,7 +380,14 @@ function gitFailure(operation, result) {
     return new ReceiptPublisherError(`${operation} exceeded the output limit`, 'RECEIPT_GIT_OUTPUT_LIMIT', result);
   }
   const detail = String(result.stderr || result.stdout || `exit ${result.code}`).trim();
-  return new ReceiptPublisherError(`${operation} failed: ${detail}`, 'RECEIPT_GIT_FAILED', result);
+  const error = new ReceiptPublisherError(`${operation} failed: ${detail}`, 'RECEIPT_GIT_FAILED', result);
+  const match = /(?:requested URL returned error:\s*|\bHTTP(?:\/\S+)?\s+)([45][0-9]{2})\b/i.exec(detail);
+  if (match) {
+    error.httpStatus = Number(match[1]);
+    error.status = error.httpStatus;
+    error.headers = {};
+  }
+  return error;
 }
 
 function commandRunner({run, spawnImpl, timeoutMs, maxOutputBytes, gitExecutable}) {

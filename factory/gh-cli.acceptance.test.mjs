@@ -153,7 +153,18 @@ test('H3b git clone binds an absolute checkout to the requested base OID', async
   assert.deepEqual(calls[5], ['-C', destination, 'rev-parse', '--verify', 'HEAD^{commit}']);
 });
 
-test('H3c a git HTTPS 403 pauses the production safety queue', async (t) => {
+test('H3c a git transport timeout is retryable infrastructure', async (t) => {
+  const directory = await temporary(t, 'factory-git-timeout');
+  const slowGit = await executable(directory, 'slow-git.mjs', 'setTimeout(() => {}, 10_000);');
+  const transport = createGhCliTransport({gitExecutable: slowGit, timeoutMs: 40});
+  await assert.rejects(() => transport({
+    operation: 'git_clone', repository: 'upstream/project',
+    destination: path.join(directory, 'checkout'),
+  }), (error) => error instanceof GhCliError && error.code === 'ETIMEDOUT' &&
+    error.infrastructure === true && error.transient === true);
+});
+
+test('H3d a git HTTPS 403 pauses the production safety queue', async (t) => {
   const directory = await temporary(t, 'factory-git-forbidden');
   const fakeGit = await executable(directory, 'forbidden-git.mjs', `
     process.stderr.write("fatal: unable to access 'https://github.com/northset/project.git/': " +
@@ -307,6 +318,7 @@ test('H6 final live recheck accepts unchanged clean state and explains concrete 
         ref: {target: {oid: baseOid}},
         issue: {
           state: 'OPEN', locked: false,
+          labels: {nodes: [{name: 'help wanted'}]},
           assignees: {nodes: [], pageInfo: {hasNextPage: false}},
           comments: {pageInfo: {hasPreviousPage: false}, nodes: []},
           timelineItems: {pageInfo: {hasPreviousPage: false}, nodes: []},
@@ -362,6 +374,12 @@ test('H6 final live recheck accepts unchanged clean state and explains concrete 
   assert.match(blocked.reason, /linked open competing PR exists: #44/);
   assert.match(blocked.reason, /active external claim by contributor/);
   assert.match(blocked.reason, /another open PR/);
+
+  response = structuredClone(cleanResponse);
+  response.data.repository.issue.labels.nodes = [];
+  const uninvited = await github.finalLiveRecheck(plan);
+  assert.equal(uninvited.clean, false);
+  assert.match(uninvited.reason, /invitation label or policy is missing/);
 });
 
 test('H6b final live recheck recognizes a maintainer opt-out and emits a manual cooldown', async () => {
@@ -374,6 +392,7 @@ test('H6b final live recheck recognizes a maintainer opt-out and emits a manual 
         ref: {target: {oid: baseOid}},
         issue: {
           state: 'OPEN', locked: false,
+          labels: {nodes: [{name: 'good first issue'}]},
           assignees: {nodes: [{login: 'AysajanE'}], pageInfo: {hasNextPage: false}},
           comments: {pageInfo: {hasPreviousPage: false}, nodes: [{
             body: 'Please do not submit a pull request for this issue.',
@@ -442,6 +461,33 @@ test('H7b deep overlap tolerates only missing textual issue or PR references', a
   const live = {repository: {nameWithOwner: 'upstream/project'}, issue: {number: 9,
     title: 'Follow up on #1791', body: ''}};
   assert.deepEqual(await github.deepOverlap(live), {clean: true, reason: null});
+});
+
+test('H7c deep overlap rejects a merged cross-reference whose title matches the issue contract', async () => {
+  let graphqlCalls = 0;
+  const transport = fakeTransport({
+    rest: async () => structured({}),
+    graphql: async () => { graphqlCalls += 1; return structured({data: {}}); },
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  const blocked = await github.deepOverlap({
+    repository: {nameWithOwner: 'ajaxorg/ace'},
+    issue: {
+      number: 5256,
+      title: 'Add support for numeric separator in Javascript and PHP',
+      body: '',
+      crossReferencedPrs: [{
+        number: 5930,
+        state: 'MERGED',
+        title: 'Numeric separator for PHP and javascript modes highlight',
+        url: 'https://github.com/ajaxorg/ace/pull/5930',
+      }],
+    },
+  });
+  assert.equal(blocked.clean, false);
+  assert.match(blocked.reason, /merged overlapping PR.*5930/);
+  assert.equal(graphqlCalls, 0);
 });
 
 test('H8 safety governor wraps semantic actions and recognizes structured CLI throttles', async (t) => {
@@ -678,6 +724,57 @@ test('H10f a failed status read stops before requesting Check Runs', async () =>
   await assert.rejects(() => github.getCommitStatus({repository: 'upstream/project', oid: 'b'.repeat(40)}),
     (error) => error instanceof GhCliError && error.status === 403);
   assert.equal(requests, 1);
+});
+
+test('H10g follow-up read preserves exact review and comment facts and reports truncation', async () => {
+  const transport = fakeTransport({
+    rest: async () => structured({}),
+    graphql: async ({query, variables}) => {
+      assert.match(query, /FactoryPullRequestFollowUp/);
+      assert.match(query, /reviewThreads\(first: 20\)/);
+      assert.match(query, /comments\(last: 20\)/);
+      assert.deepEqual(variables, {owner: 'upstream', name: 'project', number: 17});
+      return structured({data: {repository: {
+        nameWithOwner: 'upstream/project',
+        pullRequest: {
+          number: 17, url: 'https://github.com/upstream/project/pull/17',
+          reviewDecision: 'CHANGES_REQUESTED', author: {login: 'AysajanE'},
+          comments: {pageInfo: {hasPreviousPage: false}, nodes: [{
+            url: 'https://github.com/upstream/project/pull/17#issuecomment-2',
+            body: 'Exact author response.', createdAt: '2026-07-20T14:00:00Z',
+            updatedAt: '2026-07-20T14:00:00Z', authorAssociation: 'NONE',
+            author: {login: 'AysajanE', __typename: 'User'},
+          }]},
+          reviews: {pageInfo: {hasPreviousPage: false}, nodes: [{
+            url: 'https://github.com/upstream/project/pull/17#pullrequestreview-1',
+            body: 'Please test this manually.', state: 'CHANGES_REQUESTED',
+            submittedAt: '2026-07-20T12:00:00Z', authorAssociation: 'MEMBER',
+            commit: {oid: 'a'.repeat(40)}, author: {login: 'maintainer', __typename: 'User'},
+          }]},
+          reviewThreads: {pageInfo: {hasNextPage: false}, nodes: [{
+            isResolved: false, isOutdated: true, path: 'src/index.mjs', line: null, originalLine: 7,
+            comments: {pageInfo: {hasPreviousPage: true}, nodes: [{
+              url: 'https://github.com/upstream/project/pull/17#discussion_r1',
+              body: 'Keep this exact request.', createdAt: '2026-07-20T12:01:00Z',
+              updatedAt: '2026-07-20T12:01:00Z', authorAssociation: 'MEMBER',
+              author: {login: 'maintainer', __typename: 'User'},
+            }]},
+          }]},
+        },
+      }}});
+    },
+    git: async () => ({code: 0, status: 200, httpStatus: 200, stdout: '', stderr: ''}),
+  });
+  const github = createGhCliPublisherAdapter({transport});
+  const result = await github.getPullRequestFollowUp({repository: 'upstream/project', number: 17});
+  assert.equal(result.review_decision, 'CHANGES_REQUESTED');
+  assert.equal(result.author_login, 'AysajanE');
+  assert.equal(result.reviews[0].commit_oid, 'a'.repeat(40));
+  assert.equal(result.comments[0].body, 'Exact author response.');
+  assert.equal(result.threads[0].comments[0].url,
+    'https://github.com/upstream/project/pull/17#discussion_r1');
+  assert.equal(result.threads[0].is_outdated, true);
+  assert.equal(result.history_truncated, true);
 });
 
 test('H11 missing combined status or attestation remains factual and pending', async () => {

@@ -372,7 +372,14 @@ function readableCheck(check) {
 function proofChecksNotRun(manifest, verification) {
   const executed = new Set((verification.executed_commands ?? []).map((entry) =>
     canonical(commandValue(entry.command))));
-  const explicit = Array.isArray(manifest.checks_not_run) ? manifest.checks_not_run : [];
+  const explicit = (Array.isArray(manifest.checks_not_run) ? manifest.checks_not_run : []).map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+        typeof entry.check !== 'string' || !entry.check.trim() ||
+        typeof entry.reason !== 'string' || !entry.reason.trim()) {
+      throw new Error('checks_not_run entries require nonblank check and reason strings');
+    }
+    return {check: entry.check.trim(), reason: entry.reason.trim()};
+  });
   const inferred = (Array.isArray(manifest.checks) ? manifest.checks : [])
     .filter((check) => {
       const command = checkCommand(check);

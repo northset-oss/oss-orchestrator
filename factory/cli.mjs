@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+import {mkdir, realpath} from 'node:fs/promises';
 import path from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import {fileURLToPath} from 'node:url';
 
 import {approveBoard, createBoardIfDue, renderBoard} from './board.mjs';
@@ -30,7 +32,7 @@ export const FACTORY_DEFAULTS = Object.freeze({
   receiptRemote: 'https://github.com/northset-oss/verification-pilot.git',
 });
 
-const COMMANDS = new Set(['run', 'board', 'approve', 'publish', 'github-status', 'github-resume']);
+const COMMANDS = new Set(['run', 'board', 'approve', 'publish', 'reconcile', 'github-status', 'github-resume']);
 const COMMON_VALUE_FLAGS = new Set(['--db', '--pause-file', '--gh-bin']);
 const COMMAND_VALUE_FLAGS = Object.freeze({
   run: new Set(['--lake', '--profile', '--workers', '--board-size', '--board-max-age-minutes',
@@ -38,6 +40,7 @@ const COMMAND_VALUE_FLAGS = Object.freeze({
   board: new Set(),
   approve: new Set(['--board', '--ids', '--reject-ids', '--approved-by']),
   publish: new Set(['--board', '--receipt-remote', '--artifact-root']),
+  reconcile: new Set(['--limit', '--receipt-remote']),
   'github-status': new Set(),
   'github-resume': new Set(['--reason', '--cleared-by', '--repository']),
 });
@@ -46,9 +49,50 @@ const COMMAND_BOOLEAN_FLAGS = Object.freeze({
   board: new Set(),
   approve: new Set(),
   publish: new Set(),
+  reconcile: new Set(),
   'github-status': new Set(),
   'github-resume': new Set(['--acknowledge-forbidden']),
 });
+
+async function canonicalDatabasePath(database) {
+  const resolved = path.resolve(database);
+  try {
+    return await realpath(resolved);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    await mkdir(path.dirname(resolved), {recursive: true});
+    return path.join(await realpath(path.dirname(resolved)), path.basename(resolved));
+  }
+}
+
+export async function acquireFactoryRunLock(database) {
+  const canonical = await canonicalDatabasePath(database);
+  const lockPath = `${canonical}.run-lock.sqlite`;
+  const connection = new DatabaseSync(lockPath);
+  try {
+    connection.exec('PRAGMA busy_timeout = 0');
+    connection.exec('BEGIN EXCLUSIVE');
+  } catch (error) {
+    connection.close();
+    if (/database is locked/i.test(error.message)) {
+      throw new Error(`factory run already active for ${canonical}`);
+    }
+    throw error;
+  }
+  let released = false;
+  return {
+    path: lockPath,
+    async release() {
+      if (released) return;
+      released = true;
+      try {
+        connection.exec('ROLLBACK');
+      } finally {
+        connection.close();
+      }
+    },
+  };
+}
 
 function requiredValue(argv, index, flag) {
   const value = argv[index + 1];
@@ -106,7 +150,7 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
   const values = [...argv];
   const command = values.shift();
   if (!COMMANDS.has(command)) {
-    throw new Error('command must be run, board, approve, publish, github-status, or github-resume');
+    throw new Error('command must be run, board, approve, publish, reconcile, github-status, or github-resume');
   }
   const allowedValues = new Set([...COMMON_VALUE_FLAGS, ...COMMAND_VALUE_FLAGS[command]]);
   const allowedBooleans = COMMAND_BOOLEAN_FLAGS[command];
@@ -192,6 +236,14 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
         FACTORY_DEFAULTS.receiptRemote,
       artifactRoot: pathValue(parsed.get('--artifact-root') ?? env.OSS_FACTORY_ARTIFACT_ROOT,
         FACTORY_DEFAULTS.artifactRoot),
+    };
+  }
+  if (command === 'reconcile') {
+    return {
+      ...common,
+      limit: positiveInteger(parsed.get('--limit') ?? '30', '--limit', 1000),
+      receiptRemote: parsed.get('--receipt-remote') ?? env.OSS_FACTORY_RECEIPT_REMOTE ??
+        FACTORY_DEFAULTS.receiptRemote,
     };
   }
   if (command === 'github-resume') {
@@ -335,6 +387,27 @@ export async function executeFactoryCli(argv, {
 
   const db = deps.openDb(options.database);
   try {
+    if (options.command === 'reconcile') {
+      const safety = deps.createSafety({
+        pauseFile: options.pauseFile,
+        transport: safetyTransport,
+        repositoryState: typeof db.getPublicActionState === 'function'
+          ? db.getPublicActionState.bind(db) : db,
+      });
+      const github = dependencies.github ?? deps.createPublisherAdapter({transport});
+      const statusPublisher = dependencies.receiptStatusPublisher ?? deps.createReceiptStatusPublisher({
+        remoteUrl: options.receiptRemote,
+      });
+      const result = await deps.reconcilePublicationBatch({
+        db,
+        github,
+        safety,
+        statusPublisher,
+        limit: options.limit,
+      });
+      printJson(stdout, result);
+      return result;
+    }
     if (options.command === 'run') {
       const safety = deps.createSafety({
         pauseFile: options.pauseFile,
@@ -369,13 +442,19 @@ export async function executeFactoryCli(argv, {
           throw new Error(`${task?.task_id ?? 'task'} cannot clone without an exact base OID`);
         }
         const destination = path.join(allocatedRoot, 'repository');
-        const result = await transport({
-          operation: 'git_clone',
+        const result = await safety.request({
+          priority: 'live_preflight',
+          kind: 'read',
+          operation: 'checkout_exact_base',
           repository: task.repository,
-          destination,
-          base_oid: task.base_oid,
-          task_id: task.task_id,
-          attempt_id: attempt?.attempt_id,
+          execute: () => transport({
+            operation: 'git_clone',
+            repository: task.repository,
+            destination,
+            base_oid: task.base_oid,
+            task_id: task.task_id,
+            attempt_id: attempt?.attempt_id,
+          }),
         });
         if (result?.base_oid !== task.base_oid) {
           throw new Error(`safe checkout returned base ${result?.base_oid ?? 'missing'}, expected ${task.base_oid}`);
@@ -400,6 +479,7 @@ export async function executeFactoryCli(argv, {
       let sourceFailures = 0;
       let lastSourceError = null;
       let lastCycle = null;
+      let stopReason = null;
       const reconciliation = {runs: 0, processed: 0, failures: 0, paused: 0, last_error: null};
       let nextReconciliationAt = 0;
       while (!signal?.aborted) {
@@ -438,6 +518,10 @@ export async function executeFactoryCli(argv, {
         claimed += Number(lastCycle?.claimed ?? 0);
         completed += lastCycle?.results?.length ?? 0;
         deps.createBoard(db, boardPolicy);
+        if (lastCycle?.results?.some((item) => item?.code === 'MODEL_PROVIDER_UNAVAILABLE')) {
+          stopReason = 'MODEL_PROVIDER_UNAVAILABLE';
+          break;
+        }
         const reconciliationDue = Date.now() >= nextReconciliationAt;
         if (typeof db.listReconciliationCandidates === 'function' && reconciliationDue) {
           try {
@@ -472,6 +556,7 @@ export async function executeFactoryCli(argv, {
         claimed,
         completed,
         stopped: signal?.aborted === true,
+        stop_reason: stopReason,
         source_failures: sourceFailures,
         last_source_error: lastSourceError,
         reconciliation,
@@ -554,18 +639,25 @@ export async function executeFactoryCli(argv, {
 
 export async function main(argv = process.argv.slice(2), options = {}) {
   const controller = !options.signal && argv[0] === 'run' ? new AbortController() : null;
+  const lockingCommand = argv[0] === 'run' || argv[0] === 'reconcile';
+  let runLock = null;
   const stop = () => controller.abort();
   if (controller) {
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
   }
   try {
+    if (lockingCommand) {
+      const runOptions = parseFactoryCliArgs(argv, {env: options.env ?? process.env});
+      runLock = await acquireFactoryRunLock(runOptions.database);
+    }
     await executeFactoryCli(argv, {...options, signal: options.signal ?? controller?.signal ?? null});
     return 0;
   } catch (error) {
     (options.stderr ?? process.stderr).write(`${error.message}\n`);
     return 1;
   } finally {
+    await runLock?.release();
     if (controller) {
       process.removeListener('SIGINT', stop);
       process.removeListener('SIGTERM', stop);

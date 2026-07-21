@@ -216,7 +216,13 @@ export function buildPreflightQuery(candidates, {northsetLogin = 'AysajanE'} = {
               ... on CrossReferencedEvent {
                 source {
                   __typename
-                  ... on PullRequest { number title url state isDraft repository { nameWithOwner } }
+                  ... on PullRequest {
+                    number title url state isDraft
+                    repository { nameWithOwner }
+                    closingIssuesReferences(first: 20) {
+                      nodes { number repository { nameWithOwner } }
+                    }
+                  }
                 }
               }
             }
@@ -261,6 +267,10 @@ export function normalizePreflight(candidate, data) {
       state: pr.state,
       draft: Boolean(pr.isDraft),
       repository: pr.repository?.nameWithOwner ?? null,
+      closesIssue: (pr.closingIssuesReferences?.nodes ?? []).some((closed) =>
+        Number(closed?.number) === Number(issue.number) &&
+        String(closed?.repository?.nameWithOwner ?? '').toLowerCase() ===
+          String(repository?.nameWithOwner ?? candidate.repository).toLowerCase()),
     }));
   return {
     candidate,
@@ -312,6 +322,10 @@ function isAlreadyInDevelopment(labels) {
   return labels.some((label) => normalizedLabel(label) === 'in develop');
 }
 
+function isUnapproved(labels) {
+  return labels.some((label) => normalizedLabel(label) === 'unapproved');
+}
+
 function recentExternalClaim(comments, northsetLogin, now) {
   const cutoff = now.getTime() - 45 * DAY_MS;
   return comments.find((comment) => {
@@ -334,13 +348,19 @@ export function evaluatePreflight(live, {northsetLogin = 'AysajanE', now = new D
     .filter((login) => login.toLowerCase() !== northsetLogin.toLowerCase());
   if (externalAssignees.length) reasons.push(`issue is assigned to ${externalAssignees.join(', ')}`);
   if (issue && !hasInvitation(live.candidate, issue.labels)) reasons.push('invitation label or policy is missing');
+  if (issue && isUnapproved(issue.labels)) reasons.push('issue is marked unapproved by the repository');
   if (issue && isAlreadyInDevelopment(issue.labels)) reasons.push('issue is already implemented in the development branch');
   if (repository?.archived || repository?.fork) reasons.push('repository is archived or forked');
   if (repository && !repository.hasRootPackageJson) reasons.push('root package.json is missing');
   if (repository?.unsupportedNodeLayout) reasons.push(repository.unsupportedNodeLayout);
   if (repository?.northsetOpenPrs > 0) reasons.push('Northset already has an open PR in the repository');
   const openLinked = (issue?.crossReferencedPrs ?? []).filter((pr) => pr.state === 'OPEN');
+  const mergedLinked = (issue?.crossReferencedPrs ?? [])
+    .filter((pr) => pr.state === 'MERGED' && pr.closesIssue === true);
   if (openLinked.length) reasons.push(`exact linked open PR exists: ${openLinked.map((pr) => pr.url).join(', ')}`);
+  if (mergedLinked.length) {
+    reasons.push(`linked merged PR already implements the issue: ${mergedLinked.map((pr) => pr.url).join(', ')}`);
+  }
   const claim = issue ? recentExternalClaim(issue.comments, northsetLogin, now) : null;
   if (claim) reasons.push(`recent external claimant: ${claim.author}`);
   if (repository && !/^[0-9a-f]{40}$/i.test(repository.defaultOid ?? '')) reasons.push('current default-branch OID is unavailable');
@@ -432,10 +452,14 @@ export function createSource({lakePath = 'candidate_lake.sqlite', query, db, git
       const active = known.filter((task) => ['QUEUED', 'WORKING'].includes(task.state)).length;
       const available = Math.max(0, targetDepth - active);
       if (available === 0) return {candidates: [], results: [], enqueued: []};
+      const retryable = new Set(known.filter((task) => task.state === 'FAILED' &&
+        task.last_failure_class === 'infrastructure' && Number(task.attempt_count) < 2)
+        .map((task) => canonicalCandidate(task.candidate)));
       const candidates = await this.select({
         ...options,
         limit: available,
-        excludeCandidates: known.map((task) => task.candidate),
+        excludeCandidates: known.filter((task) => !retryable.has(canonicalCandidate(task.candidate)))
+          .map((task) => task.candidate),
       });
       const results = await this.preflight(candidates, options);
       await db?.recordPreflightOutcomes?.(results, {now: options.now});

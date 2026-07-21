@@ -1,14 +1,112 @@
 import assert from 'node:assert/strict';
+import {mkdir, mkdtemp, rm, symlink} from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import {
+  acquireFactoryRunLock,
   FACTORY_DEFAULTS,
   executeFactoryCli,
+  main,
   parseFactoryCliArgs,
 } from './cli.mjs';
 
 const BOARD = `sha256:${'a'.repeat(64)}`;
+
+test('run lock rejects a live duplicate, canonicalizes aliases, and releases for reuse', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-run-lock-test-'));
+  const realRoot = path.join(root, 'real');
+  const aliasRoot = path.join(root, 'alias');
+  await mkdir(realRoot);
+  await symlink(realRoot, aliasRoot);
+  const database = path.join(realRoot, 'factory.sqlite');
+  const alias = path.join(aliasRoot, 'factory.sqlite');
+  let first;
+  let recovered;
+  try {
+    first = await acquireFactoryRunLock(database);
+    await assert.rejects(
+      () => acquireFactoryRunLock(alias),
+      /already active/,
+    );
+
+    await first.release();
+    recovered = await acquireFactoryRunLock(alias);
+  } finally {
+    await recovered?.release();
+    await first?.release();
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('run lock creates a missing database parent', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-run-lock-parent-test-'));
+  let lock;
+  try {
+    const database = path.join(root, 'missing', 'nested', 'factory.sqlite');
+    lock = await acquireFactoryRunLock(database);
+    assert.equal(path.basename(lock.path), 'factory.sqlite.run-lock.sqlite');
+  } finally {
+    await lock?.release();
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('main releases the run lock after success and failure', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-main-lock-test-'));
+  const database = path.join(root, 'factory.sqlite');
+  const argv = ['run', '--db', database, '--once'];
+  let lock;
+  try {
+    const successDb = fakeDb({stats: () => ({tasks: 0})});
+    const success = await main(argv, {
+      env: {},
+      stdout: output().stream,
+      stderr: output().stream,
+      dependencies: baseDependencies(successDb, {
+        source: {fill: async () => ({candidates: [], results: [], enqueued: []})},
+        createBoard: () => null,
+        runCycle: async () => ({claimed: 0, results: []}),
+      }),
+    });
+    assert.equal(success, 0);
+    lock = await acquireFactoryRunLock(database);
+    await lock.release();
+    lock = null;
+
+    const stderr = output();
+    const failure = await main(argv, {
+      env: {},
+      stdout: output().stream,
+      stderr: stderr.stream,
+      dependencies: baseDependencies(null, {
+        openDb: () => { throw new Error('injected open failure'); },
+      }),
+    });
+    assert.equal(failure, 1);
+    assert.match(stderr.read(), /injected open failure/);
+    lock = await acquireFactoryRunLock(database);
+  } finally {
+    await lock?.release();
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('standalone reconcile shares the factory run lock', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-reconcile-lock-test-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const database = path.join(root, 'factory.sqlite');
+  const held = await acquireFactoryRunLock(database);
+  t.after(() => held.release());
+  const stderr = output();
+  const code = await main(['reconcile', '--db', database], {
+    env: {}, stdout: output().stream, stderr: stderr.stream,
+    dependencies: {openDb: () => assert.fail('locked reconcile must not open the database')},
+  });
+  assert.equal(code, 1);
+  assert.match(stderr.read(), /already active/);
+});
 
 function output() {
   let value = '';
@@ -78,6 +176,13 @@ test('parser provides stable paths and strictly validates command-specific argum
   assert.throws(() => parseFactoryCliArgs(['approve', '--board', BOARD, '--ids', 'M-001,M-001'], {env: {}}),
     /duplicate mission/);
   assert.throws(() => parseFactoryCliArgs(['publish', '--board', 'B-1'], {env: {}}), /sha256/);
+  assert.deepEqual(parseFactoryCliArgs([
+    'reconcile', '--limit', '17', '--receipt-remote', 'https://example.test/receipts.git',
+  ], {env: {}}), {
+    command: 'reconcile', database: FACTORY_DEFAULTS.database, pauseFile: FACTORY_DEFAULTS.pauseFile,
+    ghBin: 'gh', limit: 17, receiptRemote: 'https://example.test/receipts.git',
+  });
+  assert.throws(() => parseFactoryCliArgs(['reconcile', '--limit', '0'], {env: {}}), /positive integer/);
   assert.throws(() => parseFactoryCliArgs(['github-resume'], {env: {}}), /--reason is required/);
   assert.equal(parseFactoryCliArgs([
     'github-resume', '--reason', 'reviewed', '--acknowledge-forbidden',
@@ -160,7 +265,7 @@ test('run uses the production Node worker by default', async () => {
   assert.equal(db.closed, true);
 });
 
-test('production run clones exact public source outside the publication pause queue', async () => {
+test('production run routes exact public source checkout through the safety queue', async () => {
   const publicState = () => ({open_northset_prs: 0});
   const db = fakeDb({
     getPublicActionState: publicState,
@@ -188,7 +293,7 @@ test('production run clones exact public source outside the publication pause qu
         safetyRepositoryState = options.repositoryState;
         return {request: async (request) => {
           requests.push(request);
-          return options.transport(request);
+          return request.execute();
         }};
       },
       createDriver: (options) => { driverOptions = options; return {}; },
@@ -203,7 +308,10 @@ test('production run clones exact public source outside the publication pause qu
     }),
   });
   assert.equal(driverOptions.command, '/opt/northset/author');
-  assert.equal(requests.length, 0);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].operation, 'checkout_exact_base');
+  assert.equal(requests[0].kind, 'read');
+  assert.equal(requests[0].repository, 'owner/repo');
   assert.equal(transportRequests.length, 1);
   assert.equal(transportRequests[0].operation, 'git_clone');
   assert.equal(transportRequests[0].base_oid, '1'.repeat(40));
@@ -249,7 +357,7 @@ test('run remains alive when idle, ticks board age, and stops through the inject
   assert.equal(db.closed, true);
 });
 
-test('a publication pause skips new preflight but still drains already queued local work', async () => {
+test('a GitHub pause skips new preflight but still offers queued local work to the cycle', async () => {
   const db = fakeDb({stats: () => ({ready_items: 1})});
   let cycles = 0;
   const paused = new Error('publication paused');
@@ -270,6 +378,29 @@ test('a publication pause skips new preflight but still drains already queued lo
   assert.equal(cycles, 1);
   assert.equal(result.claimed, 1);
   assert.equal(result.source.paused, 1);
+  assert.equal(db.closed, true);
+});
+
+test('a model-provider outage stops the continuous runner after preserving the current claim', async () => {
+  const db = fakeDb({stats: () => ({ready_items: 1})});
+  let cycles = 0;
+  const result = await executeFactoryCli(['run'], {
+    env: {},
+    stdout: output().stream,
+    dependencies: baseDependencies(db, {
+      driver: {},
+      source: {fill: async () => ({candidates: [], results: [], enqueued: []})},
+      createBoard: () => null,
+      runCycle: async () => {
+        cycles += 1;
+        return {claimed: 1, results: [{state: 'DEFERRED', code: 'MODEL_PROVIDER_UNAVAILABLE'}]};
+      },
+      sleep: async () => { throw new Error('provider outage must not enter a retry loop'); },
+    }),
+  });
+  assert.equal(cycles, 1);
+  assert.equal(result.stop_reason, 'MODEL_PROVIDER_UNAVAILABLE');
+  assert.equal(result.stopped, false);
   assert.equal(db.closed, true);
 });
 
@@ -373,6 +504,47 @@ test('a paused reconciliation lane is reported but does not stop queued local ex
   assert.equal(result.reconciliation.failures, 1);
   assert.equal(result.reconciliation.paused, 1);
   assert.match(result.reconciliation.last_error, /publication is paused/);
+});
+
+test('reconcile runs one bounded pass without creating workers, sources, or boards', async () => {
+  const db = fakeDb({listReconciliationCandidates: () => []});
+  const stdout = output();
+  let statusPublisherOptions;
+  let reconciliationOptions;
+  const statusPublisher = async () => ({});
+  const github = {getPullRequest: async () => ({})};
+  const safety = {request: async (request) => request.execute(), releaseRepository: async () => {}};
+  const expected = {processed: 1, results: [{mission_id: 'M-001', follow_up: {review_decision: null}}]};
+  const result = await executeFactoryCli([
+    'reconcile', '--limit', '7', '--receipt-remote', 'https://example.test/receipts.git',
+  ], {
+    env: {}, stdout: stdout.stream,
+    dependencies: baseDependencies(db, {
+      github,
+      createSafety: () => safety,
+      createReceiptStatusPublisher: (options) => {
+        statusPublisherOptions = options;
+        return statusPublisher;
+      },
+      createSource: () => assert.fail('reconcile must not create a source'),
+      createDriver: () => assert.fail('reconcile must not create a worker driver'),
+      createBoard: () => assert.fail('reconcile must not create a board'),
+      runCycle: () => assert.fail('reconcile must not run workers'),
+      reconcilePublicationBatch: async (options) => {
+        reconciliationOptions = options;
+        return expected;
+      },
+    }),
+  });
+  assert.deepEqual(result, expected);
+  assert.deepEqual(JSON.parse(stdout.read()), expected);
+  assert.deepEqual(statusPublisherOptions, {remoteUrl: 'https://example.test/receipts.git'});
+  assert.equal(reconciliationOptions.db, db);
+  assert.equal(reconciliationOptions.github, github);
+  assert.equal(reconciliationOptions.safety, safety);
+  assert.equal(reconciliationOptions.statusPublisher, statusPublisher);
+  assert.equal(reconciliationOptions.limit, 7);
+  assert.equal(db.closed, true);
 });
 
 test('board displays the current immutable board or creates one from READY items', async () => {

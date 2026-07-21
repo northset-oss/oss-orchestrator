@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import {createGitHubSafety} from './github-safety.mjs';
 import {
   createReceiptPublisher,
   createReceiptStatusPublisher,
@@ -130,6 +131,33 @@ test('receiptUrlFor uses the canonical public ledger path while validating contr
     'https://northset-oss.github.io/verification-pilot/receipts/M-1000/');
   assert.throws(() => receiptUrlFor('../M-1000', oid('a')), /invalid mission_id/);
   assert.throws(() => receiptUrlFor('M-1000', 'bad'), /commit_oid/);
+});
+
+test('raw receipt git HTTP 403 reaches the shared GitHub pause', async (t) => {
+  const root = await temporary(t, 'factory-receipt-git-403');
+  const pauseFile = path.join(root, 'pause.json');
+  const publisher = createReceiptPublisher({
+    remoteUrl: 'https://github.com/northset-oss/verification-pilot.git',
+    tempRoot: root,
+    run: async () => ({
+      code: 128, signal: null, stdout: '', timedOut: false, outputLimited: false,
+      stderr: "fatal: unable to access repository: The requested URL returned error: 403\n",
+    }),
+  });
+  const safety = createGitHubSafety({
+    pauseFile,
+    governorFile: path.join(root, 'governor.json'),
+    transport: async (request) => typeof request.execute === 'function'
+      ? request.execute() : {status: 200},
+    mutationSpacingMs: 0,
+    searchSpacingMs: 0,
+  });
+
+  await assert.rejects(() => safety.request({
+    priority: 'final_submission', kind: 'git_push', operation: 'publish_receipt_batch',
+    execute: () => publisher([item('M-1000', 'b')]),
+  }), (error) => error.code === 'GITHUB_PAUSED' && error.pause.kind === 'GITHUB_HTTP_403');
+  assert.equal(JSON.parse(await readFile(pauseFile, 'utf8')).kind, 'GITHUB_HTTP_403');
 });
 
 test('one non-force batch push publishes deterministic exact proof bytes from an isolated clone', async (t) => {

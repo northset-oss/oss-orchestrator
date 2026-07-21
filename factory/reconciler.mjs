@@ -2,6 +2,7 @@ import {receiptUrlFor} from './receipt-publisher.mjs';
 
 const RECONCILIATION_PRIORITY = 'reconciliation';
 const DEFAULT_ATTESTATION_REPOSITORY = 'northset-oss/verification-pilot';
+const MAINTAINER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
 function requiredMethod(value, name, label) {
   if (typeof value?.[name] !== 'function') throw new TypeError(`${label}.${name} is required`);
@@ -43,6 +44,66 @@ function statusFacts(publication) {
     attestation_state: publication.attestation_state ?? null,
     attestation_url: publication.attestation_url ?? null,
   });
+}
+
+function eventTime(event) {
+  return event?.submitted_at ?? event?.updated_at ?? event?.created_at ?? null;
+}
+
+function latestTime(events) {
+  return events.map(eventTime).filter(Boolean).sort().at(-1) ?? null;
+}
+
+function humanEvent(event) {
+  return Boolean(event?.author_login) && String(event?.author_type ?? '').toLowerCase() !== 'bot' &&
+    !/\[bot\]$/i.test(String(event.author_login));
+}
+
+function maintainerEvent(event) {
+  return MAINTAINER_ASSOCIATIONS.has(event?.author_association) && humanEvent(event);
+}
+
+function externalHumanEvent(event, author) {
+  const login = String(event?.author_login ?? '').toLowerCase();
+  return Boolean(author) && humanEvent(event) && login !== author;
+}
+
+function summarizeFollowUp(value) {
+  const comments = Array.isArray(value?.comments) ? value.comments : [];
+  const reviews = Array.isArray(value?.reviews) ? value.reviews : [];
+  const threads = Array.isArray(value?.threads) ? value.threads : [];
+  const threadComments = threads.flatMap((thread) => thread.comments ?? []);
+  const commentEvents = [...comments, ...threadComments];
+  const maintainerReviews = reviews.filter(maintainerEvent);
+  const latestByMaintainer = new Map();
+  for (const review of [...maintainerReviews].sort((left, right) =>
+    String(eventTime(left)).localeCompare(String(eventTime(right))))) {
+    latestByMaintainer.set(String(review.author_login).toLowerCase(), review);
+  }
+  const author = String(value?.author_login ?? '').toLowerCase();
+  const allEvents = [...comments, ...reviews, ...threadComments];
+  const latestAuthorActivity = latestTime(allEvents.filter((event) =>
+    author && String(event?.author_login ?? '').toLowerCase() === author));
+  const latestChangeRequest = latestTime(maintainerReviews.filter((review) =>
+    review.state === 'CHANGES_REQUESTED'));
+  return {
+    author_login: value?.author_login ?? null,
+    review_decision: value?.review_decision ?? null,
+    latest_reviews_by_maintainer: [...latestByMaintainer.values()],
+    maintainer_comments: comments.filter(maintainerEvent),
+    external_comments: commentEvents.filter((event) => externalHumanEvent(event, author)),
+    author_comments: comments.filter((event) =>
+      author && String(event?.author_login ?? '').toLowerCase() === author),
+    unresolved_threads: threads.filter((thread) => thread.is_resolved !== true),
+    latest_author_activity_at: latestAuthorActivity,
+    latest_maintainer_activity_at: latestTime(allEvents.filter(maintainerEvent)),
+    latest_external_activity_at: latestTime(allEvents.filter((event) =>
+      externalHumanEvent(event, author))),
+    latest_change_request_at: latestChangeRequest,
+    author_activity_after_latest_change_request: latestChangeRequest === null ? null
+      : latestAuthorActivity !== null && latestAuthorActivity > latestChangeRequest,
+    history_truncated: value?.history_truncated === true,
+  };
 }
 
 async function throughSafety(safety, request) {
@@ -99,6 +160,7 @@ export async function reconcilePublicationBatch({
   const updateTaskState = requiredMethod(db, 'updateTaskState', 'db');
   const recordObservation = requiredMethod(db, 'recordPublicationObservation', 'db');
   const getPullRequest = requiredMethod(github, 'getPullRequest', 'github');
+  const getPullRequestFollowUp = requiredMethod(github, 'getPullRequestFollowUp', 'github');
   const getCommitStatus = requiredMethod(github, 'getCommitStatus', 'github');
   const getArtifactAttestation = attestor === null
     ? requiredMethod(github, 'getArtifactAttestation', 'github') : null;
@@ -144,6 +206,17 @@ export async function reconcilePublicationBatch({
       if (returnedRepository && returnedRepository.toLowerCase() !== repository.toLowerCase()) {
         throw Object.assign(new Error(`pull request repository changed to ${returnedRepository}`),
           {code: 'RECONCILIATION_PR_MISMATCH'});
+      }
+      let followUp = null;
+      let followUpError = null;
+      try {
+        followUp = summarizeFollowUp(await throughSafety(safety, {
+          kind: 'read', operation: 'reconcile_get_pull_request_follow_up', repository, pr_number: prNumber,
+          execute: () => getPullRequestFollowUp({repository, number: prNumber}),
+        }));
+      } catch (error) {
+        if (isPaused(error)) throw error;
+        followUpError = message(error);
       }
       const expectedHead = publicationBefore.pushed_oid ?? publicationBefore.pr_head_oid;
       const returnedHead = pr.head_oid ?? pr.head_sha ?? pr.head?.sha;
@@ -235,17 +308,28 @@ export async function reconcilePublicationBatch({
         }
       }
 
+      if (publication.last_error !== null || publication.last_error_detail !== null) {
+        publication = await db.savePublication(missionId, {
+          last_error: null,
+          last_error_detail: null,
+        }, {now: observed});
+      }
+
       const factsChanged = statusFacts(publicationBefore) !== statusFacts(publication);
       if (publicationBefore.status_state !== 'PUBLISHED' || factsChanged) {
         pendingStatuses.push({missionId, observed, item: statusItem(publication, observed, mergeCommitOid)});
       }
       results.push({
         mission_id: missionId,
+        pr_url: publication.pr_url,
+        pr_head_oid: publication.pr_head_oid,
         pr_state: publication.pr_state,
         merged: publication.merged,
         ci_state: publication.ci_state,
         attestation_state: publication.attestation_state,
         status_state: publication.status_state,
+        follow_up: followUp,
+        follow_up_error: followUpError,
       });
     } catch (error) {
       if (isPaused(error)) throw error;

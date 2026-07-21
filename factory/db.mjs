@@ -125,6 +125,7 @@ function mapTask(row) {
     base_oid: row.base_oid,
     attempt_count: row.attempt_count,
     last_error: row.last_error,
+    last_failure_class: row.last_failure_class ?? null,
     worker_id: row.worker_id,
     live_state: parseJson(row.live_state_json, {}),
     issue_snapshot: parseJson(row.issue_snapshot_json, {}),
@@ -454,6 +455,21 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       base_oid=COALESCE(excluded.base_oid,tasks.base_oid),
       live_state_json=excluded.live_state_json,
       issue_snapshot_json=excluded.issue_snapshot_json,
+      state=CASE WHEN tasks.state='FAILED' AND tasks.attempt_count<2
+        AND excluded.state IN ('QUEUED','SKIPPED')
+        AND EXISTS(SELECT 1 FROM attempts a WHERE a.task_id=tasks.task_id
+          AND a.attempt_number=tasks.attempt_count AND a.failure_class='infrastructure')
+        THEN excluded.state ELSE tasks.state END,
+      last_error=CASE WHEN tasks.state='FAILED' AND tasks.attempt_count<2
+        AND excluded.state IN ('QUEUED','SKIPPED')
+        AND EXISTS(SELECT 1 FROM attempts a WHERE a.task_id=tasks.task_id
+          AND a.attempt_number=tasks.attempt_count AND a.failure_class='infrastructure')
+        THEN NULL ELSE tasks.last_error END,
+      worker_id=CASE WHEN tasks.state='FAILED' AND tasks.attempt_count<2
+        AND excluded.state IN ('QUEUED','SKIPPED')
+        AND EXISTS(SELECT 1 FROM attempts a WHERE a.task_id=tasks.task_id
+          AND a.attempt_number=tasks.attempt_count AND a.failure_class='infrastructure')
+        THEN NULL ELSE tasks.worker_id END,
       updated_at=excluded.updated_at`);
     return transaction(() => records.map((record) => {
       const candidate = String(record.candidate);
@@ -503,7 +519,10 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     if (state) { assertState(state); clauses.push('state=?'); args.push(state); }
     if (profile) { clauses.push('profile=?'); args.push(profile); }
     args.push(limit);
-    return connection.prepare(`SELECT * FROM tasks ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+    return connection.prepare(`SELECT tasks.*,
+      (SELECT a.failure_class FROM attempts a WHERE a.task_id=tasks.task_id
+        ORDER BY a.attempt_number DESC LIMIT 1) AS last_failure_class
+      FROM tasks ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
       ORDER BY priority DESC,created_at,task_id LIMIT ?`).all(...args).map(mapTask);
   }
 
@@ -564,6 +583,24 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       connection.prepare(`UPDATE tasks SET state=?,last_error=?,worker_id=NULL,updated_at=? WHERE task_id=?`)
         .run(nextState, error, finishedAt, attempt.task_id);
       return {task: getTask(attempt.task_id), attempt: getAttempt(attemptId)};
+    });
+  }
+
+  function deferAttempt(attemptId, {reason = 'deferred before worker execution', now = new Date()} = {}) {
+    return transaction(() => {
+      const attempt = connection.prepare('SELECT * FROM attempts WHERE attempt_id=?').get(attemptId);
+      if (!attempt) throw new Error(`unknown attempt ${attemptId}`);
+      if (attempt.finished_at) throw new Error(`attempt ${attemptId} is already finished`);
+      const task = connection.prepare('SELECT * FROM tasks WHERE task_id=?').get(attempt.task_id);
+      if (!task || task.state !== 'WORKING' || task.attempt_count !== attempt.attempt_number) {
+        throw new Error(`attempt ${attemptId} is not the current unstarted task claim`);
+      }
+      connection.prepare('DELETE FROM attempts WHERE attempt_id=?').run(attemptId);
+      connection.prepare(`UPDATE tasks SET state='QUEUED',attempt_count=attempt_count-1,
+        worker_id=NULL,last_error=?,updated_at=? WHERE task_id=?`).run(
+        reason, iso(now), attempt.task_id,
+      );
+      return getTask(attempt.task_id);
     });
   }
 
@@ -671,6 +708,25 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     return mapReady(connection.prepare('SELECT * FROM ready_items WHERE mission_id=?').get(missionId));
   }
 
+  function supersedeReady(missionId, {
+    reason = 'verified work was superseded before review',
+    now = new Date(),
+  } = {}) {
+    return transaction(() => {
+      const current = getReadyItem(missionId);
+      if (!current) throw new Error(`unknown mission ${missionId}`);
+      if (current.approval_state !== 'PENDING' || current.board_id !== null) {
+        throw new Error('only an unboarded pending READY item can be superseded');
+      }
+      if (getPublication(missionId)) throw new Error('a published mission cannot be superseded as local READY work');
+      const observed = iso(now);
+      connection.prepare("UPDATE ready_items SET approval_state='SUPERSEDED' WHERE mission_id=?").run(missionId);
+      connection.prepare(`UPDATE tasks SET state='SUPERSEDED',last_error=?,worker_id=NULL,updated_at=?
+        WHERE task_id=?`).run(reason, observed, current.task_id);
+      return getReadyItem(missionId);
+    });
+  }
+
   function listReady({unboarded = false, states = ['PENDING'], limit = 100} = {}) {
     if (!Array.isArray(states) || !states.length) throw new Error('ready states are required');
     if (!Number.isInteger(limit) || limit < 1) throw new Error('ready limit must be positive');
@@ -718,6 +774,40 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     const row = connection.prepare("SELECT board_digest FROM boards WHERE state='OPEN' ORDER BY created_at,board_id LIMIT 1")
       .get();
     return row ? getBoard(row.board_digest) : null;
+  }
+
+  function supersedeBoard(boardDigest, {
+    reason = 'review board was superseded before approval',
+    now = new Date(),
+  } = {}) {
+    return transaction(() => {
+      const board = getBoard(boardDigest);
+      if (!board || board.state !== 'OPEN') throw new Error('board is missing or no longer open');
+      if (getBoardApproval(boardDigest)) throw new Error('an approved board cannot be superseded');
+      const observed = iso(now);
+      const release = connection.prepare(`UPDATE ready_items SET board_id=NULL
+        WHERE mission_id=? AND board_id=? AND approval_state='PENDING'`);
+      const note = connection.prepare(`UPDATE tasks SET last_error=?,updated_at=?
+        WHERE task_id=(SELECT task_id FROM ready_items WHERE mission_id=?)`);
+      for (const item of board.items) {
+        const current = getReadyItem(item.mission_id);
+        if (!current || current.approval_state !== 'PENDING') {
+          throw new Error(`${item.mission_id} is no longer pending on the open board`);
+        }
+        if (current.board_id === null) {
+          // Replacing a READY manifest invalidates and releases that item from its
+          // immutable board. The board itself still needs to close cleanly.
+          continue;
+        }
+        if (current.board_id !== board.board_id ||
+            release.run(item.mission_id, board.board_id).changes !== 1) {
+          throw new Error(`${item.mission_id} is no longer bound to the open board`);
+        }
+        note.run(reason, observed, item.mission_id);
+      }
+      connection.prepare("UPDATE boards SET state='SUPERSEDED' WHERE board_id=?").run(board.board_id);
+      return getBoard(boardDigest);
+    });
   }
 
   function approveBoard(boardDigest, approvedIds, {
@@ -823,7 +913,8 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
         ready_at=?,board_id=NULL,approval_state='PENDING' WHERE mission_id=?`).run(
         manifestSha, itemDigest, json(manifest), manifest.risk_tier, manifest.ready_at, missionId,
       );
-      connection.prepare("UPDATE tasks SET state='READY',updated_at=? WHERE task_id=?").run(manifest.ready_at, current.task_id);
+      connection.prepare("UPDATE tasks SET state='READY',base_oid=?,last_error=NULL,updated_at=? WHERE task_id=?")
+        .run(manifest.base_oid ?? null, manifest.ready_at, current.task_id);
       return getReadyItem(missionId);
     });
   }
@@ -963,7 +1054,9 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       WHERE publication_state='SUBMITTED' AND (
         attestation_state!='RECEIPT_ATTESTED' OR
         outcome_recorded_at IS NULL OR
-        status_state!='PUBLISHED'
+        status_state!='PUBLISHED' OR
+        last_error IS NOT NULL OR
+        last_error_detail IS NOT NULL
       )
       ORDER BY updated_at,mission_id LIMIT ?`).all(limit).map(mapPublication);
   }
@@ -1106,13 +1199,16 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     recoverWorkingTasks,
     getAttempt,
     finishAttempt,
+    deferAttempt,
     promoteVerified,
     finishVerifiedReady,
     getReadyItem,
+    supersedeReady,
     listReady,
     insertBoard,
     getBoard,
     getCurrentBoard,
+    supersedeBoard,
     approveBoard,
     getBoardApproval,
     replaceReadyManifest,

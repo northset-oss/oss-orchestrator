@@ -122,6 +122,7 @@ node factory/cli.mjs run --profile node --workers 8 --board-size 20 --board-max-
 node factory/cli.mjs board
 node factory/cli.mjs approve --board sha256:<digest> --ids M-201,M-202
 node factory/cli.mjs publish --board sha256:<digest>
+node factory/cli.mjs reconcile --limit 30
 node factory/cli.mjs github-status
 node factory/cli.mjs github-resume --reason "<founder decision>"
 ```

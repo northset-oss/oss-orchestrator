@@ -67,7 +67,7 @@ export function createStageSemaphores({
 async function oneInfrastructureRetry(operation) {
   try { return await operation(); }
   catch (error) {
-    if (error?.transient !== true) throw error;
+    if (error?.transient !== true || error?.providerUnavailable === true) throw error;
     return operation();
   }
 }
@@ -334,6 +334,13 @@ async function processClaim(claim, {
     });
     return {task_id: task.task_id, state: 'SKIPPED', reason: lastError?.message ?? null};
   } catch (error) {
+    if ((error?.code === 'GITHUB_PAUSED' || error?.providerUnavailable === true) &&
+        typeof db.deferAttempt === 'function') {
+      db.deferAttempt(attempt.attempt_id, {reason: error.message, now: now()});
+      return {task_id: task.task_id, state: 'DEFERRED',
+        code: error?.providerUnavailable === true ? 'MODEL_PROVIDER_UNAVAILABLE' : 'GITHUB_PAUSED',
+        reason: error.message};
+    }
     db.finishAttempt(attempt.attempt_id, {
       outcome: 'FAILED', failureClass: error?.transient || error?.infrastructure
         ? 'infrastructure' : 'worker',
@@ -455,8 +462,11 @@ function runJsonCommand(command, args, payload, {
       if (code !== 0) {
         const failureOutput = stderr || stdout;
         const error = new Error(`worker command failed: ${failureOutput.trim() || `exit ${code}`}`);
-        error.infrastructure = /host Codex sandbox failed:[\s\S]*(?:agent identity JWT payload is not valid JSON|invalid_json_schema|usage[_ ]limit|model provider[^\n]*(?:unavailable|error))/i
+        error.providerUnavailable = /host Codex sandbox failed:[\s\S]*(?:you(?:'|’)ve hit your usage limit|usage[_ ]limit|model provider[^\n]*unavailable|unexpected status 401 unauthorized|http error: 401 unauthorized|auth error code: token_(?:invalidated|revoked)|authentication token has been invalidated|invalidated oauth token|invalid ['’]refresh_token['’]: empty string)/i
           .test(failureOutput);
+        error.infrastructure = error.providerUnavailable ||
+          /host Codex sandbox failed:[\s\S]*(?:agent identity JWT payload is not valid JSON|invalid_json_schema|model provider[^\n]*error)/i
+            .test(failureOutput);
         error.transient = /temporar|timed out|connection reset|econnreset|etimedout|eai_again|network unreachable|registry[^\n]*(?:unavailable|timeout)|cannot connect to the docker daemon/i
           .test(failureOutput) ||
           /host Codex sandbox failed:[\s\S]*agent identity JWT payload is not valid JSON/i.test(failureOutput);

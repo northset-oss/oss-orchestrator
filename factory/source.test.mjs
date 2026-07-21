@@ -180,7 +180,7 @@ test('preflight query consolidates all live fields and repository-wide Northset 
   const query = buildPreflightQuery([candidate()]);
   for (const expected of ['isArchived', 'isFork', 'defaultBranchRef', 'rootPackage',
     'pnpmWorkspaceYaml', 'pnpmWorkspaceYml', 'lernaConfig', 'assignees', 'labels', 'comments',
-    'timelineItems']) {
+    'timelineItems', 'closingIssuesReferences']) {
     assert.match(query, new RegExp(expected));
   }
   assert.match(query, /rootPackage: object[\s\S]*\.\.\. on Blob \{ byteSize text \}/);
@@ -197,6 +197,7 @@ test('each hard live-preflight violation returns SKIP', async (t) => {
     ['closed issue', normalizedLive({issue: {state: 'CLOSED'}}), /issue is closed/],
     ['external assignment', normalizedLive({issue: {assignees: ['someone']}}), /assigned/],
     ['missing invitation', normalizedLive({issue: {labels: []}}), /invitation/],
+    ['unapproved issue', normalizedLive({issue: {labels: ['good first issue', 'unapproved']}}), /marked unapproved/],
     ['already in development', normalizedLive({issue: {labels: ['good first issue', 'in-develop']}}), /development branch/],
     ['archived repository', normalizedLive({repository: {archived: true}}), /archived/],
     ['missing root package', normalizedLive({repository: {hasRootPackageJson: false}}), /root package\.json/],
@@ -205,6 +206,9 @@ test('each hard live-preflight violation returns SKIP', async (t) => {
     }}), /multi-package workspaces/],
     ['Northset open PR', normalizedLive({repository: {northsetOpenPrs: 1}}), /Northset already/],
     ['linked open PR', normalizedLive({issue: {crossReferencedPrs: [{state: 'OPEN', url: 'https://github.com/o/r/pull/2'}]}}), /linked open PR/],
+    ['linked merged PR', normalizedLive({issue: {crossReferencedPrs: [{
+      state: 'MERGED', closesIssue: true, url: 'https://github.com/o/r/pull/2',
+    }]}}), /linked merged PR/],
     ['external claimant', normalizedLive({issue: {comments: [claim]}}), /claimant/],
     ['missing base OID', normalizedLive({repository: {defaultOid: null}}), /OID/],
   ];
@@ -224,7 +228,9 @@ test('recent common claim and collaborator-offer phrases block while stale inter
     'I’m working on this.',
     'I would like to work on this.',
     'I would love to work on this issue.',
+    "I'd love to investigate this issue. Could I be assigned?",
     'Please let me know if I can work on this.',
+    'I have implemented the unit tests and would like to request that this issue be assigned to me.',
     'This one is yours if you want it.',
   ];
   for (const body of phrases) {
@@ -245,6 +251,10 @@ test('ambiguous overlap escalates only after all hard checks pass', () => {
   const live = normalizedLive({issue: {
     crossReferencedPrs: [{state: 'CLOSED', url: 'https://github.com/o/r/pull/2'}],
   }});
+  assert.equal(evaluatePreflight(live, {now: NOW}).outcome, 'ESCALATE');
+  live.issue.crossReferencedPrs = [{
+    state: 'MERGED', closesIssue: false, url: 'https://github.com/o/r/pull/3',
+  }];
   assert.equal(evaluatePreflight(live, {now: NOW}).outcome, 'ESCALATE');
   live.repository.archived = true;
   assert.equal(evaluatePreflight(live, {now: NOW}).outcome, 'SKIP');
@@ -368,6 +378,34 @@ test('skipped preflights are recorded so the continuous source does not retry th
   assert.equal(first.results[0].outcome, 'SKIP');
   const second = await source.fill({workers: 1, now: NOW});
   assert.equal(second.candidates.length, 0);
+  assert.equal(githubCalls, 1);
+});
+
+test('source rechecks one bounded infrastructure failure but keeps worker failures terminal', async () => {
+  let githubCalls = 0;
+  const enqueued = [];
+  const source = createSource({
+    query: async () => [row(1), row(2)],
+    github: {graphql: async () => {
+      githubCalls += 1;
+      return {data: {c0: graphRepository(1), n0: {issueCount: 0}}};
+    }},
+    db: {
+      listTasks: () => [
+        {candidate: 'owner/repo1#1', state: 'FAILED', attempt_count: 1,
+          last_failure_class: 'infrastructure'},
+        {candidate: 'owner/repo2#2', state: 'FAILED', attempt_count: 1,
+          last_failure_class: 'worker'},
+      ],
+      recordPreflightOutcomes: () => {},
+      enqueueTasks: async (tasks) => { enqueued.push(...tasks); return tasks; },
+    },
+  });
+
+  const result = await source.fill({workers: 1, now: NOW});
+  assert.deepEqual(result.candidates.map((candidate) => candidate.candidate), ['owner/repo1#1']);
+  assert.equal(result.results[0].outcome, 'GO');
+  assert.deepEqual(enqueued.map((task) => task.candidate), ['owner/repo1#1']);
   assert.equal(githubCalls, 1);
 });
 

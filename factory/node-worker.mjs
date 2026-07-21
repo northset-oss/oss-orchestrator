@@ -297,7 +297,6 @@ export function codexHostArgs({
     '-c', 'approval_policy="never"',
     '-c', `default_permissions="${readOnly ? 'factory_readonly' : 'factory_workspace'}"`,
     '-c', `model_reasoning_effort="${effort}"`,
-    '-c', 'service_tier="fast"',
     '-c', 'shell_environment_policy.inherit="core"',
     '-c', 'shell_environment_policy.exclude=["CODEX_ACCESS_TOKEN","CODEX_API_KEY","OPENAI_API_KEY","GH_TOKEN","GITHUB_TOKEN"]',
     '-c', 'features.apps=false',
@@ -373,9 +372,11 @@ function scoutPrompt(task) {
   return `${issueText(task)}
 
 Inspect this checkout read-only. Decide whether this is a small, testable Node contribution suitable
-for the standard lane. Select one exact focused test command and likely target files. Do not change
-files. Return an empty install_command to use the lockfile-based default. SKIP if the issue is unclear,
-too broad, needs secrets/services, or is Red risk. Return only
+for the standard lane. Read the repository's contribution and pull-request instructions. Select one
+exact focused test command and likely target files. Do not change files. Return an empty
+install_command to use the lockfile-based default. SKIP if the issue is unclear, too broad, needs
+secrets/services, is Red risk, or requires a committed filename or content derived from the future
+pull-request number; that cannot be bound in the one-approval standard lane. Return only
 the requested structured result. Do not call GitHub or any network service other than the model API.`;
 }
 

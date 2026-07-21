@@ -78,7 +78,8 @@ test('N1 scout uses the bounded structured read-only contract', async (t) => {
   assert.equal(invocation.effort, 'medium');
   assert.equal(invocation.timeoutMs, 90_000);
   assert.match(invocation.prompt, /Inspect this checkout read-only/);
-  assert.match(invocation.prompt, /empty install_command/);
+  assert.match(invocation.prompt, /empty\s+install_command/);
+  assert.match(invocation.prompt, /future\s+pull-request number/);
   assert.match(invocation.prompt, /Never call GitHub|Do not call GitHub/);
   assert.deepEqual(new Set(SCOUT_SCHEMA.required), new Set(Object.keys(SCOUT_SCHEMA.properties)));
   assert.deepEqual(result.target_files, ['src/value.mjs', 'test/value.test.mjs']);
@@ -135,6 +136,7 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
   assert.match(joinedAuthor, /--output-schema/);
   assert.match(joinedAuthor, /--output-last-message/);
   assert.match(joinedAuthor, /shell_environment_policy\.exclude/);
+  assert.doesNotMatch(joinedAuthor, /service_tier="fast"/);
   const clientEnvironment = codexProcessEnvironment({codexHome});
   assert.equal(clientEnvironment.CODEX_ACCESS_TOKEN, undefined);
   assert.equal(clientEnvironment.CODEX_HOME, codexHome);

@@ -876,3 +876,37 @@ test('an older board skips a corrected approval without mutating its current sta
   assert.equal(db.taskStates.has('TASK-002'), false);
   assert.equal(github.count('create_pull_request'), 1);
 });
+
+test('an old board cannot invalidate an already-submitted correction without a replacement board', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  const immutable = structuredClone(db.board.items[0]);
+  const corrected = structuredClone(db.ready.get('M-001'));
+  corrected.manifest.commit_oid = 'f'.repeat(40);
+  corrected.commit_oid = corrected.manifest.commit_oid;
+  corrected.item_digest = readyItemDigest(corrected.manifest);
+  corrected.manifest_sha256 = sha256(Buffer.from(canonical(corrected.manifest), 'utf8'));
+  corrected.board_id = null;
+  db.ready.set('M-001', corrected);
+  db.publications.set('M-001', {
+    publication_state: 'SUBMITTED',
+    pushed_oid: corrected.manifest.commit_oid,
+    pr_head_oid: corrected.manifest.commit_oid,
+    pr_number: 17,
+    pr_url: 'https://github.com/upstream1/project/pull/17',
+    receipt_approval_digest: `sha256:${'9'.repeat(64)}`,
+  });
+
+  const result = await publishBoard(db.board.board_digest, options(db, github));
+
+  assert.deepEqual(result.results[0], {
+    mission_id: 'M-001',
+    state: 'SKIPPED',
+    code: 'APPROVAL_SUPERSEDED',
+    detail: 'the current correction was already submitted under a newer content-bound authorization',
+  });
+  assert.deepEqual(db.board.items[0], immutable);
+  assert.deepEqual(await db.getReadyItem('M-001'), corrected);
+  assert.equal((await db.getPublication('M-001')).publication_state, 'SUBMITTED');
+  assert.equal(github.count('create_pull_request'), 0);
+});

@@ -5,6 +5,23 @@ import {isClaimText} from './claim-detection.mjs';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+const OVERLAP_TITLE_STOPWORDS = new Set([
+  'add', 'adds', 'adding', 'bug', 'feature', 'fix', 'fixes', 'fixed', 'for', 'from',
+  'issue', 'mode', 'modes', 'request', 'support', 'the', 'this', 'with',
+]);
+
+function titleTerms(value) {
+  return new Set(String(value ?? '').toLowerCase().replaceAll(/#[0-9]+/g, ' ')
+    .split(/[^a-z0-9]+/).filter((term) => term.length >= 3 && !OVERLAP_TITLE_STOPWORDS.has(term)));
+}
+
+function stronglyOverlappingTitles(issueTitle, pullRequestTitle) {
+  const issue = titleTerms(issueTitle);
+  const pullRequest = titleTerms(pullRequestTitle);
+  if (issue.size < 2 || pullRequest.size < 2) return false;
+  const common = [...issue].filter((term) => pullRequest.has(term)).length;
+  return common >= 2 && common / Math.min(issue.size, pullRequest.size) >= 0.75;
+}
 
 export class GhCliError extends Error {
   constructor(message, code, result = {}) {
@@ -216,6 +233,8 @@ function rawGitResult(result, operation) {
     const error = new GhCliError(`${operation} timed out`, 'ETIMEDOUT', structured);
     error.name = 'TimeoutError';
     error.commandCode = 'GIT_COMMAND_TIMEOUT';
+    error.infrastructure = true;
+    error.transient = true;
     throw error;
   }
   if (result.outputLimited) throw new GhCliError(`${operation} exceeded the output limit`, 'GIT_OUTPUT_LIMIT', structured);
@@ -225,6 +244,8 @@ function rawGitResult(result, operation) {
     if (/connection (?:reset|refused|timed out)|could not resolve host|network is unreachable|remote end hung up/i.test(failureDetail)) {
       error.commandCode = error.code;
       error.code = /could not resolve host/i.test(failureDetail) ? 'EAI_AGAIN' : 'ECONNRESET';
+      error.infrastructure = true;
+      error.transient = true;
     }
     throw error;
   }
@@ -452,6 +473,7 @@ const FINAL_RECHECK_QUERY = `query FactoryFinalLiveRecheck(
     ref(qualifiedName: $qualifiedBase) { target { ... on Commit { oid } } }
     issue(number: $issue) {
       state locked
+      labels(first: 50) { nodes { name } }
       assignees(first: 20) { nodes { login } pageInfo { hasNextPage } }
       comments(last: 100) {
         pageInfo { hasPreviousPage }
@@ -483,6 +505,54 @@ const FINAL_RECHECK_QUERY = `query FactoryFinalLiveRecheck(
     }
   }
 }`;
+
+const FOLLOW_UP_QUERY = `query FactoryPullRequestFollowUp($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      number url reviewDecision author { login }
+      comments(last: 100) {
+        pageInfo { hasPreviousPage }
+        nodes { url body createdAt updatedAt authorAssociation author { login __typename } }
+      }
+      reviews(last: 100) {
+        pageInfo { hasPreviousPage }
+        nodes {
+          url body state submittedAt authorAssociation commit { oid }
+          author { login __typename }
+        }
+      }
+      reviewThreads(first: 20) {
+        pageInfo { hasNextPage }
+        nodes {
+          isResolved isOutdated path line originalLine
+          comments(last: 20) {
+            pageInfo { hasPreviousPage }
+            nodes { url body createdAt updatedAt authorAssociation author { login __typename } }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+function followUpActor(value) {
+  return {
+    author_login: value?.author?.login ?? null,
+    author_type: value?.author?.__typename ?? null,
+    author_association: value?.authorAssociation ?? null,
+  };
+}
+
+function followUpComment(value) {
+  return {
+    ...followUpActor(value),
+    url: value?.url ?? null,
+    body: value?.body ?? '',
+    created_at: value?.createdAt ?? null,
+    updated_at: value?.updatedAt ?? null,
+  };
+}
 
 /** Raw semantic operations. Callers must admit each method through GitHubSafety. */
 export function createGhCliPublisherAdapter({
@@ -621,6 +691,50 @@ export function createGhCliPublisherAdapter({
     const result = await transport.rest({method: 'GET', path: apiPath(repository, `pulls/${Number(number)}`)});
     return {status: result.httpStatus, headers: result.headers,
       ...pullRequest(bodyObject(result, 'get pull request'), repository)};
+  };
+
+  const getPullRequestFollowUp = async ({repository, number}) => {
+    if (!Number.isInteger(Number(number)) || Number(number) < 1) throw new TypeError('PR number must be positive');
+    const {owner, name} = repositoryParts(repository);
+    const result = await graphql(FOLLOW_UP_QUERY, {owner, name, number: Number(number)});
+    const repo = result.data?.repository;
+    const pr = repo?.pullRequest;
+    if (!pr || Number(pr.number) !== Number(number) ||
+        String(repo?.nameWithOwner ?? '').toLowerCase() !== repository.toLowerCase()) {
+      throw new GhCliError('pull request follow-up response does not match the requested PR',
+        'GH_RESPONSE_INVALID');
+    }
+    const comments = pr.comments?.nodes ?? [];
+    const reviews = (pr.reviews?.nodes ?? []).map((review) => ({
+      ...followUpActor(review),
+      url: review?.url ?? null,
+      body: review?.body ?? '',
+      state: review?.state ?? null,
+      submitted_at: review?.submittedAt ?? null,
+      commit_oid: review?.commit?.oid ?? null,
+    }));
+    const threads = (pr.reviewThreads?.nodes ?? []).map((thread) => ({
+      is_resolved: thread?.isResolved === true,
+      is_outdated: thread?.isOutdated === true,
+      path: thread?.path ?? null,
+      line: thread?.line ?? null,
+      original_line: thread?.originalLine ?? null,
+      comments: (thread?.comments?.nodes ?? []).map(followUpComment),
+      history_truncated: thread?.comments?.pageInfo?.hasPreviousPage === true,
+    }));
+    return {
+      number: Number(pr.number),
+      url: pr.url ?? null,
+      author_login: pr.author?.login ?? null,
+      review_decision: pr.reviewDecision ?? null,
+      comments: comments.map(followUpComment),
+      reviews,
+      threads,
+      history_truncated: pr.comments?.pageInfo?.hasPreviousPage === true ||
+        pr.reviews?.pageInfo?.hasPreviousPage === true ||
+        pr.reviewThreads?.pageInfo?.hasNextPage === true ||
+        threads.some((thread) => thread.history_truncated),
+    };
   };
 
   const getPullRequestCommits = async ({repository, number}) => {
@@ -791,6 +905,15 @@ export function createGhCliPublisherAdapter({
     if (!issueState) reasons.push('issue is missing or inaccessible');
     if (issueState?.state !== 'OPEN') reasons.push(`issue is ${String(issueState?.state ?? 'missing').toLowerCase()}`);
     if (issueState?.locked) reasons.push('issue is locked');
+    const invitationLabels = (issueState?.labels?.nodes ?? []).map((item) => String(item?.name ?? ''));
+    const approvedInvitationLabels = new Set((plan?.invitation_labels ?? []).map((label) =>
+      String(label).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()));
+    const invited = plan?.invitation_policy_present === true || invitationLabels.some((label) => {
+      const normalized = label.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      return normalized.includes('good first issue') || normalized.endsWith('help wanted') ||
+        approvedInvitationLabels.has(normalized);
+    });
+    if (issueState && !invited) reasons.push('invitation label or policy is missing');
     const assignees = issueState?.assignees?.nodes ?? [];
     const externalAssignees = assignees.filter((item) =>
       item.login?.toLowerCase() !== northsetLogin.toLowerCase());
@@ -842,6 +965,14 @@ export function createGhCliPublisherAdapter({
     const number = Number(liveCandidate?.issue?.number ?? liveCandidate?.candidate?.issueNumber ??
       liveCandidate?.issueNumber ?? liveCandidate?.liveState?.issue?.number);
     if (!Number.isInteger(number) || number < 1) throw new TypeError('deep overlap requires issue number');
+    const issueTitle = liveCandidate?.issue?.title ?? liveCandidate?.liveState?.issue?.title ?? '';
+    const mergedOverlap = (liveCandidate?.issue?.crossReferencedPrs ??
+      liveCandidate?.liveState?.issue?.crossReferencedPrs ?? []).find((pullRequest) =>
+      pullRequest?.state === 'MERGED' && stronglyOverlappingTitles(issueTitle, pullRequest.title));
+    if (mergedOverlap) {
+      return {clean: false,
+        reason: `merged overlapping PR already implements the issue: ${mergedOverlap.url ?? `#${mergedOverlap.number}`}`};
+    }
     const {owner, name} = repositoryParts(repository);
     const knownText = `${liveCandidate?.issue?.title ?? ''}\n${liveCandidate?.issue?.body ?? ''}`;
     const mentioned = [...knownText.matchAll(/(?:^|[^A-Za-z0-9])#([1-9][0-9]*)\b/g)]
@@ -894,6 +1025,6 @@ export function createGhCliPublisherAdapter({
   };
 
   return {getFork, createFork, getBranch, pushBranch, findPullRequests, createPullRequest, updatePullRequest,
-    getPullRequest,
+    getPullRequest, getPullRequestFollowUp,
     getPullRequestCommits, getCommitStatus, getArtifactAttestation, graphql, finalLiveRecheck, deepOverlap};
 }

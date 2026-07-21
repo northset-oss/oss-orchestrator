@@ -52,6 +52,16 @@ In another terminal, display the current board:
 node factory/cli.mjs board
 ```
 
+When the always-on process is stopped, run the same bounded PR/CI/attestation pass and print current
+maintainer review, comment, and thread facts without starting workers:
+
+```sh
+node factory/cli.mjs reconcile --limit 30
+```
+
+The follow-up summary is an ephemeral snapshot. It reports truncated GitHub history explicitly and
+does not infer that a request was addressed or post any response.
+
 Each card shows the repository and issue, risk, changed files and diffstat, links to the full local
 diff and verifier log, base and patched observations, exact checks, exact PR title/body, and receipt
 claim.
@@ -143,7 +153,8 @@ a candidate preflight target of twice the worker count, capped at four times the
 - `SUBMITTED` means the upstream PR exists and its stored bytes/head were verified. Receipt
   attestation and later PR/CI outcome publication are asynchronous. The always-on `run` process uses
   `reconcilePublicationBatch()` to update `publication.json`, retry pending attestations, and release
-  the one-open-PR reservation after merge or closure. Failure leaves the upstream PR open and
+  the one-open-PR reservation after merge or closure. `reconcile` performs the same bounded pass when
+  `run` is stopped and also prints current follow-up facts. Failure leaves the upstream PR open and
   recoverable and never creates a replacement PR.
 
 There is no shift activation, JIT window, NTP gate, profile-exit gate, reviewer-calibration gate,

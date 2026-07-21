@@ -1,4 +1,4 @@
-import {access, mkdir, mkdtemp, rm} from 'node:fs/promises';
+import {access, mkdir, mkdtemp, rm, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
@@ -80,6 +80,7 @@ function replacementManifest(plan, manifest, artifact, refreshed) {
     patch_sha256: refreshed.patch_sha256,
     repository_path: artifact.repository,
     patch_path: refreshed.patch_file,
+    verification_path: path.join(artifact.root, 'verification.json'),
     verification: refreshed.verification,
     changed_files: refreshed.verification.changed_files,
     changed_lines: refreshed.verification.changed_lines,
@@ -158,6 +159,9 @@ export function createStaleRefresher({
       const next = replacementManifest(plan, manifest, {root: refreshRoot, repository}, {
         ...refreshed,
         patch_file: patchFile,
+      });
+      await writeFile(next.verification_path, `${JSON.stringify(refreshed.verification, null, 2)}\n`, {
+        mode: 0o600,
       });
       return {manifest: next};
     } catch (error) {

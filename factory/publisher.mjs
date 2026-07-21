@@ -101,6 +101,18 @@ function submittedPr(publication) {
     (publication?.publication_state === 'FAILED' && publication.last_error === 'STORED_PR_MISMATCH');
 }
 
+function submittedCorrectionSupersedesBoard(immutable, ready, approval, publication) {
+  const currentManifest = manifestFor(ready);
+  const currentCommit = value(currentManifest?.commit_oid, currentManifest?.commitOid);
+  const currentDiffers = itemDigest(immutable) !== itemDigest(ready) ||
+    value(immutable?.manifest_sha256, immutable?.manifest_digest) !==
+      value(ready?.manifest_sha256, ready?.manifest_digest);
+  return currentDiffers && submittedPr(publication) && Boolean(currentCommit) &&
+    publication.pushed_oid === currentCommit && publication.pr_head_oid === currentCommit &&
+    Boolean(publication.receipt_approval_digest) &&
+    publication.receipt_approval_digest !== value(approval?.approval_digest, approval?.digest);
+}
+
 function amendmentHead(publication, plan) {
   if (!Array.isArray(plan.manifest?.planned_actions) ||
       !plan.manifest.planned_actions.includes('update-upstream-pr')) return null;
@@ -649,6 +661,12 @@ export async function publishBoard(boardDigest, {
       results.push({mission_id: id, state: 'FAILED', code: 'APPROVED_ITEM_MISSING'});
       continue;
     }
+    const priorPublication = await db.getPublication(id);
+    if (submittedCorrectionSupersedesBoard(immutable, ready, approval, priorPublication)) {
+      results.push({mission_id: id, state: 'SKIPPED', code: 'APPROVAL_SUPERSEDED',
+        detail: 'the current correction was already submitted under a newer content-bound authorization'});
+      continue;
+    }
     const approvedBoardId = value(board.board_id, board.boardId);
     const currentBoardId = value(ready.board_id, ready.boardId);
     if (approvedBoardId && currentBoardId && approvedBoardId !== currentBoardId) {
@@ -656,7 +674,6 @@ export async function publishBoard(boardDigest, {
         detail: `the current READY item belongs to corrected board ${currentBoardId}`});
       continue;
     }
-    const priorPublication = await db.getPublication(id);
     if (priorPublication?.publication_state === 'SUPERSEDED') {
       results.push({mission_id: id, state: 'SUPERSEDED', code: 'APPROVAL_TERMINAL',
         detail: 'a superseded mission cannot be published under its previous approval'});
@@ -721,7 +738,11 @@ export async function publishBoard(boardDigest, {
       results.push(await failItem(db, plan, 'PUBLICATION_REPOSITORY_BLOCKED', blocked));
       continue;
     }
-    eligible.push({...plan, approval_digest: approval.approval_digest});
+    const task = typeof db.getTask === 'function' ? await db.getTask(plan.task_id) : null;
+    const invitation = task?.live_state?.candidate ?? {};
+    eligible.push({...plan, approval_digest: approval.approval_digest,
+      invitation_policy_present: invitation.invitationPolicyPresent === true,
+      invitation_labels: Array.isArray(invitation.invitationLabels) ? invitation.invitationLabels : []});
   }
 
   const clean = [];
