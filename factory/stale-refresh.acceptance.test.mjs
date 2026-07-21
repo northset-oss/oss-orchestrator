@@ -125,12 +125,13 @@ function localDockerRun(calls) {
     if (args.includes('/deps/.northset-ready')) return {code: 0, stdout: '', stderr: ''};
     assert.equal(args[0], 'run');
     const mount = args.find((argument) => typeof argument === 'string' &&
-      argument.startsWith('type=bind,src=') && argument.includes(',dst=/workspace,readonly'));
+      argument.startsWith('type=bind,src=') && argument.includes(',dst=/source,readonly'));
     assert.ok(mount, args.join(' '));
-    const checkout = mount.slice('type=bind,src='.length).split(',dst=/workspace,readonly')[0];
+    const checkout = mount.slice('type=bind,src='.length).split(',dst=/source,readonly')[0];
     const cleanEnvironment = Object.fromEntries(Object.entries(process.env)
       .filter(([name]) => !name.startsWith('NODE_TEST')));
-    return runBounded('sh', ['-lc', args.at(-1)], {
+    const commandInWorkspace = args.at(-1).split(' && ').slice(1).join(' && ');
+    return runBounded('sh', ['-lc', commandInWorkspace], {
       cwd: checkout, env: cleanEnvironment,
       timeoutMs: options.timeoutMs, maxOutputBytes: options.maxOutputBytes,
     });
@@ -192,7 +193,8 @@ test('S1 clean moved-base refresh keeps the mission and approved artifact while 
   assert.equal(await runGit(['-C', fixture.approved, 'status', '--porcelain', '--untracked-files=all']), approvedStatus);
   assert.equal(dockerCalls.filter((args) => args.includes('/deps/.northset-ready')).length, 1);
   assert.equal(dockerCalls.filter((args) => args.includes('--network=none') &&
-    args.some((entry) => String(entry).includes('dst=/workspace,readonly'))).length, 2);
+    args.some((entry) => String(entry).includes('dst=/source,readonly')) &&
+    args.includes('/workspace:rw,exec,nosuid,nodev,size=2g')).length, 2);
 });
 
 test('S2 refresh conflict is recoverable and leaves no replacement artifact or approved mutation', async (t) => {
