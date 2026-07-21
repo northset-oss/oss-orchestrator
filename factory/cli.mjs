@@ -9,6 +9,7 @@ import {approveBoard, createBoardIfDue, renderBoard} from './board.mjs';
 import {openFactoryDb} from './db.mjs';
 import {createGhCliPublisherAdapter, createGhCliTransport} from './gh-cli.mjs';
 import {createGitHubSafety, resumeGitHub} from './github-safety.mjs';
+import {buildOfferDossier} from './offer-dossier.mjs';
 import {publishBoard} from './publisher.mjs';
 import {
   createReceiptPublisher,
@@ -32,7 +33,8 @@ export const FACTORY_DEFAULTS = Object.freeze({
   receiptRemote: 'https://github.com/northset-oss/verification-pilot.git',
 });
 
-const COMMANDS = new Set(['run', 'board', 'approve', 'publish', 'reconcile', 'github-status', 'github-resume']);
+const COMMANDS = new Set(['run', 'board', 'approve', 'publish', 'reconcile', 'dossier',
+  'github-status', 'github-resume']);
 const COMMON_VALUE_FLAGS = new Set(['--db', '--pause-file', '--gh-bin']);
 const COMMAND_VALUE_FLAGS = Object.freeze({
   run: new Set(['--lake', '--profile', '--workers', '--board-size', '--board-max-age-minutes',
@@ -41,6 +43,7 @@ const COMMAND_VALUE_FLAGS = Object.freeze({
   approve: new Set(['--board', '--ids', '--reject-ids', '--approved-by']),
   publish: new Set(['--board', '--receipt-remote', '--artifact-root', '--repository-open-override']),
   reconcile: new Set(['--limit', '--receipt-remote']),
+  dossier: new Set(['--limit']),
   'github-status': new Set(),
   'github-resume': new Set(['--reason', '--cleared-by', '--repository']),
 });
@@ -50,6 +53,7 @@ const COMMAND_BOOLEAN_FLAGS = Object.freeze({
   approve: new Set(),
   publish: new Set(),
   reconcile: new Set(),
+  dossier: new Set(),
   'github-status': new Set(),
   'github-resume': new Set(['--acknowledge-forbidden']),
 });
@@ -150,7 +154,7 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
   const values = [...argv];
   const command = values.shift();
   if (!COMMANDS.has(command)) {
-    throw new Error('command must be run, board, approve, publish, reconcile, github-status, or github-resume');
+    throw new Error('command must be run, board, approve, publish, reconcile, dossier, github-status, or github-resume');
   }
   const allowedValues = new Set([...COMMON_VALUE_FLAGS, ...COMMAND_VALUE_FLAGS[command]]);
   const allowedBooleans = COMMAND_BOOLEAN_FLAGS[command];
@@ -252,6 +256,7 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
         FACTORY_DEFAULTS.receiptRemote,
     };
   }
+  if (command === 'dossier') return {...common, limit: positiveInteger(parsed.get('--limit') ?? '30', '--limit', 100)};
   if (command === 'github-resume') {
     const reason = parsed.get('--reason');
     if (!reason?.trim()) throw new Error('--reason is required for github-resume');
@@ -393,6 +398,18 @@ export async function executeFactoryCli(argv, {
 
   const db = deps.openDb(options.database);
   try {
+    if (options.command === 'dossier') {
+      const safety = deps.createSafety({
+        pauseFile: options.pauseFile,
+        transport: safetyTransport,
+        repositoryState: typeof db.getPublicActionState === 'function'
+          ? db.getPublicActionState.bind(db) : db,
+      });
+      const github = dependencies.github ?? deps.createPublisherAdapter({transport});
+      const result = await buildOfferDossier({db, github, safety, limit: options.limit});
+      stdout.write(result.summary);
+      return result;
+    }
     if (options.command === 'reconcile') {
       const safety = deps.createSafety({
         pauseFile: options.pauseFile,
