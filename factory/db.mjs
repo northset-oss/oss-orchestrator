@@ -944,24 +944,25 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     });
   }
 
-  function replaceVerifiedReady(missionId, manifestDraft, {
+  function replaceVerifiedReadyFromState(missionId, manifestDraft, {
     durationMs = null, patchSha256 = null, commitOid = null, verification = null,
     riskTier = 'GREEN', model = null, now = new Date(),
-  } = {}) {
+  } = {}, {
+    approvalState, taskState, requireUnboarded = false, approvalError, taskError,
+  }) {
     if (!['GREEN', 'AMBER', 'RED'].includes(riskTier)) throw new Error('risk tier must be GREEN, AMBER, or RED');
     return transaction(() => {
       const current = getReadyItem(missionId);
       if (!current) throw new Error(`unknown mission ${missionId}`);
-      if (current.approval_state !== 'REJECTED') {
-        throw new Error('only a rejected READY item can be replaced');
+      if (current.approval_state !== approvalState) throw new Error(approvalError);
+      if (requireUnboarded && current.board_id !== null) {
+        throw new Error('only an unboarded pending READY item can be replaced');
       }
       if (getPublication(missionId)) throw new Error('a published mission cannot be replaced');
       const board = current.board_id ? getBoard(current.board_id) : null;
       if (board?.state === 'OPEN') throw new Error('the previous READY board must be closed before replacement');
       const task = connection.prepare('SELECT * FROM tasks WHERE task_id=?').get(current.task_id);
-      if (!task || task.state !== 'REJECTED_BY_OWNER') {
-        throw new Error('only an owner-rejected task can receive replacement verified bytes');
-      }
+      if (!task || task.state !== taskState) throw new Error(taskError);
 
       const readyAt = iso(now);
       const attemptId = randomUUID();
@@ -996,17 +997,38 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       const replaced = connection.prepare(`UPDATE ready_items SET
         attempt_id=?,manifest_sha256=?,item_digest=?,manifest_json=?,risk_tier=?,ready_at=?,
         board_id=NULL,approval_state='PENDING'
-        WHERE mission_id=? AND task_id=? AND approval_state='REJECTED'`).run(
+        WHERE mission_id=? AND task_id=? AND approval_state=?
+          AND (?=0 OR board_id IS NULL)`).run(
         attemptId, manifestSha, itemDigest, json(manifest), riskTier, readyAt,
-        missionId, task.task_id,
+        missionId, task.task_id, approvalState, requireUnboarded ? 1 : 0,
       );
-      if (replaced.changes !== 1) throw new Error('READY replacement lost its rejected mission binding');
+      const bindingLabel = approvalState === 'REJECTED' ? 'rejected' : approvalState.toLowerCase();
+      if (replaced.changes !== 1) throw new Error(`READY replacement lost its ${bindingLabel} mission binding`);
       const updated = connection.prepare(`UPDATE tasks SET state='READY',attempt_count=?,last_error=NULL,
-        worker_id=NULL,updated_at=? WHERE task_id=? AND state='REJECTED_BY_OWNER'`).run(
-        attemptNumber, readyAt, task.task_id,
+        worker_id=NULL,updated_at=? WHERE task_id=? AND state=?`).run(
+        attemptNumber, readyAt, task.task_id, taskState,
       );
-      if (updated.changes !== 1) throw new Error('READY replacement lost its rejected task binding');
+      if (updated.changes !== 1) throw new Error(`READY replacement lost its ${bindingLabel} task binding`);
       return getReadyItem(missionId);
+    });
+  }
+
+  function replaceVerifiedReady(missionId, manifestDraft, options = {}) {
+    return replaceVerifiedReadyFromState(missionId, manifestDraft, options, {
+      approvalState: 'REJECTED',
+      taskState: 'REJECTED_BY_OWNER',
+      approvalError: 'only a rejected READY item can be replaced',
+      taskError: 'only an owner-rejected task can receive replacement verified bytes',
+    });
+  }
+
+  function replacePendingVerifiedReady(missionId, manifestDraft, options = {}) {
+    return replaceVerifiedReadyFromState(missionId, manifestDraft, options, {
+      approvalState: 'PENDING',
+      taskState: 'READY',
+      requireUnboarded: true,
+      approvalError: 'only a pending READY item can be replaced before review',
+      taskError: 'only a READY task can receive replacement verified bytes before review',
     });
   }
 
@@ -1238,6 +1260,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     getBoardApproval,
     replaceReadyManifest,
     replaceVerifiedReady,
+    replacePendingVerifiedReady,
     savePublication,
     getPublication,
     listPublications,
