@@ -161,7 +161,14 @@ test('parser provides stable paths and strictly validates command-specific argum
   assert.equal(parsed.candidateLimit, 16);
   assert.equal(parsed.boardMaxAgeMinutes, 30);
   assert.equal(parsed.pollMs, 5000);
+  assert.equal(parsed.reconcileLimit, 30);
   assert.equal(parsed.once, false);
+  assert.equal(parseFactoryCliArgs([
+    'run', '--once', '--reconcile-limit', '0',
+  ], {env: {}}).reconcileLimit, 0);
+  assert.throws(() => parseFactoryCliArgs([
+    'run', '--reconcile-limit', '-1',
+  ], {env: {}}), /non-negative integer/);
 
   const discover = parseFactoryCliArgs(['discover'], {env: {}});
   assert.equal(discover.lake, FACTORY_DEFAULTS.lake);
@@ -548,6 +555,33 @@ test('run performs one bounded asynchronous reconciliation pass without blocking
   assert.equal(reconciliationOptions.limit, 30);
   assert.deepEqual(result.reconciliation, {
     runs: 1, processed: 2, failures: 0, paused: 0, last_error: null,
+  });
+});
+
+test('run can disable reconciliation for a worker-only bounded cycle', async () => {
+  const db = fakeDb({
+    listReconciliationCandidates: () => [],
+    stats: () => ({ready_items: 1}),
+  });
+  let localCycles = 0;
+  const result = await executeFactoryCli(['run', '--once', '--reconcile-limit', '0'], {
+    env: {},
+    stdout: output().stream,
+    dependencies: baseDependencies(db, {
+      driver: {},
+      source: {fill: async () => ({candidates: [], results: [], enqueued: []})},
+      createBoard: () => null,
+      createReceiptStatusPublisher: () => assert.fail('worker-only run must not create a status publisher'),
+      reconcilePublicationBatch: async () => assert.fail('worker-only run must not reconcile publications'),
+      runCycle: async () => {
+        localCycles += 1;
+        return {claimed: 1, results: [{state: 'READY'}]};
+      },
+    }),
+  });
+  assert.equal(localCycles, 1);
+  assert.deepEqual(result.reconciliation, {
+    runs: 0, processed: 0, failures: 0, paused: 0, last_error: null,
   });
 });
 

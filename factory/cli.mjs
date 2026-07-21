@@ -40,7 +40,8 @@ const COMMON_VALUE_FLAGS = new Set(['--db', '--pause-file', '--gh-bin']);
 const COMMAND_VALUE_FLAGS = Object.freeze({
   discover: new Set(['--lake', '--target']),
   run: new Set(['--lake', '--profile', '--workers', '--board-size', '--board-max-age-minutes',
-    '--candidate-limit', '--worker-command', '--work-root', '--artifact-root', '--receipt-remote', '--poll-ms']),
+    '--candidate-limit', '--worker-command', '--work-root', '--artifact-root', '--receipt-remote', '--poll-ms',
+    '--reconcile-limit']),
   board: new Set(),
   approve: new Set(['--board', '--ids', '--reject-ids', '--approved-by']),
   publish: new Set(['--board', '--receipt-remote', '--artifact-root', '--repository-open-override']),
@@ -213,6 +214,7 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
       receiptRemote: parsed.get('--receipt-remote') ?? env.OSS_FACTORY_RECEIPT_REMOTE ??
         FACTORY_DEFAULTS.receiptRemote,
       pollMs: nonnegativeInteger(parsed.get('--poll-ms') ?? '5000', '--poll-ms'),
+      reconcileLimit: nonnegativeInteger(parsed.get('--reconcile-limit') ?? '30', '--reconcile-limit'),
       once: parsed.get('--once') === true,
     };
   }
@@ -512,9 +514,10 @@ export async function executeFactoryCli(argv, {
         artifactRoot: options.artifactRoot,
         checkoutProvider,
       });
-      const statusPublisher = dependencies.receiptStatusPublisher ?? deps.createReceiptStatusPublisher({
-        remoteUrl: options.receiptRemote,
-      });
+      const statusPublisher = options.reconcileLimit === 0 ? null
+        : dependencies.receiptStatusPublisher ?? deps.createReceiptStatusPublisher({
+          remoteUrl: options.receiptRemote,
+        });
       const recovered = db.recoverWorkingTasks?.() ?? [];
       const boardPolicy = {minSize: options.boardSize, maxAgeMinutes: options.boardMaxAgeMinutes};
       const sourceTotal = {selected: 0, go: 0, skipped: 0, escalated: 0, enqueued: 0, paused: 0};
@@ -568,14 +571,15 @@ export async function executeFactoryCli(argv, {
           break;
         }
         const reconciliationDue = Date.now() >= nextReconciliationAt;
-        if (typeof db.listReconciliationCandidates === 'function' && reconciliationDue) {
+        if (options.reconcileLimit > 0 &&
+            typeof db.listReconciliationCandidates === 'function' && reconciliationDue) {
           try {
             const reconciled = await deps.reconcilePublicationBatch({
               db,
               github,
               safety,
               statusPublisher,
-              limit: 30,
+              limit: options.reconcileLimit,
             });
             reconciliation.runs += 1;
             reconciliation.processed += Number(reconciled?.processed ?? 0);
