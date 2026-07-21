@@ -1,0 +1,20 @@
+{
+  "domain": "northset-published-pr-correction-authorization-v1",
+  "authorization_basis": "User explicitly instructed: Approve and publish M-1014 and M-1048 on board sha256:91eb3c9fa71cc28707bf7294295cdc40ff7f06794328e01c4d5608217c300a9b.",
+  "board_digest": "sha256:91eb3c9fa71cc28707bf7294295cdc40ff7f06794328e01c4d5608217c300a9b",
+  "approval_digest": "sha256:ecdc11ceb610b8fc13b517d8fb9ba5bc83ed5237f96270d11a6bef9b1319eec6",
+  "approved_mission_ids": [
+    "M-1014",
+    "M-1048"
+  ],
+  "rejected_mission_ids": [],
+  "approved_by": "internal-user:aeziz",
+  "approved_at": "2026-07-21T18:35:29.891Z",
+  "public_actions": [
+    "publish-corrected-proof",
+    "replace-upstream-pr-head-with-lease",
+    "update-upstream-pr-body",
+    "reply-to-maintainer",
+    "verify-pr-and-receipt-readback"
+  ]
+}
