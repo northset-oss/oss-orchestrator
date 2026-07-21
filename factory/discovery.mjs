@@ -300,10 +300,23 @@ export async function discoverCandidates({
       available.push(record);
     }
   }
-  const selected = available.slice(0, target);
-  for (const record of available.slice(target)) {
-    skipped.push({candidate: record.candidate, reasons: [`discovery target ${target} reached`],
-      stratum: [...record.strata].sort().join(',')});
+  const selected = [];
+  const repositoryCounts = new Map();
+  for (const record of available) {
+    if (selected.length >= target) {
+      skipped.push({candidate: record.candidate, reasons: [`discovery target ${target} reached`],
+        stratum: [...record.strata].sort().join(',')});
+      continue;
+    }
+    const repository = record.repository.nameWithOwner.toLowerCase();
+    const repositoryCount = repositoryCounts.get(repository) ?? 0;
+    if (repositoryCount >= 2) {
+      skipped.push({candidate: record.candidate, reasons: ['repository discovery cap 2 reached'],
+        stratum: [...record.strata].sort().join(',')});
+      continue;
+    }
+    selected.push(record);
+    repositoryCounts.set(repository, repositoryCount + 1);
   }
 
   const connection = new DatabaseSync(path.resolve(lakePath));

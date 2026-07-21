@@ -132,6 +132,38 @@ test('bounded discovery routes all six searches through its callback, deduplicat
   assert.equal(refreshed.refreshed, 2);
 });
 
+test('a high-score repository flood is capped at two while later repositories fill the target', async (t) => {
+  const lake = await temporaryLake(t);
+  const flooded = [
+    issue('Flooded/Repo', 10, {stars: 20_000}),
+    issue('Flooded/Repo', 11, {stars: 20_000}),
+    issue('Flooded/Repo', 12, {stars: 20_000}),
+    issue('Flooded/Repo', 13, {stars: 20_000}),
+  ];
+  const later = issue('Later/Repo', 20, {stars: 10});
+  let calls = 0;
+  const result = await discoverCandidates({
+    lakePath: lake,
+    target: 3,
+    now: NOW,
+    search: async () => ({body: {data: {search: {nodes: calls++ === 0 ? [...flooded, later] : []}}}}),
+  });
+
+  assert.equal(calls, 6);
+  assert.deepEqual(result.candidates.map((item) => item.candidate), [
+    'flooded/repo#10', 'flooded/repo#11', 'later/repo#20',
+  ]);
+  assert.equal(result.skipped_reason_counts['repository discovery cap 2 reached'], 2);
+  assert.deepEqual(result.skipped.filter((item) =>
+    item.reasons.includes('repository discovery cap 2 reached')).map((item) => item.candidate),
+  ['flooded/repo#12', 'flooded/repo#13']);
+
+  const db = new DatabaseSync(lake, {readOnly: true});
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM issues WHERE repo_key='flooded/repo'").get().count, 2);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM issues WHERE repo_key='later/repo'").get().count, 1);
+  db.close();
+});
+
 test('discovery target rejects zero, non-integers, and values above the hard cap before search', async () => {
   for (const target of [0, 1.5, DISCOVERY_MAX_TARGET + 1]) {
     await assert.rejects(() => discoverCandidates({target, search: async () => assert.fail('must not search')}),
