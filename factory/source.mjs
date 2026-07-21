@@ -12,6 +12,20 @@ const CLEARLY_NON_NODE_PRIMARY_LANGUAGES = new Set([
   'Julia', 'Jupyter Notebook', 'Kotlin', 'Lua', 'Makefile', 'Nextflow', 'PHP',
   'PowerShell', 'Python', 'R', 'Ruby', 'Rust', 'Shell', 'Swift', 'TeX',
 ]);
+const CONTRIBUTION_POLICY_FILES = [
+  ['rootReadme', 'README.md'],
+  ['rootContributing', 'CONTRIBUTING.md'],
+  ['githubContributing', '.github/CONTRIBUTING.md'],
+  ['rootAgents', 'AGENTS.md'],
+  ['githubAgents', '.github/AGENTS.md'],
+  ['rootClaude', 'CLAUDE.md'],
+  ['rootAiPolicy', 'AI_POLICY.md'],
+  ['githubAiPolicy', '.github/AI_POLICY.md'],
+  ['rootPullRequestTemplate', 'PULL_REQUEST_TEMPLATE.md'],
+  ['githubPullRequestTemplate', '.github/PULL_REQUEST_TEMPLATE.md'],
+  ['rootPullRequestTemplateLower', 'pull_request_template.md'],
+  ['githubPullRequestTemplateLower', '.github/pull_request_template.md'],
+];
 
 function assertWorkers(value) {
   if (!Number.isInteger(value) || value < 1 || value > 100) {
@@ -194,6 +208,9 @@ export function buildPreflightQuery(candidates, {northsetLogin = 'AysajanE'} = {
         rootPackage: object(expression: "HEAD:package.json") {
           ... on Blob { byteSize text }
         }
+        ${CONTRIBUTION_POLICY_FILES.map(([alias, file]) => `${alias}: object(expression: ${JSON.stringify(`HEAD:${file}`)}) {
+          ... on Blob { byteSize text }
+        }`).join('\n        ')}
         pnpmWorkspaceYaml: object(expression: "HEAD:pnpm-workspace.yaml") {
           ... on Blob { byteSize }
         }
@@ -257,6 +274,10 @@ export function normalizePreflight(candidate, data) {
       .some((item) => Number(item?.byteSize) > 0);
   const yarnBerryLayout = /^yarn@(?:[2-9]|[1-9][0-9]+)(?:\.|$)/i
     .test(String(rootPackage?.packageManager ?? ''));
+  const contributionPolicies = CONTRIBUTION_POLICY_FILES
+    .map(([alias, file]) => ({file, text: String(repository?.[alias]?.text ?? '')}))
+    .filter((policy) => policy.text.trim().length > 0);
+  const prohibitedAiPolicyFile = aiContributionProhibition(contributionPolicies)?.file ?? null;
   const crossReferencedPrs = (issue?.timelineItems?.nodes ?? [])
     .map((event) => event?.source)
     .filter((source) => source?.__typename === 'PullRequest')
@@ -285,6 +306,7 @@ export function normalizePreflight(candidate, data) {
       unsupportedNodeLayout: workspaceLayout
         ? 'multi-package workspaces are outside the single-package Node lane'
         : yarnBerryLayout ? 'Yarn Berry is outside the node_modules dependency lane' : null,
+      prohibitedAiPolicyFile,
       northsetOpenPrs: Number(data?.northsetOpenPrCount ?? data?.northset?.issueCount ?? 0),
     } : null,
     issue: issue ? {
@@ -326,6 +348,26 @@ function isUnapproved(labels) {
   return labels.some((label) => normalizedLabel(label) === 'unapproved');
 }
 
+function aiContributionProhibition(policies) {
+  const ai = String.raw`\b(?:AI|LLMs?|large language models?|ChatGPT|Claude|autonomous (?:AI )?agents?)\b`;
+  const generated = String.raw`\b(?:generated|authored|written|produced|created)\b`;
+  const contribution = String.raw`\b(?:code|contributions?|pull requests?|PRs?|patches|submissions?|changes)\b`;
+  const ban = String.raw`(?:will not be accepted|(?:are|is) not (?:accepted|allowed|permitted)|(?:are|is) (?:prohibited|forbidden|disallowed)|will be (?:rejected|closed)|we do not accept)`;
+  const directiveBan = new RegExp(String.raw`\b(?:do not|must not|may not|never)\s+(?:submit|open|create|author|write|include)[^.\n]{0,80}(?:${ai})[- ]?(?:${generated})?[^.\n]{0,80}(?:${contribution})`, 'i');
+  const agentBan = new RegExp(String.raw`(?:${ai})(?:\s+(?:coding\s+)?agents?|\s+tools?)?[^.\n]{0,80}(?:must not|may not|cannot|(?:are|is) not allowed to|(?:are|is) (?:prohibited|forbidden) from)[^.\n]{0,80}(?:contribut|submit|author|write|create|open)[^.\n]{0,80}(?:${contribution})`, 'i');
+  const after = new RegExp(String.raw`(?:${contribution})[^.\n]{0,120}(?:${generated})[^.\n]{0,80}(?:${ai})[^.\n]{0,160}(?:${ban})`, 'i');
+  const before = new RegExp(String.raw`(?:${ai})[^.\n]{0,80}(?:${generated})[^.\n]{0,80}(?:${contribution})[^.\n]{0,160}(?:${ban})`, 'i');
+  const banFirst = new RegExp(String.raw`(?:${ban})[^.\n]{0,120}(?:${ai})[^.\n]{0,80}(?:${generated})?[^.\n]{0,80}(?:${contribution})`, 'i');
+  const noAi = new RegExp(String.raw`\bno\s+(?:${ai})(?:[- ](?:${generated}))?\s+${contribution}\b`, 'i');
+  const technologyReferenceBan = new RegExp(String.raw`(?:${ai})[^.\n]{0,200}(?:${contribution})\s+(?:made|created|authored|written|produced)\s+using\s+(?:these|such)\s+technolog(?:y|ies)[^.\n]{0,120}(?:${ban})`, 'i');
+  return (policies ?? []).find(({text}) => String(text).split(/\n\s*\n/).some((paragraph) => {
+    const statement = paragraph.replace(/\b(?:e\.g\.|i\.e\.)/gi, '').replace(/\s+/g, ' ');
+    return directiveBan.test(statement) || agentBan.test(statement) || after.test(statement) ||
+      before.test(statement) || banFirst.test(statement) || noAi.test(statement) ||
+      technologyReferenceBan.test(statement);
+  })) ?? null;
+}
+
 function recentExternalClaim(comments, northsetLogin, now) {
   const cutoff = now.getTime() - 45 * DAY_MS;
   return comments.find((comment) => {
@@ -353,6 +395,9 @@ export function evaluatePreflight(live, {northsetLogin = 'AysajanE', now = new D
   if (repository?.archived || repository?.fork) reasons.push('repository is archived or forked');
   if (repository && !repository.hasRootPackageJson) reasons.push('root package.json is missing');
   if (repository?.unsupportedNodeLayout) reasons.push(repository.unsupportedNodeLayout);
+  if (repository?.prohibitedAiPolicyFile) {
+    reasons.push(`repository policy prohibits AI-generated contributions (${repository.prohibitedAiPolicyFile})`);
+  }
   if (repository?.northsetOpenPrs > 0) reasons.push('Northset already has an open PR in the repository');
   const openLinked = (issue?.crossReferencedPrs ?? []).filter((pr) => pr.state === 'OPEN');
   const mergedLinked = (issue?.crossReferencedPrs ?? [])
