@@ -1,0 +1,16 @@
+{
+  "M-1014": {
+    "mission_id": "M-1014",
+    "receipt_url": "https://northset-oss.github.io/verification-pilot/receipts/M-1014/",
+    "proof_sha256": "sha256:8fc1755bb259e294aa3427688d46a7548a63531b062a10f15bc5cc72c270f343",
+    "batch_approval_digest": "sha256:ecdc11ceb610b8fc13b517d8fb9ba5bc83ed5237f96270d11a6bef9b1319eec6",
+    "batch_commit_oid": "33a26657392924fd598f754f6775fcfd922509f6"
+  },
+  "M-1048": {
+    "mission_id": "M-1048",
+    "receipt_url": "https://northset-oss.github.io/verification-pilot/receipts/M-1048/",
+    "proof_sha256": "sha256:4aae679ed67ecf119454b81ad611c208b8216eacb18299da771fbf92c46351da",
+    "batch_approval_digest": "sha256:ecdc11ceb610b8fc13b517d8fb9ba5bc83ed5237f96270d11a6bef9b1319eec6",
+    "batch_commit_oid": "33a26657392924fd598f754f6775fcfd922509f6"
+  }
+}
