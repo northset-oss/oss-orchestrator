@@ -261,7 +261,18 @@ test('G5 repository cooldown and one-open-PR cap reject before transport', async
     () => github.request({priority: 'final_submission', kind: 'pr_create', operation: 'create', repository: 'owner/open'}),
     (error) => error instanceof GitHubPublicLimitError && /one-open-PR/.test(error.reason),
   );
-  assert.equal(calls, 0);
+  await github.request({
+    priority: 'final_submission', kind: 'pr_create', operation: 'create', repository: 'owner/open',
+    mission_id: 'M-1046', repositoryOpenOverrideMissionId: 'M-1046',
+  });
+  await assert.rejects(
+    () => github.request({
+      priority: 'final_submission', kind: 'pr_create', operation: 'create', repository: 'owner/cooling',
+      mission_id: 'M-1046', repositoryOpenOverrideMissionId: 'M-1046',
+    }),
+    (error) => error instanceof GitHubPublicLimitError && /cooldown/.test(error.reason),
+  );
+  assert.equal(calls, 1);
 });
 
 test('G6 a paused GitHub publisher does not govern local worker execution', async (t) => {

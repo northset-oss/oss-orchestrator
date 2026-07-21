@@ -89,6 +89,18 @@ node factory/cli.mjs publish \
   --board sha256:<digest>
 ```
 
+When the owner explicitly overrides only the one-open-PR-per-repository cap for one approved mission,
+bind that exception to the mission on the approved board:
+
+```sh
+node factory/cli.mjs publish \
+  --board sha256:<digest> \
+  --repository-open-override M-201
+```
+
+The override does not bypass approval, live issue eligibility, collision checks, repository cooldowns,
+or owner/hour/day publication caps.
+
 It validates the approval, performs the final live collision/occupancy check, publishes one immutable
 receipt batch, pushes exact approved commits, opens upstream PRs through the paced safety queue, and
 reads each PR back to verify its stored title, body, base, and head OID. Re-running the same command

@@ -547,10 +547,13 @@ async function publishOne(plan, {
     }
   }
   if (!pullRequest) {
-    if (openPrCapReached(repositoryState)) {
+    const repositoryOpenOverride = plan.repositoryOpenOverrideMissionId === plan.mission_id;
+    if (!repositoryOpenOverride && openPrCapReached(repositoryState)) {
       return deferItem(db, plan, 'GITHUB_PUBLIC_LIMIT', 'one-open-PR cap reached');
     }
     pullRequest = await remoteRequest(safety, github, 'pr_create', 'create_pull_request', 'createPullRequest', {
+      mission_id: plan.mission_id,
+      repositoryOpenOverrideMissionId: plan.repositoryOpenOverrideMissionId,
       repository: plan.repository,
       owner: plan.repository.split('/')[0],
       fork_repository: plan.fork_repository,
@@ -627,6 +630,7 @@ export async function publishBoard(boardDigest, {
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   forkPollAttempts = 15,
   forkPollIntervalMs = 1_000,
+  repositoryOpenOverrideMissionId = null,
 } = {}) {
   if (!db) throw new TypeError('db is required');
   if (!github) throw new TypeError('github is required');
@@ -649,6 +653,11 @@ export async function publishBoard(boardDigest, {
   if (value(approval.board_digest, approval.digest) !== boardDigest) throw new Error('approval board digest mismatch');
   verifyStoredApproval(board, approval, boardDigest);
   const approved = approvedMissionIds(approval);
+  if (repositoryOpenOverrideMissionId !== null &&
+      (!/^M-(?!0+$)[0-9]+$/.test(repositoryOpenOverrideMissionId) ||
+       !approved.includes(repositoryOpenOverrideMissionId))) {
+    throw new Error('repository-open override mission must be approved by the immutable board');
+  }
   if (!approved.length) return {board_digest: boardDigest, results: []};
   const immutableById = new Map(boardItems(board).map((item) => [missionId(item), item]));
   const eligible = [];
@@ -741,6 +750,7 @@ export async function publishBoard(boardDigest, {
     const task = typeof db.getTask === 'function' ? await db.getTask(plan.task_id) : null;
     const invitation = task?.live_state?.candidate ?? {};
     eligible.push({...plan, approval_digest: approval.approval_digest,
+      repositoryOpenOverrideMissionId: id === repositoryOpenOverrideMissionId ? id : null,
       invitation_policy_present: invitation.invitationPolicyPresent === true,
       invitation_labels: Array.isArray(invitation.invitationLabels) ? invitation.invitationLabels : []});
   }

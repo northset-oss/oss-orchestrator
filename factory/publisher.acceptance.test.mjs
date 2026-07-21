@@ -374,6 +374,37 @@ test('publisher creates a missing fork once, validates it through safety, and ad
   assert.equal(requests.find((item) => item.operation === 'create_fork').kind, 'mutation');
 });
 
+test('publisher applies the repository-open override only to its approved mission', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  db.repositoryStates.set('upstream1/project', {open_northset_prs: 1});
+  const requests = [];
+  const result = await publishBoard(db.board.board_digest, options(db, github, {
+    repositoryOpenOverrideMissionId: 'M-001',
+    liveRecheck: async (plan) => ({
+      clean: plan.repositoryOpenOverrideMissionId === plan.mission_id,
+      reason: 'Northset already has another open PR in the repository',
+    }),
+    safety: {request: async (request) => {
+      requests.push(request);
+      if (request.kind === 'pr_create') {
+        assert.equal(request.mission_id, 'M-001');
+        assert.equal(request.repositoryOpenOverrideMissionId, 'M-001');
+      }
+      return request.execute();
+    }},
+  }));
+  assert.equal(result.results[0].state, 'SUBMITTED');
+  assert.equal(requests.filter((request) => request.kind === 'pr_create').length, 1);
+
+  const rejectedDb = new FakeDb(1);
+  const rejectedGithub = new FakeGitHub();
+  await assert.rejects(() => publishBoard(rejectedDb.board.board_digest,
+    options(rejectedDb, rejectedGithub, {repositoryOpenOverrideMissionId: 'M-999'})),
+  /must be approved by the immutable board/);
+  assert.equal(rejectedGithub.events.length, 0);
+});
+
 test('publisher pushes an approved evidence commit before the PR branch and adopts both on retry', async () => {
   const db = new FakeDb(1);
   const github = new FakeGitHub();

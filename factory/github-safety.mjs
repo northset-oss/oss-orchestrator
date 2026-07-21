@@ -393,7 +393,9 @@ export function createGitHubSafety({
     while (queue.length) queue.shift().reject(new GitHubPausedError(pause));
   };
 
-  const assertPublicAction = async ({repository, owner} = {}, governor = emptyGovernor()) => {
+  const assertPublicAction = async ({
+    repository, owner, mission_id: missionId, repositoryOpenOverrideMissionId,
+  } = {}, governor = emptyGovernor()) => {
     if (typeof repository !== 'string' || !repository.includes('/')) {
       throw new TypeError('PR creation requires repository owner/name');
     }
@@ -413,7 +415,10 @@ export function createGitHubSafety({
       item.repository.toLowerCase() === repository.toLowerCase());
     const durableRepoOpen = Object.keys(governor.open_repositories ?? {})
       .some((item) => item.toLowerCase() === repository.toLowerCase());
-    if (repoOpen >= PUBLIC_LIMITS.repositoryOpen || sessionRepoOpen || durableRepoOpen) {
+    const repositoryOpenOverride = typeof missionId === 'string' &&
+      repositoryOpenOverrideMissionId === missionId;
+    if (!repositoryOpenOverride &&
+        (repoOpen >= PUBLIC_LIMITS.repositoryOpen || sessionRepoOpen || durableRepoOpen)) {
       throw new GitHubPublicLimitError(`one-open-PR cap reached for ${repository}`);
     }
     const ownerToday = Math.max(

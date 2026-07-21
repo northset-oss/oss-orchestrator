@@ -176,6 +176,12 @@ test('parser provides stable paths and strictly validates command-specific argum
   assert.throws(() => parseFactoryCliArgs(['approve', '--board', BOARD, '--ids', 'M-001,M-001'], {env: {}}),
     /duplicate mission/);
   assert.throws(() => parseFactoryCliArgs(['publish', '--board', 'B-1'], {env: {}}), /sha256/);
+  assert.equal(parseFactoryCliArgs([
+    'publish', '--board', BOARD, '--repository-open-override', 'M-1046',
+  ], {env: {}}).repositoryOpenOverrideMissionId, 'M-1046');
+  assert.throws(() => parseFactoryCliArgs([
+    'publish', '--board', BOARD, '--repository-open-override', 'M-1046,M-1047',
+  ], {env: {}}), /one mission ID/);
   assert.deepEqual(parseFactoryCliArgs([
     'reconcile', '--limit', '17', '--receipt-remote', 'https://example.test/receipts.git',
   ], {env: {}}), {
@@ -602,7 +608,7 @@ test('approve records exactly the selected and rejected mission IDs', async () =
   assert.equal(db.closed, true);
 });
 
-test('publish routes the final recheck through safety and uses the injected receipt publisher', async () => {
+test('publish routes a mission-bound repository-open override to the publisher', async () => {
   const db = fakeDb();
   const stdout = output();
   const events = [];
@@ -623,7 +629,9 @@ test('publish routes the final recheck through safety and uses the injected rece
     return {'M-001': {receipt_url: 'https://receipts.test/M-001'}};
   };
   let publicationOptions;
-  const result = await executeFactoryCli(['publish', '--board', BOARD], {
+  const result = await executeFactoryCli([
+    'publish', '--board', BOARD, '--repository-open-override', 'M-1046',
+  ], {
     env: {},
     stdout: stdout.stream,
     dependencies: baseDependencies(db, {
@@ -649,6 +657,7 @@ test('publish routes the final recheck through safety and uses the injected rece
   assert.equal(publicationOptions.db, db);
   assert.equal(publicationOptions.github, github);
   assert.equal(publicationOptions.safety, safety);
+  assert.equal(publicationOptions.repositoryOpenOverrideMissionId, 'M-1046');
   assert.equal(events[0].name, 'safety');
   assert.equal(events[0].request.priority, 'final_submission');
   assert.equal(events[0].request.kind, 'read');

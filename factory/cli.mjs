@@ -39,7 +39,7 @@ const COMMAND_VALUE_FLAGS = Object.freeze({
     '--candidate-limit', '--worker-command', '--work-root', '--artifact-root', '--receipt-remote', '--poll-ms']),
   board: new Set(),
   approve: new Set(['--board', '--ids', '--reject-ids', '--approved-by']),
-  publish: new Set(['--board', '--receipt-remote', '--artifact-root']),
+  publish: new Set(['--board', '--receipt-remote', '--artifact-root', '--repository-open-override']),
   reconcile: new Set(['--limit', '--receipt-remote']),
   'github-status': new Set(),
   'github-resume': new Set(['--reason', '--cleared-by', '--repository']),
@@ -229,9 +229,15 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
     if (!/^sha256:[a-f0-9]{64}$/.test(board ?? '')) {
       throw new Error('--board must be a sha256:<64 lowercase hex> digest');
     }
+    const repositoryOpenOverrideMissionId = parsed.get('--repository-open-override') ?? null;
+    if (repositoryOpenOverrideMissionId !== null &&
+        !/^M-(?!0+$)[0-9]+$/.test(repositoryOpenOverrideMissionId)) {
+      throw new Error('--repository-open-override must be one mission ID such as M-201');
+    }
     return {
       ...common,
       board,
+      repositoryOpenOverrideMissionId,
       receiptRemote: parsed.get('--receipt-remote') ?? env.OSS_FACTORY_RECEIPT_REMOTE ??
         FACTORY_DEFAULTS.receiptRemote,
       artifactRoot: pathValue(parsed.get('--artifact-root') ?? env.OSS_FACTORY_ARTIFACT_ROOT,
@@ -627,6 +633,7 @@ export async function executeFactoryCli(argv, {
         liveRecheck,
         receiptPublisher,
         refreshStale,
+        repositoryOpenOverrideMissionId: options.repositoryOpenOverrideMissionId,
       });
       printJson(stdout, result);
       return result;

@@ -947,8 +947,10 @@ export function createGhCliPublisherAdapter({
     if (stop) reasons.push(`maintainer requested no submission${stop.author?.login ? `: ${stop.author.login}` : ''}`);
     const northsetPrs = (result.data?.northset?.nodes ?? []).filter((item) =>
       item?.repository?.nameWithOwner === repository && item.headRefName !== branch);
-    if (northsetPrs.length || Number(result.data?.northset?.issueCount ?? 0) >
-        (result.data?.northset?.nodes ?? []).filter((item) => item?.headRefName === branch).length) {
+    const repositoryOpenOverride = typeof plan?.mission_id === 'string' &&
+      plan?.repositoryOpenOverrideMissionId === plan.mission_id;
+    if (!repositoryOpenOverride && (northsetPrs.length || Number(result.data?.northset?.issueCount ?? 0) >
+        (result.data?.northset?.nodes ?? []).filter((item) => item?.headRefName === branch).length)) {
       reasons.push('Northset already has another open PR in the repository');
     }
     return {clean: reasons.length === 0, reason: reasons.join('; ') || null,

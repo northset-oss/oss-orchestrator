@@ -375,6 +375,13 @@ test('H6 final live recheck accepts unchanged clean state and explains concrete 
   assert.match(blocked.reason, /active external claim by contributor/);
   assert.match(blocked.reason, /another open PR/);
 
+  const overridden = await github.finalLiveRecheck({
+    ...plan, repositoryOpenOverrideMissionId: plan.mission_id,
+  });
+  assert.equal(overridden.clean, false);
+  assert.doesNotMatch(overridden.reason, /another open PR/);
+  assert.match(overridden.reason, /assigned to someone/);
+
   response = structuredClone(cleanResponse);
   response.data.repository.issue.labels.nodes = [];
   const uninvited = await github.finalLiveRecheck(plan);
