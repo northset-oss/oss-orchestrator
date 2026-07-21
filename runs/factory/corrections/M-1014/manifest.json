@@ -1,0 +1,290 @@
+{
+  "schema_version": 1,
+  "mission_id": "M-1014",
+  "task_id": "TASK-OSS-4377BA1619F013DC",
+  "candidate": "choices-js/choices#1373",
+  "repository": "Choices-js/Choices",
+  "fork_repository": "AysajanE/Choices",
+  "repository_path": "/Users/aeziz-local/oss-orchestrator/runs/factory/artifacts/TASK-OSS-4377BA1619F013DC/7f2a6734-6759-41c4-8593-02cd6d91a70e-qZJuVR/repo",
+  "patch_path": "/Users/aeziz-local/oss-orchestrator/runs/factory/corrections/M-1014/change.patch",
+  "verification_path": "/Users/aeziz-local/oss-orchestrator/runs/factory/corrections/M-1014/verification.json",
+  "issue_number": 1373,
+  "issue_url": "https://github.com/Choices-js/Choices/issues/1373",
+  "base_branch": "main",
+  "branch": "northset/m-1014",
+  "base_oid": "440641be900072991383c05ae66589e0d4c34f6e",
+  "previous_pr_head_oid": "e98f6d2eac6d33b08b6914c0bb566d68ba2fd70a",
+  "patch_sha256": "sha256:bf1b67a719dfa7a588dc679b0c206981329539b217ab565dd4738b9684f70545",
+  "tested_tree_oid": "81e88b2108166a490d2c4e2dda33623d1bdf4255",
+  "commit_oid": "403d2ea215222f41d32595fc01c35710f96e6d2c",
+  "checks": [
+    "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown"
+  ],
+  "test_command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+  "install_command": "npm ci --no-audit --no-fund",
+  "test_only_paths": [
+    "test/scripts/choices.test.ts"
+  ],
+  "base_failure_contains": "focuses input synchronously when input focus is allowed",
+  "verification": {
+    "ok": true,
+    "claim_type": "regression_fix",
+    "verification_started_at": "2026-07-21T18:27:32.410Z",
+    "verification_finished_at": "2026-07-21T18:27:35.869Z",
+    "verified_at": "2026-07-21T18:27:35.869Z",
+    "executed_commands": [
+      {
+        "phase": "base_observation",
+        "command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+        "network": "none",
+        "expected_result": "failure",
+        "result": "FAIL",
+        "expectation_met": true,
+        "started_at": "2026-07-21T18:27:32.411Z",
+        "finished_at": "2026-07-21T18:27:34.389Z",
+        "duration_ms": 1978,
+        "exit_code": 1,
+        "stdout_sha256": "sha256:c8865931fb87162e2cd63f86c3114760abddebeba96b41728729a7a80d71cceb",
+        "stderr_sha256": "sha256:737b57c7d28a74db7c9bba9bbfad45cf2977dddfbecd9e28f3e253cfb127fd71",
+        "output_sha256": "sha256:5dd6d011097f77cb23b1f32f56168897aa6364c4d7ba3e133b3c6a658eca6ae7"
+      },
+      {
+        "phase": "patched_observation",
+        "command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+        "network": "none",
+        "expected_result": "success",
+        "result": "PASS",
+        "expectation_met": true,
+        "started_at": "2026-07-21T18:27:34.389Z",
+        "finished_at": "2026-07-21T18:27:35.712Z",
+        "duration_ms": 1323,
+        "exit_code": 0,
+        "stdout_sha256": "sha256:f544bea6fd965538a8e9c9a10ffe8d0fbb0692decd1f44a96b125fc9b6468ad0",
+        "stderr_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "output_sha256": "sha256:00959351b030992b93b540e924e7b5c3e38949a50d8425e1e31c87c38967f6e1"
+      }
+    ],
+    "base_observation": {
+      "phase": "base_observation",
+      "command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+      "network": "none",
+      "expected_result": "failure",
+      "result": "FAIL",
+      "expectation_met": true,
+      "started_at": "2026-07-21T18:27:32.411Z",
+      "finished_at": "2026-07-21T18:27:34.389Z",
+      "duration_ms": 1978,
+      "exit_code": 1,
+      "stdout_sha256": "sha256:c8865931fb87162e2cd63f86c3114760abddebeba96b41728729a7a80d71cceb",
+      "stderr_sha256": "sha256:737b57c7d28a74db7c9bba9bbfad45cf2977dddfbecd9e28f3e253cfb127fd71",
+      "output_sha256": "sha256:5dd6d011097f77cb23b1f32f56168897aa6364c4d7ba3e133b3c6a658eca6ae7"
+    },
+    "patched_observation": {
+      "phase": "patched_observation",
+      "command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+      "network": "none",
+      "expected_result": "success",
+      "result": "PASS",
+      "expectation_met": true,
+      "started_at": "2026-07-21T18:27:34.389Z",
+      "finished_at": "2026-07-21T18:27:35.712Z",
+      "duration_ms": 1323,
+      "exit_code": 0,
+      "stdout_sha256": "sha256:f544bea6fd965538a8e9c9a10ffe8d0fbb0692decd1f44a96b125fc9b6468ad0",
+      "stderr_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "output_sha256": "sha256:00959351b030992b93b540e924e7b5c3e38949a50d8425e1e31c87c38967f6e1"
+    },
+    "patch_sha256": "sha256:bf1b67a719dfa7a588dc679b0c206981329539b217ab565dd4738b9684f70545",
+    "tested_tree_oid": "81e88b2108166a490d2c4e2dda33623d1bdf4255",
+    "commit_oid": "403d2ea215222f41d32595fc01c35710f96e6d2c",
+    "dependency_cache_key": "sha256:b539773ddc102f1aefca7a102e6f82e3594ac6e2f257bb59e77d8adcd54c5978",
+    "dco_verified": true,
+    "changed_files": [
+      {
+        "path": "src/scripts/choices.ts",
+        "status": "M",
+        "class": "production",
+        "lines": 8
+      },
+      {
+        "path": "test/scripts/choices.test.ts",
+        "status": "M",
+        "class": "existing_test",
+        "lines": 6
+      }
+    ],
+    "changed_lines": 14,
+    "environment": {
+      "profile": "node",
+      "image": "sha256:d5289634d7a51632a99b4796460f3235b5b91c0106cbffd1c74b0fd3b65563e8",
+      "architecture": "arm64",
+      "network": "none"
+    },
+    "test_command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+    "test_only_paths": [
+      "test/scripts/choices.test.ts"
+    ],
+    "base_failure_contains": "focuses input synchronously when input focus is allowed",
+    "dependency_install_command": "npm ci --no-audit --no-fund",
+    "dependency_image_digest": "sha256:d5289634d7a51632a99b4796460f3235b5b91c0106cbffd1c74b0fd3b65563e8",
+    "limitations": [
+      "Manual iOS-device testing was not performed."
+    ],
+    "additional_checks": [
+      {
+        "command": "npm run test:unit -- test/scripts/choices.test.ts",
+        "result": "PASS",
+        "summary": "150 tests passed."
+      },
+      {
+        "command": "npx eslint src/scripts/choices.ts test/scripts/choices.test.ts",
+        "result": "PASS",
+        "summary": "Targeted lint passed."
+      }
+    ]
+  },
+  "pr_title": "Focus input synchronously when showing dropdown",
+  "pr_body": "## Summary\n\n- Fix #1373 by focusing the search input synchronously while `showDropdown()` is still in the user-interaction path.\n- Keep dropdown rendering, measurement, event dispatch, and choice highlighting deferred to `requestAnimationFrame`.\n- Preserve `preventInputFocus` behavior.\n- Add a regression test for synchronous focus timing.\n\nFixes #1373\n\n## Why\n\nOn affected iOS Safari and WebView versions, deferring `input.focus()` into `requestAnimationFrame` can move it outside the WebKit user-interaction context needed to show the software keyboard. The input can appear focused while the user still has to tap it again before typing.\n\n## Testing\n\n- `npm run test:unit -- test/scripts/choices.test.ts -t showDropdown` — passed: 8 tests.\n- `npm run test:unit -- test/scripts/choices.test.ts` — passed: 150 tests.\n- `npx eslint src/scripts/choices.ts test/scripts/choices.test.ts` — passed.\n- Manual iOS-device testing was not performed.\n\n---\nAI assistance was used. This change was reviewed by Northset, and I accept responsibility for this submission.\n\n<!-- northset-receipt:M-1014:start -->\n### Verification\n\n[Northset proof-of-pass receipt M-1014](https://northset-oss.github.io/verification-pilot/receipts/M-1014/)  \nContributor self-run; not maintainer verification.\n<!-- northset-receipt:M-1014:end -->\n",
+  "summary": "Explains and preserves the synchronous iOS focus fix on current upstream main, with the migrated Vitest regression assertion.",
+  "changed_files": [
+    {
+      "path": "src/scripts/choices.ts",
+      "status": "M",
+      "class": "production",
+      "lines": 8
+    },
+    {
+      "path": "test/scripts/choices.test.ts",
+      "status": "M",
+      "class": "existing_test",
+      "lines": 6
+    }
+  ],
+  "changed_lines": 14,
+  "risk_tier": "AMBER",
+  "risk_warnings": [
+    "Replacing the existing PR head requires force-with-lease from the exact observed old head."
+  ],
+  "receipt_claim": {
+    "type": "regression_fix",
+    "statement": "With the regression assertion applied to current main, the clean network-off focused test failed before the production change and passed on the exact corrected commit."
+  },
+  "receipt_url": "https://northset-oss.github.io/verification-pilot/receipts/M-1014/",
+  "planned_actions": [
+    "publish-corrected-proof",
+    "replace-upstream-pr-head-with-lease",
+    "update-upstream-pr-body",
+    "reply-to-maintainer",
+    "verify-pr-and-receipt-readback"
+  ],
+  "limitations": [
+    "Manual iOS-device testing was not performed."
+  ],
+  "additional_check_results": [
+    {
+      "command": "npm run test:unit -- test/scripts/choices.test.ts",
+      "result": "PASS",
+      "summary": "150 tests passed."
+    },
+    {
+      "command": "npx eslint src/scripts/choices.ts test/scripts/choices.test.ts",
+      "result": "PASS",
+      "summary": "Targeted lint passed."
+    }
+  ],
+  "proof": {
+    "schema_version": 2,
+    "task_id": "TASK-OSS-4377BA1619F013DC",
+    "candidate": "choices-js/choices#1373",
+    "repository": "Choices-js/Choices",
+    "issue_number": 1373,
+    "base_oid": "440641be900072991383c05ae66589e0d4c34f6e",
+    "patch_sha256": "sha256:bf1b67a719dfa7a588dc679b0c206981329539b217ab565dd4738b9684f70545",
+    "tested_tree_oid": "81e88b2108166a490d2c4e2dda33623d1bdf4255",
+    "commit_oid": "403d2ea215222f41d32595fc01c35710f96e6d2c",
+    "checks": [
+      "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown"
+    ],
+    "executed_commands": [
+      {
+        "phase": "base_observation",
+        "command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+        "network": "none",
+        "expected_result": "failure",
+        "result": "FAIL",
+        "expectation_met": true,
+        "started_at": "2026-07-21T18:27:32.411Z",
+        "finished_at": "2026-07-21T18:27:34.389Z",
+        "duration_ms": 1978,
+        "exit_code": 1,
+        "stdout_sha256": "sha256:c8865931fb87162e2cd63f86c3114760abddebeba96b41728729a7a80d71cceb",
+        "stderr_sha256": "sha256:737b57c7d28a74db7c9bba9bbfad45cf2977dddfbecd9e28f3e253cfb127fd71",
+        "output_sha256": "sha256:5dd6d011097f77cb23b1f32f56168897aa6364c4d7ba3e133b3c6a658eca6ae7"
+      },
+      {
+        "phase": "patched_observation",
+        "command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+        "network": "none",
+        "expected_result": "success",
+        "result": "PASS",
+        "expectation_met": true,
+        "started_at": "2026-07-21T18:27:34.389Z",
+        "finished_at": "2026-07-21T18:27:35.712Z",
+        "duration_ms": 1323,
+        "exit_code": 0,
+        "stdout_sha256": "sha256:f544bea6fd965538a8e9c9a10ffe8d0fbb0692decd1f44a96b125fc9b6468ad0",
+        "stderr_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "output_sha256": "sha256:00959351b030992b93b540e924e7b5c3e38949a50d8425e1e31c87c38967f6e1"
+      }
+    ],
+    "checks_not_run": [],
+    "limitations": [
+      "Manual iOS-device testing was not performed.",
+      "Manual iOS-device testing was not performed."
+    ],
+    "verification_started_at": "2026-07-21T18:27:32.410Z",
+    "verification_finished_at": "2026-07-21T18:27:35.869Z",
+    "environment": {
+      "profile": "node",
+      "image": "sha256:d5289634d7a51632a99b4796460f3235b5b91c0106cbffd1c74b0fd3b65563e8",
+      "architecture": "arm64",
+      "network": "none"
+    },
+    "base_observation": {
+      "phase": "base_observation",
+      "command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+      "network": "none",
+      "expected_result": "failure",
+      "result": "FAIL",
+      "expectation_met": true,
+      "started_at": "2026-07-21T18:27:32.411Z",
+      "finished_at": "2026-07-21T18:27:34.389Z",
+      "duration_ms": 1978,
+      "exit_code": 1,
+      "stdout_sha256": "sha256:c8865931fb87162e2cd63f86c3114760abddebeba96b41728729a7a80d71cceb",
+      "stderr_sha256": "sha256:737b57c7d28a74db7c9bba9bbfad45cf2977dddfbecd9e28f3e253cfb127fd71",
+      "output_sha256": "sha256:5dd6d011097f77cb23b1f32f56168897aa6364c4d7ba3e133b3c6a658eca6ae7"
+    },
+    "patched_observation": {
+      "phase": "patched_observation",
+      "command": "npm run test:unit -- test/scripts/choices.test.ts -t showDropdown",
+      "network": "none",
+      "expected_result": "success",
+      "result": "PASS",
+      "expectation_met": true,
+      "started_at": "2026-07-21T18:27:34.389Z",
+      "finished_at": "2026-07-21T18:27:35.712Z",
+      "duration_ms": 1323,
+      "exit_code": 0,
+      "stdout_sha256": "sha256:f544bea6fd965538a8e9c9a10ffe8d0fbb0692decd1f44a96b125fc9b6468ad0",
+      "stderr_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "output_sha256": "sha256:00959351b030992b93b540e924e7b5c3e38949a50d8425e1e31c87c38967f6e1"
+    },
+    "claim": {
+      "type": "regression_fix",
+      "statement": "With the regression assertion applied to current main, the clean network-off focused test failed before the production change and passed on the exact corrected commit."
+    },
+    "batch_approval_digest": null,
+    "proof_sha256": "sha256:fb2856ff8f612c5cb8ad0b43fdda09b42d82c43dab7d9dfee48205a49e0276dc"
+  }
+}

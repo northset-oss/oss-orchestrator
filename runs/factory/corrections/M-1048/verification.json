@@ -1,0 +1,103 @@
+{
+  "ok": true,
+  "claim_type": "feature_implementation",
+  "verification_started_at": "2026-07-21T18:25:35.534Z",
+  "verification_finished_at": "2026-07-21T18:25:36.571Z",
+  "verified_at": "2026-07-21T18:25:36.571Z",
+  "executed_commands": [
+    {
+      "phase": "base_observation",
+      "command": "node -e 'const fs=require(\"fs\");const s=fs.readFileSync(\"src/cljs/nr/gameboard/board.cljs\",\"utf8\");const calls=(s.match(/replay-opponent-hand\\?/g)||[]).length;if(!s.includes(\"(defn replay-opponent-hand?\")||!s.includes(\"[facedown-card (:side card)]\")||calls<3){console.error(\"replay opponent hand visibility predicate is missing\");process.exit(1)}'",
+      "network": "none",
+      "expected_result": "failure",
+      "result": "FAIL",
+      "expectation_met": true,
+      "started_at": "2026-07-21T18:25:35.535Z",
+      "finished_at": "2026-07-21T18:25:36.067Z",
+      "duration_ms": 532,
+      "exit_code": 1,
+      "stdout_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "sha256:61e65f7153bb75b0f8c099540faf02709cccce0957a45914b8842d6ccbcf5330",
+      "output_sha256": "sha256:80f0430b91c264a89fd7caa114603a9986d93865102b2be445bd7db71602f84b"
+    },
+    {
+      "phase": "patched_observation",
+      "command": "node -e 'const fs=require(\"fs\");const s=fs.readFileSync(\"src/cljs/nr/gameboard/board.cljs\",\"utf8\");const calls=(s.match(/replay-opponent-hand\\?/g)||[]).length;if(!s.includes(\"(defn replay-opponent-hand?\")||!s.includes(\"[facedown-card (:side card)]\")||calls<3){console.error(\"replay opponent hand visibility predicate is missing\");process.exit(1)}'",
+      "network": "none",
+      "expected_result": "success",
+      "result": "PASS",
+      "expectation_met": true,
+      "started_at": "2026-07-21T18:25:36.067Z",
+      "finished_at": "2026-07-21T18:25:36.397Z",
+      "duration_ms": 330,
+      "exit_code": 0,
+      "stdout_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "output_sha256": "sha256:6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+    }
+  ],
+  "base_observation": {
+    "phase": "base_observation",
+    "command": "node -e 'const fs=require(\"fs\");const s=fs.readFileSync(\"src/cljs/nr/gameboard/board.cljs\",\"utf8\");const calls=(s.match(/replay-opponent-hand\\?/g)||[]).length;if(!s.includes(\"(defn replay-opponent-hand?\")||!s.includes(\"[facedown-card (:side card)]\")||calls<3){console.error(\"replay opponent hand visibility predicate is missing\");process.exit(1)}'",
+    "network": "none",
+    "expected_result": "failure",
+    "result": "FAIL",
+    "expectation_met": true,
+    "started_at": "2026-07-21T18:25:35.535Z",
+    "finished_at": "2026-07-21T18:25:36.067Z",
+    "duration_ms": 532,
+    "exit_code": 1,
+    "stdout_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_sha256": "sha256:61e65f7153bb75b0f8c099540faf02709cccce0957a45914b8842d6ccbcf5330",
+    "output_sha256": "sha256:80f0430b91c264a89fd7caa114603a9986d93865102b2be445bd7db71602f84b"
+  },
+  "patched_observation": {
+    "phase": "patched_observation",
+    "command": "node -e 'const fs=require(\"fs\");const s=fs.readFileSync(\"src/cljs/nr/gameboard/board.cljs\",\"utf8\");const calls=(s.match(/replay-opponent-hand\\?/g)||[]).length;if(!s.includes(\"(defn replay-opponent-hand?\")||!s.includes(\"[facedown-card (:side card)]\")||calls<3){console.error(\"replay opponent hand visibility predicate is missing\");process.exit(1)}'",
+    "network": "none",
+    "expected_result": "success",
+    "result": "PASS",
+    "expectation_met": true,
+    "started_at": "2026-07-21T18:25:36.067Z",
+    "finished_at": "2026-07-21T18:25:36.397Z",
+    "duration_ms": 330,
+    "exit_code": 0,
+    "stdout_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "output_sha256": "sha256:6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+  },
+  "patch_sha256": "sha256:755eb8d43c01147b2adfab6266dde193897d7cde6e8e6c690d00681037848530",
+  "tested_tree_oid": "e3d89b854084a7d8b2dea4d7179a1bfddca09723",
+  "commit_oid": "16aa11b96d9e4d88afe8c6c4c5306de9ec8850de",
+  "dependency_cache_key": null,
+  "dco_verified": true,
+  "changed_files": [
+    {
+      "path": "src/cljs/nr/gameboard/board.cljs",
+      "status": "M",
+      "class": "production",
+      "lines": 17
+    }
+  ],
+  "changed_lines": 17,
+  "environment": {
+    "profile": "node",
+    "image": "sha256:d5289634d7a51632a99b4796460f3235b5b91c0106cbffd1c74b0fd3b65563e8",
+    "architecture": "arm64",
+    "network": "none"
+  },
+  "test_command": "node -e 'const fs=require(\"fs\");const s=fs.readFileSync(\"src/cljs/nr/gameboard/board.cljs\",\"utf8\");const calls=(s.match(/replay-opponent-hand\\?/g)||[]).length;if(!s.includes(\"(defn replay-opponent-hand?\")||!s.includes(\"[facedown-card (:side card)]\")||calls<3){console.error(\"replay opponent hand visibility predicate is missing\");process.exit(1)}'",
+  "test_only_paths": [],
+  "base_failure_contains": "replay opponent hand visibility predicate is missing",
+  "limitations": [
+    "Manual replay UI verification was not run."
+  ],
+  "additional_checks": [
+    {
+      "command": "npm run cljs:release",
+      "result": "PASS",
+      "network": "none",
+      "summary": "258 files, 0 warnings on the corrected exact head; repeated offline after dependency caching."
+    }
+  ]
+}

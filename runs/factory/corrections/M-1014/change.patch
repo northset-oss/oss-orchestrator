@@ -1,0 +1,41 @@
+diff --git a/src/scripts/choices.ts b/src/scripts/choices.ts
+index b834c50cc925b48d68a0f2d88a3bf0c01936e706..b14569047f09824346dde6548d3ecfd2e81289d1 100644
+--- a/src/scripts/choices.ts
++++ b/src/scripts/choices.ts
+@@ -511,15 +511,15 @@ class Choices {
+       preventInputFocus = !this._canSearch;
+     }
+ 
++    if (!preventInputFocus) {
++      this.input.focus();
++    }
++
+     requestAnimationFrame(() => {
+       this.dropdown.show();
+       const rect = this.dropdown.element.getBoundingClientRect();
+       this.containerOuter.open(rect.bottom, rect.height);
+ 
+-      if (!preventInputFocus) {
+-        this.input.focus();
+-      }
+-
+       this.passedElement.triggerEvent(EventType.showDropdown);
+ 
+       const activeElement = this.choiceList.element.querySelector<HTMLElement>(
+diff --git a/test/scripts/choices.test.ts b/test/scripts/choices.test.ts
+index 8fe3e5c96246b801b341c392f45ac5de9e83fd2e..5d41345fbe53b846fd66caa4c4a8a86d10574cda 100644
+--- a/test/scripts/choices.test.ts
++++ b/test/scripts/choices.test.ts
+@@ -607,6 +607,12 @@ describe('choices', () => {
+           expect(output).to.deep.equal(instance);
+         });
+ 
++        it('focuses input synchronously when input focus is allowed', () => {
++          instance.showDropdown(false);
++
++          expect(inputFocusSpy).toHaveBeenCalledOnce();
++        });
++
+         it('opens containerOuter', () =>
+           new Promise((done) => {
+             requestAnimationFrame(() => {
