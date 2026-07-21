@@ -72,34 +72,88 @@ async function oneInfrastructureRetry(operation) {
   }
 }
 
-function receiptFooter(missionId, receiptUrl) {
-  return [
-    '---',
-    'AI assistance was used. This change was reviewed by Northset, and I accept responsibility for this submission.',
-    '',
+function renderedVerificationCommand(command) {
+  const rendered = Array.isArray(command) ? command.join(' ') : String(command ?? '');
+  return rendered.length > 80 ? "the repository's declared test command" : `\`${rendered}\``;
+}
+
+function hasMechanicallyVerifiedNoCiFiles(changedFiles) {
+  if (!Array.isArray(changedFiles)) return false;
+  return changedFiles.every((file) => {
+    const filePath = typeof file === 'string' ? file : file?.path;
+    if (typeof filePath !== 'string' || !filePath) return false;
+    const normalized = filePath.replaceAll('\\', '/').replace(/^\.\//, '').toLowerCase();
+    const knownCiPath = normalized.startsWith('.github/workflows/') ||
+      normalized.startsWith('.github/actions/') ||
+      /^(?:\.circleci|\.buildkite|ci|workflows?)(?:\/|$)/.test(normalized) ||
+      /^(?:\.gitlab-ci\.ya?ml|\.travis\.ya?ml|azure-pipelines\.ya?ml|jenkinsfile)$/.test(normalized);
+    return file?.class !== 'ci' && !knownCiPath;
+  });
+}
+
+function receiptBlock(missionId, receiptUrl, {command, commitOid, changedFiles} = {}) {
+  const lines = [
     `<!-- northset-receipt:${missionId}:start -->`,
     '### Verification',
     '',
-    `[Northset proof-of-pass receipt ${missionId}](${receiptUrl})  `,
-    'Contributor self-run; not maintainer verification.',
+    `${renderedVerificationCommand(command)} exited 0 on this exact head (\`${String(commitOid).slice(0, 7)}\`) in a network-off container, before this PR was opened.`,
+  ];
+  if (hasMechanicallyVerifiedNoCiFiles(changedFiles)) {
+    lines.push('No workflow or CI files are modified in this change.');
+  }
+  lines.push(
+    `Commands, environment, and hashes: [receipt ${missionId}](${receiptUrl}) — checkable in ~30 seconds without trusting us.`,
+    'Self-run by the contributor, not maintainer verification.',
     `<!-- northset-receipt:${missionId}:end -->`,
+  );
+  return lines.join('\n');
+}
+
+function receiptFooter(missionId, receiptUrl, verificationFacts) {
+  return [
+    '---',
+    receiptBlock(missionId, receiptUrl, verificationFacts),
+    '',
+    'AI-assisted and reviewed by Northset; I take responsibility for this submission.',
   ].join('\n');
 }
 
-export function finalizePrBody(body, missionId, receiptUrl) {
+export function finalizePrBody(body, missionId, receiptUrl, {
+  replaceExisting = false,
+  ...verificationFacts
+} = {}) {
   let rendered = String(body ?? '')
     .replaceAll('{{MISSION_ID}}', missionId)
     .replaceAll('{{RECEIPT_URL}}', receiptUrl)
     .trimEnd();
-  if (!rendered.includes(`<!-- northset-receipt:${missionId}:start -->`)) {
-    rendered = `${rendered}\n\n${receiptFooter(missionId, receiptUrl)}`.trim();
+  const startMarker = `<!-- northset-receipt:${missionId}:start -->`;
+  const endMarker = `<!-- northset-receipt:${missionId}:end -->`;
+  const start = rendered.indexOf(startMarker);
+  if (start === -1) {
+    rendered = `${rendered}\n\n${receiptFooter(missionId, receiptUrl, verificationFacts)}`.trim();
+  } else if (replaceExisting) {
+    const end = rendered.indexOf(endMarker, start);
+    if (end === -1) throw new Error(`receipt block for ${missionId} is missing its end marker`);
+    const separator = rendered.lastIndexOf('\n---\n', start);
+    if (separator !== -1 || rendered.startsWith('---\n')) {
+      const footerStart = separator === -1 ? 0 : separator;
+      rendered = `${rendered.slice(0, footerStart).trimEnd()}\n\n${
+        receiptFooter(missionId, receiptUrl, verificationFacts)}`.trim();
+    } else {
+      rendered = `${rendered.slice(0, start)}${receiptBlock(missionId, receiptUrl, verificationFacts)}${
+        rendered.slice(end + endMarker.length)}`.trimEnd();
+    }
   }
   return `${rendered}\n`;
 }
 
 export function buildReadyManifest(task, authorResult, verification, missionId) {
   const receiptUrl = receiptUrlFor(missionId, verification.commit_oid);
-  const body = finalizePrBody(authorResult.pr_body, missionId, receiptUrl);
+  const body = finalizePrBody(authorResult.pr_body, missionId, receiptUrl, {
+    command: verification.patched_observation?.command,
+    commitOid: verification.commit_oid,
+    changedFiles: verification.changed_files,
+  });
   const verifiedCommand = verification.patched_observation?.command ?? authorResult.test_command;
   const manifest = {
     repository: task.repository,

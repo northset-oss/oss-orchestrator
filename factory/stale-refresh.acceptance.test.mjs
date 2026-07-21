@@ -7,6 +7,7 @@ import test from 'node:test';
 import {createNodeWorker, runBounded} from './node-worker.mjs';
 import {receiptUrlFor} from './receipt-publisher.mjs';
 import {createStaleRefresher} from './stale-refresh.mjs';
+import {finalizePrBody} from './worker.mjs';
 
 const IMAGE = 'northset-oss-author:test';
 const IMAGE_DIGEST = `sha256:${'a'.repeat(64)}`;
@@ -71,7 +72,14 @@ async function refreshFixture(t) {
   await runGit(['-C', upstream, 'checkout', '-q', 'main']);
 
   const receiptUrl = 'https://northset.test/receipts/M-1200/';
-  const prBody = `## Summary\n\nReturn the expected value.\n\n${receiptUrl}\n`;
+  const prBody = finalizePrBody('## Summary\n\nReturn the expected value.', 'M-1200', receiptUrl, {
+    command: 'node --test test/value.test.mjs',
+    commitOid: oldCommit,
+    changedFiles: [
+      {path: 'src/value.mjs', status: 'M', class: 'production', lines: 2},
+      {path: 'test/value.test.mjs', status: 'A', class: 'new_test', lines: 4},
+    ],
+  });
   const manifest = {
     mission_id: 'M-1200', task_id: 'TASK-REFRESH-1',
     repository: 'owner/repo', repository_node_id: 'R_refresh', fork_repository: 'AysajanE/repo',
@@ -170,8 +178,9 @@ test('S1 clean moved-base refresh keeps the mission and approved artifact while 
   assert.deepEqual(JSON.parse(await readFile(next.verification_path, 'utf8')), next.verification);
   assert.equal(next.changed_lines, next.verification.changed_lines);
   assert.equal(next.receipt_url, receiptUrlFor('M-1200', next.commit_oid));
-  assert.equal(next.pr_body, fixture.manifest.pr_body.replaceAll(
-    fixture.manifest.receipt_url, next.receipt_url));
+  assert.ok(next.pr_body.includes(`on this exact head (\`${next.commit_oid.slice(0, 7)}\`)`));
+  assert.ok(!next.pr_body.includes(`on this exact head (\`${fixture.oldCommit.slice(0, 7)}\`)`));
+  assert.equal(next.pr_body.match(/northset-receipt:M-1200:start/g)?.length, 1);
   assert.notEqual(next.branch, fixture.manifest.branch);
   assert.match(next.branch, /^northset\/m-1200-r-[a-f0-9]{12}$/);
   assert.equal(next.proof.base_oid, fixture.cleanBase);

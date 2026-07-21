@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {buildProof} from './verifier.mjs';
 import {runBounded} from './node-worker.mjs';
 import {receiptUrlFor} from './receipt-publisher.mjs';
+import {finalizePrBody} from './worker.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BUNDLED_WORKER = path.join(HERE, 'node-worker.mjs');
@@ -70,6 +71,12 @@ function replacementManifest(plan, manifest, artifact, refreshed) {
   if (!previousReceiptUrl || !prBody.includes(previousReceiptUrl)) {
     throw new Error('stale refresh requires the approved PR body receipt binding');
   }
+  const reboundPrBody = finalizePrBody(prBody.replaceAll(previousReceiptUrl, receiptUrl), missionId, receiptUrl, {
+    command: refreshed.verification.patched_observation?.command,
+    commitOid: refreshed.commit_oid,
+    changedFiles: refreshed.verification.changed_files,
+    replaceExisting: prBody.includes(`<!-- northset-receipt:${missionId}:start -->`),
+  });
   const next = {
     ...manifest,
     mission_id: missionId,
@@ -86,7 +93,7 @@ function replacementManifest(plan, manifest, artifact, refreshed) {
     changed_lines: refreshed.verification.changed_lines,
     branch: `northset/${missionId.toLowerCase()}-r-${refreshed.commit_oid.slice(0, 12)}`,
     receipt_url: receiptUrl,
-    pr_body: prBody.replaceAll(previousReceiptUrl, receiptUrl),
+    pr_body: reboundPrBody,
   };
   const task = taskFor(plan, next, refreshed.base_oid);
   next.proof = buildProof({task, verification: refreshed.verification, manifest: next});

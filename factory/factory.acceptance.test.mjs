@@ -10,6 +10,7 @@ import {
   assertPublicVerificationClaims,
   createCommandDriver,
   createStageSemaphores,
+  finalizePrBody,
   removeWorkTree,
   runFactoryCycle,
   runUntilIdle,
@@ -129,6 +130,84 @@ test('READY claims use the exact clean verifier command instead of authored stat
   const [ready] = db.listReady({states: ['PENDING'], limit: 1});
   assert.deepEqual(ready.manifest.checks, ['node --test']);
   assert.deepEqual(ready.manifest.proof.checks_not_run, []);
+  assert.equal(ready.manifest.pr_body, [
+    '## Summary',
+    '',
+    'Fix issue 1.',
+    '',
+    '---',
+    '<!-- northset-receipt:M-1000:start -->',
+    '### Verification',
+    '',
+    '`node --test` exited 0 on this exact head (`2222222`) in a network-off container, before this PR was opened.',
+    'No workflow or CI files are modified in this change.',
+    'Commands, environment, and hashes: [receipt M-1000](https://northset-oss.github.io/verification-pilot/receipts/M-1000/) — checkable in ~30 seconds without trusting us.',
+    'Self-run by the contributor, not maintainer verification.',
+    '<!-- northset-receipt:M-1000:end -->',
+    '',
+    'AI-assisted and reviewed by Northset; I take responsibility for this submission.',
+    '',
+  ].join('\n'));
+});
+
+test('footer v2 renders argv commands and omits the CI claim on any uncertainty', () => {
+  const missionId = 'M-321';
+  const receiptUrl = 'https://northset.test/receipts/M-321/';
+  const facts = {
+    command: ['node', '--test', 'test/value.test.mjs'],
+    commitOid: 'abcdef0123456789abcdef0123456789abcdef01',
+    changedFiles: [{path: 'src/value.mjs', class: 'production'}],
+  };
+  const rendered = finalizePrBody('Fix the value.', missionId, receiptUrl, facts);
+  assert.match(rendered,
+    /`node --test test\/value\.test\.mjs` exited 0 on this exact head \(`abcdef0`\)/);
+  assert.match(rendered, /No workflow or CI files are modified in this change\./);
+
+  for (const changedFiles of [
+    [{path: '.github/workflows/test.yml', class: 'ci'}],
+    [{path: 'custom-ci/config.yml', class: 'ci'}],
+    [{class: 'production'}],
+    null,
+  ]) {
+    const uncertain = finalizePrBody('Fix the value.', missionId, receiptUrl, {...facts, changedFiles});
+    assert.doesNotMatch(uncertain, /No workflow or CI files are modified in this change\./);
+  }
+});
+
+test('footer v2 substitutes long commands and preserves a placeholder receipt block without duplication', () => {
+  const missionId = 'M-322';
+  const receiptUrl = 'https://northset.test/receipts/M-322/';
+  const longCommand = `node --test ${'test/deeply-nested/'.repeat(4)}value.test.mjs`;
+  const rendered = finalizePrBody('Fix the value.', missionId, receiptUrl, {
+    command: longCommand,
+    commitOid: '1234567890abcdef1234567890abcdef12345678',
+    changedFiles: [],
+  });
+  assert.match(rendered,
+    /the repository's declared test command exited 0 on this exact head \(`1234567`\)/);
+  assert.doesNotMatch(rendered, new RegExp(longCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+  const templated = [
+    'Fix the value.',
+    '',
+    '<!-- northset-receipt:{{MISSION_ID}}:start -->',
+    '[receipt {{MISSION_ID}}]({{RECEIPT_URL}})',
+    '<!-- northset-receipt:{{MISSION_ID}}:end -->',
+  ].join('\n');
+  const finalized = finalizePrBody(templated, missionId, receiptUrl, {
+    command: 'node --test', commitOid: '1'.repeat(40), changedFiles: [],
+  });
+  assert.equal(finalized, `${templated
+    .replaceAll('{{MISSION_ID}}', missionId)
+    .replaceAll('{{RECEIPT_URL}}', receiptUrl)}\n`);
+  assert.equal(finalized.match(/northset-receipt:M-322:start/g)?.length, 1);
+
+  const refreshed = finalizePrBody(finalized, missionId, receiptUrl, {
+    command: ['npm', 'test'], commitOid: '2'.repeat(40), changedFiles: [], replaceExisting: true,
+  });
+  assert.match(refreshed, /`npm test` exited 0 on this exact head \(`2222222`\)/);
+  assert.doesNotMatch(refreshed, /`1111111`/);
+  assert.equal(refreshed.match(/northset-receipt:M-322:start/g)?.length, 1);
 });
 
 test('PR text cannot deny that its exact clean verifier command ran and passed', () => {
