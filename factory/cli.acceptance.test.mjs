@@ -163,6 +163,13 @@ test('parser provides stable paths and strictly validates command-specific argum
   assert.equal(parsed.pollMs, 5000);
   assert.equal(parsed.once, false);
 
+  const discover = parseFactoryCliArgs(['discover'], {env: {}});
+  assert.equal(discover.lake, FACTORY_DEFAULTS.lake);
+  assert.equal(discover.target, 64);
+  assert.equal(parseFactoryCliArgs(['discover', '--target', '100'], {env: {}}).target, 100);
+  assert.throws(() => parseFactoryCliArgs(['discover', '--target', '101'], {env: {}}),
+    /integer from 1 through 100/);
+
   assert.deepEqual(parseFactoryCliArgs([
     'approve', '--board', BOARD, '--ids', 'M-001,M-204', '--reject-ids', 'M-009',
   ], {env: {}}).ids, ['M-001', 'M-204']);
@@ -193,6 +200,63 @@ test('parser provides stable paths and strictly validates command-specific argum
   assert.equal(parseFactoryCliArgs([
     'github-resume', '--reason', 'reviewed', '--acknowledge-forbidden',
   ], {env: {}}).acknowledgeForbidden, true);
+});
+
+test('discover routes every search through the current GitHub safety queue and transport', async () => {
+  const calls = [];
+  const db = fakeDb({
+    listTasks: async () => [{candidate: 'known/repo#7'}],
+  });
+  const transport = async () => assert.fail('discover must use the GraphQL transport surface');
+  transport.graphql = async (request) => {
+    calls.push({name: 'transport', request});
+    return {status: 200, body: {data: {search: {nodes: []}}}};
+  };
+  const stdout = output();
+  const result = await executeFactoryCli(['discover', '--target', '32'], {
+    env: {}, stdout: stdout.stream,
+    dependencies: {
+      openDb: () => db,
+      transport,
+      createSafety: () => ({request: async (request) => {
+        calls.push({name: 'safety', request});
+        return request.execute();
+      }}),
+      discoverCandidates: async (options) => {
+        assert.equal(options.target, 32);
+        assert.deepEqual(options.knownCandidates, ['known/repo#7']);
+        for (const [index, name] of [
+          'good_first_issue:global', 'good_first_issue:JavaScript', 'good_first_issue:TypeScript',
+          'help_wanted:global', 'help_wanted:JavaScript', 'help_wanted:TypeScript',
+        ].entries()) {
+          await options.search({
+            stratum: {name},
+            query: 'query FactoryDiscovery { viewer { login } }',
+            variables: {query: `is:issue discovery:${index}`, first: 100},
+          });
+        }
+        return {selected: 0, inserted: 0};
+      },
+    },
+  });
+
+  const safety = calls.filter((call) => call.name === 'safety').map((call) => call.request);
+  assert.equal(safety.length, 6);
+  assert.ok(safety.every((request) => request.priority === 'discovery_top_up'));
+  assert.ok(safety.every((request) => request.kind === 'search'));
+  assert.ok(safety.every((request) => request.operation === 'factory_discover_search'));
+  assert.deepEqual(safety.map((request) => request.stratum), [
+    'good_first_issue:global', 'good_first_issue:JavaScript', 'good_first_issue:TypeScript',
+    'help_wanted:global', 'help_wanted:JavaScript', 'help_wanted:TypeScript',
+  ]);
+  assert.equal(calls.filter((call) => call.name === 'transport').length, 6);
+  assert.deepEqual(calls.map((call) => call.name), [
+    'safety', 'transport', 'safety', 'transport', 'safety', 'transport',
+    'safety', 'transport', 'safety', 'transport', 'safety', 'transport',
+  ]);
+  assert.deepEqual(result, {selected: 0, inserted: 0});
+  assert.deepEqual(JSON.parse(stdout.read()), result);
+  assert.equal(db.closed, true);
 });
 
 test('run fills from the lake once and drains workers with the requested board policy', async () => {

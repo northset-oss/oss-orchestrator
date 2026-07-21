@@ -30,6 +30,21 @@ docker build --pull --tag northset-oss-author:0.144.1 \
 
 ## Normal operation
 
+When the active Node candidate supply is low, top up the existing lake with one bounded discovery
+pass:
+
+```sh
+node factory/cli.mjs discover --target 64
+```
+
+Discovery makes at most six one-page, safety-queued GraphQL searches: `good first issue` and
+`help wanted`, each across global, JavaScript, and TypeScript strata updated within the last 14
+days. It deduplicates results, excludes candidates already known to the factory, writes at most 100
+fresh Node candidates to the existing lake, and prints exact skip and duplicate reasons. This is
+only a supply top-up: the normal `run` preflight still checks repository contribution and AI/LLM
+policies, issue occupancy, linked pull requests, repository layout, and the current base before a
+candidate can enter a worker.
+
 Run the private factory continuously:
 
 ```sh
@@ -145,6 +160,7 @@ node factory/cli.mjs github-resume \
 | Worker executable | `factory/node-worker.mjs` | `--worker-command`, `OSS_FACTORY_WORKER_COMMAND` |
 | Receipt remote | `https://github.com/northset-oss/verification-pilot.git` | `--receipt-remote`, `OSS_FACTORY_RECEIPT_REMOTE` |
 | GitHub executable | `gh` | `--gh-bin`, `GH_BIN` |
+| Discovery target | `64` (maximum `100`) | `discover --target` |
 | Approval identity | `internal-user:aeziz` | `--approved-by`, `--cleared-by`, `OSS_FACTORY_APPROVED_BY` |
 | Fork owner | `AysajanE` | `OSS_FACTORY_FORK_OWNER` |
 | Dependency/verifier image | `northset-oss-author:0.144.1` | `OSS_AUTHOR_IMAGE` |

@@ -7,6 +7,7 @@ import {fileURLToPath} from 'node:url';
 
 import {approveBoard, createBoardIfDue, renderBoard} from './board.mjs';
 import {openFactoryDb} from './db.mjs';
+import {discoverCandidates, DISCOVERY_DEFAULT_TARGET, DISCOVERY_MAX_TARGET} from './discovery.mjs';
 import {createGhCliPublisherAdapter, createGhCliTransport} from './gh-cli.mjs';
 import {createGitHubSafety, resumeGitHub} from './github-safety.mjs';
 import {publishBoard} from './publisher.mjs';
@@ -32,9 +33,12 @@ export const FACTORY_DEFAULTS = Object.freeze({
   receiptRemote: 'https://github.com/northset-oss/verification-pilot.git',
 });
 
-const COMMANDS = new Set(['run', 'board', 'approve', 'publish', 'reconcile', 'github-status', 'github-resume']);
+const COMMANDS = new Set([
+  'discover', 'run', 'board', 'approve', 'publish', 'reconcile', 'github-status', 'github-resume',
+]);
 const COMMON_VALUE_FLAGS = new Set(['--db', '--pause-file', '--gh-bin']);
 const COMMAND_VALUE_FLAGS = Object.freeze({
+  discover: new Set(['--lake', '--target']),
   run: new Set(['--lake', '--profile', '--workers', '--board-size', '--board-max-age-minutes',
     '--candidate-limit', '--worker-command', '--work-root', '--artifact-root', '--receipt-remote', '--poll-ms']),
   board: new Set(),
@@ -45,6 +49,7 @@ const COMMAND_VALUE_FLAGS = Object.freeze({
   'github-resume': new Set(['--reason', '--cleared-by', '--repository']),
 });
 const COMMAND_BOOLEAN_FLAGS = Object.freeze({
+  discover: new Set(),
   run: new Set(['--once']),
   board: new Set(),
   approve: new Set(),
@@ -150,7 +155,7 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
   const values = [...argv];
   const command = values.shift();
   if (!COMMANDS.has(command)) {
-    throw new Error('command must be run, board, approve, publish, reconcile, github-status, or github-resume');
+    throw new Error('command must be discover, run, board, approve, publish, reconcile, github-status, or github-resume');
   }
   const allowedValues = new Set([...COMMON_VALUE_FLAGS, ...COMMAND_VALUE_FLAGS[command]]);
   const allowedBooleans = COMMAND_BOOLEAN_FLAGS[command];
@@ -175,6 +180,14 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
     ghBin: parsed.get('--gh-bin') ?? env.GH_BIN ?? 'gh',
   };
 
+  if (command === 'discover') {
+    return {
+      ...common,
+      lake: pathValue(parsed.get('--lake') ?? env.OSS_FACTORY_LAKE, FACTORY_DEFAULTS.lake),
+      target: positiveInteger(parsed.get('--target') ?? String(DISCOVERY_DEFAULT_TARGET),
+        '--target', DISCOVERY_MAX_TARGET),
+    };
+  }
   if (command === 'run') {
     const profile = parsed.get('--profile') ?? 'node';
     if (profile !== 'node') throw new Error('--profile must be node; the production factory is Node-only');
@@ -317,6 +330,7 @@ function defaultSleep(milliseconds, signal) {
 const DEFAULT_DEPENDENCIES = Object.freeze({
   openDb: openFactoryDb,
   createSource,
+  discoverCandidates,
   createDriver: createCommandDriver,
   runCycle: runFactoryCycle,
   createBoard: createBoardIfDue,
@@ -393,6 +407,31 @@ export async function executeFactoryCli(argv, {
 
   const db = deps.openDb(options.database);
   try {
+    if (options.command === 'discover') {
+      const safety = deps.createSafety({
+        pauseFile: options.pauseFile,
+        transport: safetyTransport,
+        repositoryState: typeof db.getPublicActionState === 'function'
+          ? db.getPublicActionState.bind(db) : db,
+      });
+      const knownTasks = typeof db.listTasks === 'function'
+        ? await db.listTasks({profile: 'node', limit: 100_000}) : [];
+      const result = await deps.discoverCandidates({
+        lakePath: options.lake,
+        target: options.target,
+        knownCandidates: knownTasks.map((task) => task.candidate),
+        search: ({stratum, query, variables}) => safety.request({
+          priority: 'discovery_top_up',
+          kind: 'search',
+          operation: 'factory_discover_search',
+          stratum: stratum.name,
+          query: variables.query,
+          execute: () => transport.graphql({query, variables}),
+        }),
+      });
+      printJson(stdout, result);
+      return result;
+    }
     if (options.command === 'reconcile') {
       const safety = deps.createSafety({
         pauseFile: options.pauseFile,
