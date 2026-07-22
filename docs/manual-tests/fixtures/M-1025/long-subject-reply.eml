@@ -1,0 +1,11 @@
+From: Manual Reviewer <reviewer@example.invalid>
+To: Manual Tester <tester@example.invalid>
+Date: Tue, 21 Jul 2026 10:05:00 -0400
+Message-ID: <m1025-human-manual-test-2@example.invalid>
+In-Reply-To: <m1025-human-manual-test-1@example.invalid>
+References: <m1025-human-manual-test-1@example.invalid>
+Subject: Re: This deliberately long conversation subject verifies wrapping in vertical layout and separate Thunderbird views while confirming that classic view remains compact and truncates without consuming extra vertical space
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+This reply makes the synthetic fixture a two-message conversation for Thunderbird Conversations issue #2049.

@@ -1,0 +1,9 @@
+From: Manual Tester <tester@example.invalid>
+To: Manual Recipient <recipient@example.invalid>
+Date: Tue, 21 Jul 2026 10:00:00 -0400
+Message-ID: <m1025-human-manual-test-1@example.invalid>
+Subject: This deliberately long conversation subject verifies wrapping in vertical layout and separate Thunderbird views while confirming that classic view remains compact and truncates without consuming extra vertical space
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+This is a synthetic local message for the human manual test of Thunderbird Conversations issue #2049.
