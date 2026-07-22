@@ -1106,7 +1106,8 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
 
   function listWarmRepositories() {
     return connection.prepare(`SELECT t.repository,
-      coalesce(max(rs.owner_login),substr(t.repository,1,instr(t.repository,'/')-1)) AS maintainer_login,
+      coalesce(max(rs.owner_login),substr(t.repository,1,instr(t.repository,'/')-1)) AS owner_login,
+      max(p.pr_number) AS relationship_pr_number,
       min(p.mission_id) AS mission_id,max(rs.last_pr_at) AS last_pr_at
       FROM publications p
       JOIN tasks t ON t.task_id=p.task_id
@@ -1252,8 +1253,8 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       throw new Error('verification prospect requires repository owner/name');
     }
     const ownerLogin = owner ?? repository.split('/')[0];
-    if (!['ai_policy_concern', 'not_wanted'].includes(reasonCode)) {
-      throw new Error('verification prospect requires an AI-policy or not-wanted reason');
+    if (!['ai_policy_concern', 'ai_rejection', 'not_wanted'].includes(reasonCode)) {
+      throw new Error('verification prospect requires an AI or not-wanted reason');
     }
     if (typeof missionId !== 'string' || !missionId) throw new Error('verification prospect requires mission_id');
     connection.prepare(`INSERT INTO verification_prospects(

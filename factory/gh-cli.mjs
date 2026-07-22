@@ -542,9 +542,16 @@ const FOLLOW_UP_QUERY = `query FactoryPullRequestFollowUp($owner: String!, $name
   }
 }`;
 
-const OPEN_PULL_REQUESTS_QUERY = `query FactoryOpenPullRequests($owner: String!, $name: String!, $limit: Int!) {
+const OPEN_PULL_REQUESTS_QUERY = `query FactoryOpenPullRequests($owner: String!, $name: String!, $limit: Int!, $relationshipPr: Int!) {
   repository(owner: $owner, name: $name) {
     nameWithOwner
+    owner { login __typename }
+    relationshipPullRequest: pullRequest(number: $relationshipPr) {
+      mergedBy { login __typename }
+      reviews(last: 20) {
+        nodes { state authorAssociation author { login __typename } }
+      }
+    }
     pullRequests(first: $limit, states: OPEN, orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes {
         number title url authorAssociation createdAt updatedAt isCrossRepository mergeable reviewDecision
@@ -665,15 +672,18 @@ export function createGhCliPublisherAdapter({
       pull_requests: result.body.map((pr) => pullRequest(pr, repository))};
   };
 
-  const findOpenPullRequests = async (repository, {limit = 30} = {}) => {
+  const findOpenPullRequests = async (repository, {limit = 30, relationshipPrNumber} = {}) => {
     const normalizedRepository = validRepository(repository);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw new TypeError('open pull request limit must be an integer from 1 through 100');
     }
+    if (!Number.isInteger(relationshipPrNumber) || relationshipPrNumber < 1) {
+      throw new TypeError('relationship PR number must be a positive integer');
+    }
     const {owner, name} = repositoryParts(normalizedRepository);
     const result = await transport.graphql({
       query: OPEN_PULL_REQUESTS_QUERY,
-      variables: {owner, name, limit},
+      variables: {owner, name, limit, relationshipPr: relationshipPrNumber},
     });
     const body = bodyObject(result, 'find open pull requests');
     if (Array.isArray(body.errors) && body.errors.length) {
@@ -686,11 +696,21 @@ export function createGhCliPublisherAdapter({
       throw new GhCliError('find open pull requests returned an invalid repository response',
         'GH_RESPONSE_INVALID', result);
     }
+    const relationship = repo.relationshipPullRequest ?? null;
+    const maintainerActors = [
+      relationship?.mergedBy,
+      ...(relationship?.reviews?.nodes ?? [])
+        .filter((review) => ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(review?.authorAssociation))
+        .map((review) => review.author),
+    ].filter((actor) => actor?.login && actor?.__typename !== 'Bot' && !/\[bot\]$/i.test(actor.login));
+    const relationshipMaintainer = maintainerActors[0] ??
+      (repo.owner?.__typename === 'User' ? repo.owner : null);
     return {
       status: result.httpStatus,
       headers: result.headers,
       owner_login: repo.owner?.login ?? owner,
       owner_type: repo.owner?.__typename ?? null,
+      relationship_maintainer_login: relationshipMaintainer?.login ?? null,
       pull_requests: repo.pullRequests.nodes.map((pr) => ({
         number: Number(pr.number),
         title: pr.title,

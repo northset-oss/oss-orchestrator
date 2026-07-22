@@ -108,6 +108,23 @@ function relationshipHas(values, key) {
   return Boolean(values?.[normalized] ?? values?.[key]);
 }
 
+function mergedRelationships(...sources) {
+  const repositories = new Set();
+  const owners = new Set();
+  for (const source of sources) {
+    for (const repository of source?.repositories ?? []) repositories.add(String(repository).toLowerCase());
+    for (const owner of source?.owners ?? []) owners.add(String(owner).toLowerCase());
+  }
+  return {repositories, owners};
+}
+
+function ownerTypeFromNodeId(value) {
+  const nodeId = String(value ?? '');
+  if (nodeId.startsWith('O_') || nodeId.startsWith('MDEyOk9yZ2Fu')) return 'Organization';
+  if (nodeId.startsWith('U_') || nodeId.startsWith('MDQ6VXNlc')) return 'User';
+  return null;
+}
+
 export function convertibilityMultiplier(row, relationships = {}, now = new Date()) {
   let multiplier = 1;
   const raw = parseJson(row.raw_json ?? row.raw, {});
@@ -121,12 +138,13 @@ export function convertibilityMultiplier(row, relationships = {}, now = new Date
     ? Number.NaN : Number(starsValue);
   const archived = row.archived ?? raw.repository?.archived;
   const pushedAt = row.pushed_at ?? raw.repository?.pushed_at;
+  const ownerType = ownerTypeFromNodeId(ownerNodeId);
 
-  if (String(ownerNodeId ?? '').startsWith('O_')) multiplier += 0.15;
-  if (String(ownerNodeId ?? '').startsWith('U_')) multiplier -= 0.05;
+  if (ownerType === 'Organization') multiplier += 0.15;
+  if (ownerType === 'User') multiplier -= 0.05;
   if (Number.isFinite(stars) && stars >= 0) {
     multiplier += Math.min(0.15, Math.log10(stars + 1) * 0.05);
-    if (stars < 50 && String(ownerNodeId ?? '').startsWith('U_')) multiplier -= 0.1;
+    if (stars < 50 && ownerType === 'User') multiplier -= 0.1;
   }
   if (archived === true || archived === 1 || archived === '1') multiplier -= 0.3;
   else if (archived === false || archived === 0 || archived === '0') multiplier += 0.05;
@@ -425,11 +443,10 @@ function recentExternalClaim(comments, northsetLogin, now) {
 
 function doNotAuthorPause(live, entries) {
   const repository = String(live.repository?.nameWithOwner ?? live.candidate?.repository ?? '').toLowerCase();
-  const owner = repository.split('/')[0];
   return (entries ?? []).find((entry) => {
     const pausedRepository = String(entry.repository ?? '').toLowerCase();
-    const pausedOwner = String(entry.owner_login ?? entry.owner ?? '').toLowerCase();
-    return pausedRepository === repository || (pausedOwner && pausedOwner === owner);
+    return pausedRepository === repository &&
+      ['ai_policy_concern', 'not_wanted'].includes(entry.reason_code);
   }) ?? null;
 }
 
@@ -538,7 +555,14 @@ export async function enqueueCandidates(results, {db} = {}) {
   return db.enqueueTasks(tasks);
 }
 
-export function createSource({lakePath = 'candidate_lake.sqlite', query, db, github, northsetLogin = 'AysajanE'} = {}) {
+export function createSource({
+  lakePath = 'candidate_lake.sqlite',
+  query,
+  db,
+  github,
+  northsetLogin = 'AysajanE',
+  relationships = {},
+} = {}) {
   const lakeQuery = query ?? ((sql) => sqliteQuery(lakePath, sql));
   return {
     select: (options) => selectCandidates({
@@ -546,7 +570,9 @@ export function createSource({lakePath = 'candidate_lake.sqlite', query, db, git
       lakePath,
       query: lakeQuery,
       attemptStats: options?.attemptStats ?? db?.candidateAttemptStats?.() ?? {},
-      relationships: options?.relationships ?? db?.priorMergeRelationships?.() ?? {},
+      relationships: options?.relationships ?? mergedRelationships(
+        db?.priorMergeRelationships?.() ?? {}, relationships,
+      ),
     }),
     preflight: (candidates, options) => preflightCandidates(candidates, {
       ...options, github, northsetLogin: options?.northsetLogin ?? northsetLogin,

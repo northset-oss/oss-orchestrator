@@ -76,6 +76,7 @@ function maintainerText(followUp) {
     ...(followUp?.latest_reviews_by_maintainer ?? []),
     ...(followUp?.maintainer_comments ?? []),
     ...(followUp?.maintainer_thread_comments ?? []),
+    ...(followUp?.linked_decision_events ?? []),
   ];
   return events.map((event) => String(event?.body ?? '').trim()).filter(Boolean).join('\n');
 }
@@ -83,7 +84,19 @@ function maintainerText(followUp) {
 export function reasonCodeFromFollowUp(followUp) {
   const text = maintainerText(followUp);
   if (!text) return 'unknown';
-  if (/\b(?:ai[- ]generated|artificial intelligence|llms?|chatgpt|claude|coding agents?)\b/i.test(text)) {
+  const ai = String.raw`(?:ai[- ]generated|artificial intelligence|llms?|chatgpt|claude|coding agents?)`;
+  const temporaryAiRejection = new RegExp(
+    String.raw`(?:\b${ai}\b[^.\n]{0,120}\b(?:bandwidth|reached (?:its|my|the) end)|\b(?:bandwidth|reached (?:its|my|the) end)\b[^.\n]{0,120}\b${ai}\b)`,
+    'i',
+  );
+  if (temporaryAiRejection.test(text)) return 'ai_rejection';
+  const rejectBefore = String.raw`(?:do not|don't|cannot|can't|will not|won't|no longer|prohibit(?:s|ed)?|ban(?:s|ned)?|reject(?:s|ed)?|refus(?:e|es|ed)|avoid)`;
+  const rejectAfter = String.raw`(?:not (?:allowed|accepted|welcome|permitted)|prohibited|banned|rejected|refused|unwelcome|policy concern)`;
+  const aiPolicyConcern = new RegExp(
+    String.raw`(?:\b${rejectBefore}\b[^.\n]{0,120}\b${ai}\b|\b${ai}\b[^.\n]{0,120}\b${rejectAfter}\b)`,
+    'i',
+  );
+  if (aiPolicyConcern.test(text)) {
     return 'ai_policy_concern';
   }
   if (/\b(?:duplicate|already (?:fixed|implemented|covered)|another (?:pr|pull request))\b/i.test(text)) {
@@ -107,7 +120,7 @@ function externalHumanEvent(event, author) {
   return Boolean(author) && humanEvent(event) && login !== author;
 }
 
-function summarizeFollowUp(value) {
+export function summarizeFollowUp(value) {
   const comments = Array.isArray(value?.comments) ? value.comments : [];
   const reviews = Array.isArray(value?.reviews) ? value.reviews : [];
   const threads = Array.isArray(value?.threads) ? value.threads : [];
@@ -333,23 +346,30 @@ export async function reconcilePublicationBatch({
       if (observation.repository_released) {
         const verification = manifest?.verification ?? {};
         const declaredCheckPassed = verification.ok === true;
+        const explicitShadow = manifest?.shadow_acceptance ?? null;
+        const wouldRelease = typeof explicitShadow?.would_release === 'boolean'
+          ? explicitShadow.would_release : null;
+        const bothSides = ['yes', 'no', 'unknown'].includes(explicitShadow?.both_sides_would_accept)
+          ? explicitShadow.both_sides_would_accept : 'unknown';
         emitDemand(path.join(demandDir, 'shadow_acceptance.jsonl'), {
           ts: observed,
           mission_id: missionId,
           repo: repository,
           declared_check_passed: declaredCheckPassed,
-          would_release: declaredCheckPassed,
-          both_sides_would_accept: publication.merged === true ? 'yes' : 'unknown',
-          human_override: Boolean(manifest?.human_override ?? verification.human_override),
-          reason: publication.merged === true ? 'merged' : `closed_unmerged:${reasonCode ?? 'unknown'}`,
+          would_release: wouldRelease,
+          both_sides_would_accept: bothSides,
+          human_override: explicitShadow?.human_override === true,
+          reason: typeof explicitShadow?.reason === 'string' && explicitShadow.reason.trim()
+            ? explicitShadow.reason.trim()
+            : 'not_assessed: no pre-agreed payment terms and counterparty responses were recorded',
         });
         if (publication.merged === true) {
           const receiptAvailableBy = publicationBefore.submitted_at ?? null;
           const receiptAt = Date.parse(receiptAvailableBy ?? '');
           const ciAt = Date.parse(commitStatus?.updated_at ?? '');
           const mergedAt = Date.parse(pr.merged_at ?? pr.closed_at ?? observed);
-          const noCiRerun = commitStatus?.found === false || !Number.isFinite(ciAt) ||
-            (Number.isFinite(receiptAt) && ciAt <= receiptAt);
+          const noCiRerun = commitStatus?.found !== false && Number.isFinite(ciAt) &&
+            Number.isFinite(receiptAt) && ciAt <= receiptAt;
           if (noCiRerun) {
             emitDemand(path.join(demandDir, 'proto_signals.jsonl'), {
               ts: observed,
@@ -361,7 +381,7 @@ export async function reconcilePublicationBatch({
                 ci_updated_at: commitStatus?.updated_at ?? null,
                 receipt_available_by: receiptAvailableBy,
               },
-              confidence: commitStatus?.found === false || Number.isFinite(ciAt) ? 'high' : 'med',
+              confidence: 'low',
             });
           }
           const followUpText = maintainerText(followUp);

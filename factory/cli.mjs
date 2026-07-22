@@ -10,7 +10,7 @@ import {openFactoryDb} from './db.mjs';
 import {discoverCandidates, DISCOVERY_DEFAULT_TARGET, DISCOVERY_MAX_TARGET} from './discovery.mjs';
 import {createGhCliPublisherAdapter, createGhCliTransport} from './gh-cli.mjs';
 import {createGitHubSafety, resumeGitHub} from './github-safety.mjs';
-import {buildOfferDossier} from './offer-dossier.mjs';
+import {buildOfferDossier, loadDossierRelationships} from './offer-dossier.mjs';
 import {publishBoard} from './publisher.mjs';
 import {
   createReceiptPublisher,
@@ -352,6 +352,8 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
   createStaleRefresher,
   createSafety: createGitHubSafety,
   resumeGitHub,
+  buildOfferDossier,
+  loadDossierRelationships,
 });
 
 export async function executeFactoryCli(argv, {
@@ -447,7 +449,7 @@ export async function executeFactoryCli(argv, {
           ? db.getPublicActionState.bind(db) : db,
       });
       const github = dependencies.github ?? deps.createPublisherAdapter({transport});
-      const result = await buildOfferDossier({db, github, safety, limit: options.limit});
+      const result = await deps.buildOfferDossier({db, github, safety, limit: options.limit});
       stdout.write(result.summary);
       return result;
     }
@@ -500,6 +502,9 @@ export async function executeFactoryCli(argv, {
         lakePath: options.lake,
         db,
         github: queuedGithub,
+        relationships: deps.loadDossierRelationships(path.resolve(
+          path.dirname(options.database), '..', 'demand', 'offer_dossiers.json',
+        )),
       });
       const checkoutProvider = async (task, attempt, allocatedRoot) => {
         if (typeof task?.base_oid !== 'string' || !task.base_oid) {

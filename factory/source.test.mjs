@@ -203,6 +203,38 @@ test('offline convertibility favors organizations, live popularity, and prior me
   }
 });
 
+test('legacy GitHub owner node IDs receive the same organization and user weighting', async () => {
+  const selected = await selectCandidates({
+    workers: 1,
+    limit: 2,
+    now: NOW,
+    query: async () => [
+      row(1, {mechanical_score: 80, owner_node_id: 'MDQ6VXNlcjEyMw==', stars: 10}),
+      row(2, {mechanical_score: 80, owner_node_id: 'MDEyOk9yZ2FuaXphdGlvbjQ1Ng==', stars: 10}),
+    ],
+  });
+  assert.deepEqual(selected.map((item) => item.candidate), ['owner/repo2#2', 'owner/repo1#1']);
+});
+
+test('source merges cached public-ledger relationships with factory merge history offline', async () => {
+  const source = createSource({
+    query: async () => [
+      row(1, {mechanical_score: 80}),
+      row(2, {mechanical_score: 80}),
+      row(3, {mechanical_score: 80}),
+    ],
+    db: {
+      priorMergeRelationships: () => ({repositories: new Set(['owner/repo1']), owners: new Set()}),
+      candidateAttemptStats: () => ({}),
+    },
+    relationships: {repositories: new Set(['owner/repo2']), owners: new Set()},
+  });
+  const selected = await source.select({workers: 1, limit: 3, now: NOW});
+  assert.deepEqual(selected.map((item) => item.candidate), [
+    'owner/repo1#1', 'owner/repo2#2', 'owner/repo3#3',
+  ]);
+});
+
 test('preflight query consolidates all live fields and repository-wide Northset PR search', () => {
   const query = buildPreflightQuery([candidate()]);
   for (const expected of ['isArchived', 'isFork', 'defaultBranchRef', 'rootPackage', 'rootReadme',
@@ -221,15 +253,34 @@ test('clean invited live state returns GO', () => {
   assert.deepEqual(evaluatePreflight(normalizedLive(), {now: NOW}).outcome, 'GO');
 });
 
-test('verification-prospect owner pauses authoring across that owner repositories', () => {
-  const result = evaluatePreflight(normalizedLive(), {
+test('verification prospects pause only the repository that produced the maintainer signal', () => {
+  const paused = evaluatePreflight(normalizedLive(), {
+    now: NOW,
+    doNotAuthor: [{
+      repository: 'owner/repo1', owner_login: 'OWNER', reason_code: 'ai_policy_concern',
+    }],
+  });
+  assert.equal(paused.outcome, 'SKIP');
+  assert.match(paused.reasons.join(' '), /do-not-author pause list \(ai_policy_concern\)/);
+
+  const sibling = evaluatePreflight(normalizedLive(), {
     now: NOW,
     doNotAuthor: [{
       repository: 'owner/another-repo', owner_login: 'OWNER', reason_code: 'ai_policy_concern',
     }],
   });
-  assert.equal(result.outcome, 'SKIP');
-  assert.match(result.reasons.join(' '), /do-not-author pause list \(ai_policy_concern\)/);
+  assert.equal(sibling.outcome, 'GO');
+});
+
+test('a contextual AI rejection is demand evidence, not a permanent do-not-author policy', () => {
+  const live = normalizedLive();
+  assert.equal(evaluatePreflight(live, {
+    now: NOW,
+    doNotAuthor: [{
+      repository: live.repository.nameWithOwner,
+      reason_code: 'ai_rejection',
+    }],
+  }).outcome, 'GO');
 });
 
 test('each hard live-preflight violation returns SKIP', async (t) => {

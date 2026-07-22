@@ -359,7 +359,7 @@ test('follow-up summary exposes contributor comments without relabeling maintain
   assert.equal(fixture.prohibited.close, 0);
 });
 
-test('maintainer AI-policy rejection becomes telemetry and an owner-level verification prospect', async () => {
+test('maintainer AI-policy rejection becomes telemetry and a repository verification prospect', async () => {
   const fixture = harness({
     prState: 'closed',
     attestor: async () => ({found: false}),
@@ -390,6 +390,9 @@ test('maintainer AI-policy rejection becomes telemetry and an owner-level verifi
     observedAt: '2026-07-19T13:00:00.000Z',
   }]);
   assert.equal(reasonCodeFromFollowUp({latest_reviews_by_maintainer: [], maintainer_comments: []}), 'unknown');
+  assert.equal(reasonCodeFromFollowUp({latest_reviews_by_maintainer: [{
+    body: 'AI-generated contributions are allowed if reviewed.',
+  }]}), 'other');
 });
 
 test('terminal reconciliation emits exact shadow acceptance and merged demand signal schemas once', async () => {
@@ -427,16 +430,37 @@ test('terminal reconciliation emits exact shadow acceptance and merged demand si
     'both_sides_would_accept', 'human_override', 'reason',
   ]);
   assert.equal(shadow[0].record.declared_check_passed, true);
-  assert.equal(shadow[0].record.would_release, true);
-  assert.equal(shadow[0].record.both_sides_would_accept, 'yes');
+  assert.equal(shadow[0].record.would_release, null);
+  assert.equal(shadow[0].record.both_sides_would_accept, 'unknown');
+  assert.match(shadow[0].record.reason, /^not_assessed:/);
   assert.deepEqual(proto.map((entry) => entry.record.signal), [
     'merged_without_ci_rerun', 'maintainer_cited_receipt', 'fast_merge_after_receipt',
   ]);
+  assert.equal(proto.find((entry) => entry.record.signal === 'merged_without_ci_rerun').record.confidence, 'low');
   for (const entry of proto) {
     assert.deepEqual(Object.keys(entry.record), [
       'ts', 'mission_id', 'repo', 'signal', 'evidence', 'confidence',
     ]);
   }
+});
+
+test('missing CI evidence does not masquerade as a no-rerun delegation signal', async () => {
+  const appended = [];
+  const fixture = harness({
+    prState: 'closed',
+    merged: true,
+    appendDemand: (file, record) => appended.push({file, record: structuredClone(record)}),
+    demandDir: '/tmp/factory-demand-test',
+    attestor: async () => ({found: false}),
+    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
+      status_url: `https://example.test/${item.mission_id}/publication.json`,
+    }])),
+  });
+  fixture.github.getCommitStatus = async () => ({found: false});
+
+  await reconcilePublicationBatch(fixture);
+
+  assert.equal(appended.some((entry) => entry.record.signal === 'merged_without_ci_rerun'), false);
 });
 
 test('demand append failures remain non-blocking reconciliation telemetry', async () => {
