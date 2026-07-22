@@ -167,8 +167,13 @@ test('buildOfferDossier ranks verification pain and appends exact demand schemas
       repository: 'warm/repo', execute: 'function',
     }]);
     assert.deepEqual(Object.keys(result.dossiers[0]), [
-      'repo', 'owner', 'owner_type', 'maintainer', 'relationship_pr_number', 'best_pr', 'runners_up',
+      'repo', 'owner', 'owner_type', 'maintainer', 'relationship_pr_number', 'best_pr',
+      'draft_message', 'runners_up',
     ]);
+    assert.equal(result.dossiers[0].draft_message.message_key, 'post_merge');
+    assert.equal(result.dossiers[0].draft_message.send_gated, true);
+    assert.match(result.dossiers[0].draft_message.message, /PR #10/);
+    assert.doesNotMatch(result.dossiers[0].draft_message.message, /[—–]/);
     assert.equal(result.dossiers[0].owner, 'warm');
     assert.equal(result.dossiers[0].owner_type, 'org');
     assert.equal(result.dossiers[0].maintainer, 'maintainer-one');

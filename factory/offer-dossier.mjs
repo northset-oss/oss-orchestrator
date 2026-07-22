@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
+import {draftOfferMessage} from './offer-messages.mjs';
 import {reasonCodeFromFollowUp, summarizeFollowUp} from './reconciler.mjs';
 
 const FIRST_TIME_ASSOCIATIONS = new Set(['FIRST_TIME_CONTRIBUTOR', 'FIRST_TIMER']);
@@ -316,6 +317,14 @@ export async function buildOfferDossier({
     const ranked = [...(response?.pull_requests ?? [])].sort((left, right) =>
       painOrder(left, right, observedAt));
     const best = ranked[0] ? dossierPr(ranked[0], observedAt) : null;
+    const draftMessage = best ? draftOfferMessage('post_merge', {
+      prNumber: best.number,
+      prAgeDays: Math.floor(ageMilliseconds(ranked[0], observedAt) / 86_400_000),
+      firstTimeContributor: FIRST_TIME_ASSOCIATIONS.has(ranked[0].author_association),
+      crossRepository: ranked[0].is_cross_repository === true,
+      ciState: ranked[0].ci_state,
+      hasReview: Number(ranked[0].reviewer_count ?? 0) > 0,
+    }) : null;
     const dossier = {
       repo,
       owner,
@@ -323,6 +332,7 @@ export async function buildOfferDossier({
       maintainer,
       relationship_pr_number: warm.relationship_pr_number,
       best_pr: best,
+      draft_message: draftMessage,
       runners_up: ranked.slice(1).map((pr) => dossierPr(pr, observedAt)),
     };
     dossiers.push(dossier);
