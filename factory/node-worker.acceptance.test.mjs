@@ -87,6 +87,7 @@ test('N1 scout uses the bounded structured read-only contract', async (t) => {
   assert.match(invocation.prompt, /Existing issue comments/);
   assert.match(invocation.prompt, /I would like to work on this/);
   assert.match(invocation.prompt, /pre_work_rule/);
+  assert.match(invocation.prompt, /current maintainer-authored issue already satisfies it/);
   assert.match(invocation.prompt, /required_checks/);
   assert.match(invocation.prompt, /Never call GitHub|Do not call GitHub/);
   assert.deepEqual(new Set(SCOUT_SCHEMA.required), new Set(Object.keys(SCOUT_SCHEMA.properties)));

@@ -387,6 +387,10 @@ CONTRIBUTING files and pull-request templates. In pre_work_rule, quote or precis
 rule requiring a contributor to comment, claim, ask permission, or otherwise communicate publicly
 before starting. In pre_work_evidence, return an exact, non-empty quote from an existing issue
 comment by AysajanE that satisfies that rule; an issue or another person's comment is not evidence.
+Do not treat a general requirement to open or discuss an issue before larger work as a claimant
+communication rule when the current maintainer-authored issue already satisfies it and the
+repository does not separately require the contributor to comment, claim, request assignment, or
+wait for approval.
 Leave both fields empty if there is no such rule. SKIP when pre_work_rule is non-empty and no such
 comment exists. Never perform the public action yourself.
 
