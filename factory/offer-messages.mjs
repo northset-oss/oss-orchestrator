@@ -10,9 +10,11 @@ import {fileURLToPath} from 'node:url';
 
 export const NORTHSET_VERIFY_LABEL = 'northset-verify';
 
-// Foreign-PR verification runs a stranger's code. They stay gated until the
-// sacrificial-boundary sign-off, so their drafts carry send_after and never go early.
-export const FOREIGN_RUN_GATE = 'foreign-run gate checklist sign-off';
+// The sacrificial-boundary gate was signed off GO on 2026-07-22
+// (northset-oss/docs/foreign-run-gate-evidence-2026-07-22.md), so foreign-PR offers are no
+// longer boundary-blocked. They still run a stranger's code, so each requires recorded
+// PR-scoped maintainer consent before foreign-runner.mjs run executes anything.
+export const FOREIGN_CODE_CONSENT = 'recorded PR-scoped maintainer consent before foreign-runner run';
 
 function requireText(value, name) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -60,7 +62,7 @@ function situationClause({ciState, hasReview}) {
 }
 
 // Move 3. Sent after we merge a fix, offering to verify a contributor's stuck PR.
-// GATED: foreign code, send only after the boundary sign-off.
+// Foreign code: requires recorded PR-scoped consent before the run (boundary gate cleared 2026-07-22).
 export function postMergeOffer({
   prNumber,
   prAgeDays,
@@ -92,7 +94,8 @@ export function issueChoiceOffer() {
 }
 
 // Move 6. Sent to a maintainer who declined our patches, offering verification instead.
-// GATED: foreign code, send only after the boundary sign-off. Requires the login for the greeting.
+// Foreign code: requires recorded PR-scoped consent before the run (boundary gate cleared 2026-07-22).
+// Requires the login for the greeting.
 export function rejectionHarvestOffer({maintainer} = {}) {
   const login = requireText(maintainer, 'maintainer').replace(/^@+/, '');
   const body = [
@@ -112,15 +115,16 @@ export function affordanceLine({label = NORTHSET_VERIFY_LABEL} = {}) {
 }
 
 export const OFFER_MESSAGES = Object.freeze({
-  self_verify: {gated: false, render: (facts) => selfVerifyOffer(facts)},
-  post_merge: {gated: true, send_after: FOREIGN_RUN_GATE, render: (facts) => postMergeOffer(facts)},
-  issue_choice: {gated: false, render: () => issueChoiceOffer()},
-  rejection_harvest: {gated: true, send_after: FOREIGN_RUN_GATE, render: (facts) => rejectionHarvestOffer(facts)},
-  affordance: {gated: false, render: (facts) => affordanceLine(facts)},
+  self_verify: {gated: false, foreign_code: false, render: (facts) => selfVerifyOffer(facts)},
+  post_merge: {gated: false, foreign_code: true, requires: FOREIGN_CODE_CONSENT, render: (facts) => postMergeOffer(facts)},
+  issue_choice: {gated: false, foreign_code: false, render: () => issueChoiceOffer()},
+  rejection_harvest: {gated: false, foreign_code: true, requires: FOREIGN_CODE_CONSENT, render: (facts) => rejectionHarvestOffer(facts)},
+  affordance: {gated: false, foreign_code: false, render: (facts) => affordanceLine(facts)},
 });
 
-// Attachable draft: message text plus the gating metadata that keeps a foreign-PR
-// offer from being sent before the boundary is signed off.
+// Attachable draft: the message text plus the metadata an operator needs before sending.
+// The sacrificial-boundary block is cleared; foreign-code offers still require recorded
+// PR-scoped consent (see FOREIGN_CODE_CONSENT) before foreign-runner run executes anything.
 export function draftOfferMessage(messageKey, facts = {}) {
   const entry = OFFER_MESSAGES[messageKey];
   if (!entry) throw new TypeError(`unknown offer message ${JSON.stringify(messageKey)}`);
@@ -128,7 +132,8 @@ export function draftOfferMessage(messageKey, facts = {}) {
     message_key: messageKey,
     message: entry.render(facts),
     send_gated: entry.gated,
-    send_after: entry.gated ? entry.send_after : null,
+    foreign_code: entry.foreign_code === true,
+    requires: entry.foreign_code === true ? entry.requires : null,
   };
 }
 

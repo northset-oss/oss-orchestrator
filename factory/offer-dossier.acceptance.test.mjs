@@ -171,7 +171,8 @@ test('buildOfferDossier ranks verification pain and appends exact demand schemas
       'draft_message', 'runners_up',
     ]);
     assert.equal(result.dossiers[0].draft_message.message_key, 'post_merge');
-    assert.equal(result.dossiers[0].draft_message.send_gated, true);
+    assert.equal(result.dossiers[0].draft_message.send_gated, false);
+    assert.equal(result.dossiers[0].draft_message.foreign_code, true);
     assert.match(result.dossiers[0].draft_message.message, /PR #10/);
     assert.doesNotMatch(result.dossiers[0].draft_message.message, /[—–]/);
     assert.equal(result.dossiers[0].owner, 'warm');

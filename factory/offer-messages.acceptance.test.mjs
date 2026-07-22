@@ -68,15 +68,18 @@ test('rejection-harvest greets the specific maintainer and leads with respect', 
   assert.throws(() => rejectionHarvestOffer({}), /maintainer is required/);
 });
 
-test('draftOfferMessage carries gating metadata for foreign-code offers', () => {
+test('draftOfferMessage marks foreign-code offers as consent-required, not boundary-gated', () => {
   const foreign = draftOfferMessage('post_merge', {prNumber: 3, prAgeDays: 2});
-  assert.equal(foreign.send_gated, true);
-  assert.equal(foreign.send_after, 'foreign-run gate checklist sign-off');
+  assert.equal(foreign.send_gated, false);
+  assert.equal(foreign.foreign_code, true);
+  assert.equal(foreign.requires, 'recorded PR-scoped maintainer consent before foreign-runner run');
 
   const safe = draftOfferMessage('self_verify', {});
   assert.equal(safe.send_gated, false);
-  assert.equal(safe.send_after, null);
+  assert.equal(safe.foreign_code, false);
+  assert.equal(safe.requires, null);
 
-  assert.equal(OFFER_MESSAGES.rejection_harvest.gated, true);
+  assert.equal(OFFER_MESSAGES.rejection_harvest.gated, false);
+  assert.equal(OFFER_MESSAGES.rejection_harvest.foreign_code, true);
   assert.throws(() => draftOfferMessage('nope', {}), /unknown offer message/);
 });
