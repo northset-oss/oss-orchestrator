@@ -387,6 +387,10 @@ CONTRIBUTING files and pull-request templates. In pre_work_rule, quote or precis
 rule requiring a contributor to comment, claim, ask permission, or otherwise communicate publicly
 before starting. In pre_work_evidence, return an exact, non-empty quote from an existing issue
 comment by AysajanE that satisfies that rule; an issue or another person's comment is not evidence.
+Do not treat a general requirement to open or discuss an issue before larger work as a claimant
+communication rule when the current maintainer-authored issue already satisfies it and the
+repository does not separately require the contributor to comment, claim, request assignment, or
+wait for approval.
 Leave both fields empty if there is no such rule. SKIP when pre_work_rule is non-empty and no such
 comment exists. Never perform the public action yourself.
 
@@ -534,12 +538,16 @@ export function runtimeDockerArgs({checkout, volume, image, command}) {
   return [
     'run', '--rm', '--network=none', '--read-only', '--cap-drop=ALL',
     '--security-opt=no-new-privileges', '--pids-limit=512', '--memory=8g', '--cpus=4',
-    '--mount', `type=bind,src=${checkout},dst=/workspace,readonly`,
+    '--mount', `type=bind,src=${checkout},dst=/source,readonly`,
     '--mount', `type=bind,src=${path.join(checkout, '.git')},dst=/workspace/.git,readonly`,
     '--mount', `type=volume,src=${volume},dst=/workspace/node_modules,readonly`,
     '--workdir', '/workspace', '--env', 'HOME=/tmp', '--env', 'CI=true',
+    '--tmpfs', '/workspace:rw,exec,nosuid,nodev,size=2g',
     '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=2g',
-    image, 'sh', '-lc', command,
+    image, 'sh', '-lc', [
+      "tar -C /source --exclude='./.git' --exclude='./node_modules' --exclude='*/node_modules' -cf - . | tar -C /workspace -xf -",
+      command,
+    ].join(' && '),
   ];
 }
 

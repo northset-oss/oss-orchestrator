@@ -87,6 +87,7 @@ test('N1 scout uses the bounded structured read-only contract', async (t) => {
   assert.match(invocation.prompt, /Existing issue comments/);
   assert.match(invocation.prompt, /I would like to work on this/);
   assert.match(invocation.prompt, /pre_work_rule/);
+  assert.match(invocation.prompt, /current maintainer-authored issue already satisfies it/);
   assert.match(invocation.prompt, /required_checks/);
   assert.match(invocation.prompt, /Never call GitHub|Do not call GitHub/);
   assert.deepEqual(new Set(SCOUT_SCHEMA.required), new Set(Object.keys(SCOUT_SCHEMA.properties)));
@@ -220,7 +221,9 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
   }).join('\n');
   assert.match(runtime, /--network=none/);
   assert.match(runtime, /src=northset-deps-abc,dst=\/workspace\/node_modules,readonly/);
-  assert.match(runtime, /src=\/private\/factory\/repository,dst=\/workspace,readonly/);
+  assert.match(runtime, /src=\/private\/factory\/repository,dst=\/source,readonly/);
+  assert.match(runtime, /\/workspace:rw,exec,nosuid,nodev,size=2g/);
+  assert.match(runtime, /tar -C \/source/);
 
   const authRoot = await temporary(t, 'factory-codex-auth');
   const sourceHome = path.join(authRoot, 'source-home');
@@ -327,12 +330,13 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
     if (command !== 'docker') return runBounded(command, args, options);
     assert.equal(args[0], 'run');
     const checkoutMount = args.find((arg) => typeof arg === 'string' &&
-      arg.startsWith('type=bind,src=') && arg.includes(',dst=/workspace,readonly'));
+      arg.startsWith('type=bind,src=') && arg.includes(',dst=/source,readonly'));
     assert.ok(checkoutMount, args.join(' '));
-    const source = checkoutMount.slice('type=bind,src='.length).split(',dst=/workspace,readonly')[0];
+    const source = checkoutMount.slice('type=bind,src='.length).split(',dst=/source,readonly')[0];
     const cleanEnvironment = Object.fromEntries(Object.entries(process.env)
       .filter(([name]) => !name.startsWith('NODE_TEST')));
-    const result = await runBounded('sh', ['-lc', args.at(-1)], {
+    const commandInWorkspace = args.at(-1).split(' && ').slice(1).join(' && ');
+    const result = await runBounded('sh', ['-lc', commandInWorkspace], {
       cwd: source, env: cleanEnvironment,
       timeoutMs: options.timeoutMs, maxOutputBytes: options.maxOutputBytes,
     });
