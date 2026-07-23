@@ -245,11 +245,81 @@ function assertVerification(verification) {
 export function assertPublicVerificationClaims(authored, verification) {
   const command = verification?.patched_observation?.command;
   if (typeof command !== 'string' || !command.trim()) return;
-  const contradictory = /\b(?:could not|couldn't|did not run|was not run|not run|blocked|unavailable|failed to (?:start|run))\b/i;
-  const focusedCheck = /\bfocused\b[^.\n]{0,120}\b(?:command|check|test(?:s|ing)?)\b/i;
+  const verifiedCommands = [command, ...command.split(/\s*&&\s*/)]
+    .map((candidate) => candidate.trim()).filter(Boolean);
+  const verifiedTools = verifiedCommands.map((candidate) =>
+    candidate.match(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*([^\s]+)/)?.[1]).filter(Boolean);
+  const denial =
+    /\b(?:(?:could not|couldn't)\s+(?:be\s+)?(?:start(?:ed)?|run|execute(?:d)?)|(?:did not|didn't|was unable to|failed to)\s+(?:start|run|execute)|was not (?:run|executed|started)|wasn't (?:run|executed|started)|never (?:ran|executed|started)|not run|blocked|denied|unavailable|skipped|failed)\b/i;
+  const reverseDenial =
+    /\b(?:(?:(?:could|did) not|couldn't|didn't|was unable to|failed to|blocked from)\s+(?:start|run|execute)|skipped|blocked|denied)\s+(?:the\s+)?$/i;
+  const deniedLiteral = (candidate, literal, excludeProperty = false) => {
+    let offset = 0;
+    while (offset <= candidate.length - literal.length) {
+      const index = candidate.indexOf(literal, offset);
+      if (index < 0) break;
+      offset = index + Math.max(1, literal.length);
+      const rawPrefix = candidate.slice(0, index).split(/[.;\n]/).at(-1) ?? '';
+      const rawTail = candidate.slice(index + literal.length).split(/[.;\n]/)[0] ?? '';
+      const prefix = rawPrefix.replace(/[`*_]+\s*$/, '');
+      const tail = rawTail.replace(/^[`*_]+/, '');
+      if (excludeProperty &&
+          (/\b(?:output|result|logs?)\s+(?:for|from|of)(?:\s+executing)?\s+(?:the\s+)?$/i.test(prefix) ||
+           /^(?:['’]s)?\s*(?:output|result|logs?|documentation)\b/i.test(tail))) {
+        continue;
+      }
+      if (reverseDenial.test(prefix)) return true;
+      const after = tail.match(denial);
+      if (after) {
+        const beforeDenial = tail.slice(0, after.index);
+        const priorSuccess = [...beforeDenial.matchAll(
+          /\b(?:passed|succeeded|exited\s+0|completed successfully)\b/ig,
+        )].at(-1);
+        if (priorSuccess) {
+          const between = beforeDenial.slice((priorSuccess.index ?? 0) + priorSuccess[0].length);
+          const connectors = [...between.matchAll(/\b(?:but|and|however|then)\b/ig)];
+          const lastConnector = connectors.at(-1);
+          const denialSubject = (lastConnector
+            ? between.slice((lastConnector.index ?? 0) + lastConnector[0].length)
+            : between)
+            .replace(/\b(?:previously|earlier|before|now|later)\b/ig, '')
+            .replace(/[\s,()[\]`*_'-]+/g, '');
+          const recovery = tail.slice(after.index + after[0].length);
+          const deniesDifferentCheck =
+            /\b(?:run|execute|start)\b/i.test(after[0]) &&
+            /^\s+(?!(?:in|on|under|because|due|locally)\b)[^.;\n]{0,60}\b(?:tests?|checks?)\b/i
+              .test(recovery);
+          if ((!denialSubject || /^it$/i.test(denialSubject)) && deniesDifferentCheck) continue;
+          if (denialSubject && !/^it$/i.test(denialSubject)) continue;
+          return true;
+        }
+        const recovery = tail.slice(after.index + after[0].length);
+        const initialFailure = /\b(?:initially|at first|on the first attempt)\b/i
+          .test(`${prefix} ${beforeDenial}`);
+        const laterSuccess =
+          /\b(?:then|later|subsequently|after(?:ward|wards)?|but)\b\s+(?:it\s+)?(?:passed|succeeded|exited\s+0|completed successfully)\b/i
+            .test(recovery);
+        if (!initialFailure || !laterSuccess) return true;
+      }
+    }
+    return false;
+  };
+  const wholeCommand = /\b(?:full|complete|entire|exact|same|above|following|declared)\s+(?:(?:test|verification)\s+)?command\b/i;
+  const commandDeniedInFull =
+    /\bcommand\b(?:(?![.;\n]).){0,60}\b(?:did not run|was not run|wasn't run|could not run|couldn't run)\b(?:(?![.;\n]).){0,30}\bin full\b/i;
+  const deniesWholeCommand = (candidate) => {
+    if (commandDeniedInFull.test(candidate)) return true;
+    const matches = candidate.matchAll(new RegExp(wholeCommand.source, 'ig'));
+    return [...matches].some((match) => deniedLiteral(candidate, match[0], true));
+  };
+  const deniesFocusedCheck = (candidate) => [...candidate.matchAll(
+    /\bfocused\b[^.\n]{0,120}\b(?:command|check|test(?:s|ing)?)\b/ig,
+  )].some((match) => deniedLiteral(candidate, match[0]));
   const line = String(authored?.pr_body ?? '').split(/\r?\n/)
-    .find((candidate) => contradictory.test(candidate) &&
-      (candidate.includes(command) || focusedCheck.test(candidate)));
+    .find((candidate) => deniesWholeCommand(candidate) ||
+      deniesFocusedCheck(candidate) ||
+      verifiedCommands.some((verifiedCommand) => deniedLiteral(candidate, verifiedCommand)) ||
+      verifiedTools.some((tool) => deniedLiteral(candidate, `${tool} execution`)));
   if (line) {
     throw new Error('PR body says the clean verifier command did not run, but its patched observation passed');
   }

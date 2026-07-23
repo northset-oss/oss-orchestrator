@@ -212,6 +212,7 @@ test('footer v2 substitutes long commands and preserves a placeholder receipt bl
 
 test('PR text cannot deny that its exact clean verifier command ran and passed', () => {
   const command = 'yarn test --watchAll=false --runTestsByPath src/__tests__/selectors.test.js';
+  const chainedCommand = 'node --test test/junit-analyzer.test.mjs && npm test';
   assert.throws(() => assertPublicVerificationClaims({
     pr_body: `## Testing\n- \`${command}\` could not start because Yarn is unavailable`,
   }, {
@@ -225,10 +226,104 @@ test('PR text cannot deny that its exact clean verifier command ran and passed',
       result: 'PASS', exit_code: 0},
   }), /PR body says the clean verifier command did not run/);
 
-  assert.doesNotThrow(() => assertPublicVerificationClaims({
-    pr_body: `## Testing\n- \`${command}\` passed in the clean verifier\n- npm run lint was not run`,
+  assert.throws(() => assertPublicVerificationClaims({
+    pr_body: '## Testing\n- `npm test` could not run because npm execution is blocked in this workspace',
   }, {
-    patched_observation: {command, result: 'PASS', exit_code: 0},
+    patched_observation: {
+      command: chainedCommand,
+      result: 'PASS',
+      exit_code: 0,
+    },
+  }), /PR body says the clean verifier command did not run/);
+
+  assert.throws(() => assertPublicVerificationClaims({
+    pr_body: '## Testing\nNot run locally: the sandbox denied npm execution with operation not permitted.',
+  }, {
+    patched_observation: {
+      command: 'npm test -- --runInBand __TEST__/hyperaudio-lite.test.js -t "share-link highlight includes first transcript word" && npm run build && npm run test',
+      result: 'PASS',
+      exit_code: 0,
+    },
+  }), /PR body says the clean verifier command did not run/);
+
+  for (const prBody of [
+    '## Testing\nFull command attempted but blocked because dependencies were unavailable.',
+    '## Testing\nThe complete command could not execute locally. Syntax checks passed.',
+    '## Testing\nThe entire command did not run.',
+    '## Testing\nThe complete command was skipped.',
+    '## Testing\nThe complete command failed.',
+    '## Testing\nThe sandbox could not run the full command.',
+    '## Testing\nThe complete command was unable to run.',
+    '## Testing\nThe complete command did not execute.',
+    '## Testing\nThe sandbox did not run the full command.',
+    '## Testing\nWe skipped the full command.',
+    '## Testing\nThe full verification command could not run.',
+    '## Testing\nThe complete command could not be executed.',
+    '## Testing\nThe command was not run in full.',
+  ]) {
+    assert.throws(() => assertPublicVerificationClaims({
+      pr_body: prBody,
+    }, {
+      patched_observation: {
+        command: 'node test/run.mjs && npm test',
+        result: 'PASS',
+        exit_code: 0,
+      },
+    }), /PR body says the clean verifier command did not run/);
+  }
+
+  for (const prBody of [
+    '## Testing\nThe full command output is unavailable, but the command passed.',
+    '## Testing\nThe full command passed; npm run lint was not run.',
+    '## Testing\nOutput for the full command is unavailable.',
+    "## Testing\nThe full command's output is unavailable.",
+    '## Testing\nThe full command’s output is unavailable.',
+    '## Testing\nThe result of executing the full command is unavailable.',
+    '## Testing\nThe full command documentation is unavailable.',
+    '## Testing\n`npm test` passed; browser tests were not run.',
+    '## Testing\n`npm test` passed, but the optional lint check was unavailable.',
+    '## Testing\n`npm test` passed in CI, but optional lint could not run.',
+    '## Testing\n`npm test` passed, but could not run optional browser tests.',
+    '## Testing\nThe full command initially failed, then passed after installing dependencies.',
+    '## Testing\n`npm test` initially failed due to missing dependencies, then passed.',
+    '## Testing\nInitially, the full command failed, then passed after installing dependencies.',
+    '## Testing\nThe full command initially failed because dependencies were missing, but passed after installing them.',
+  ]) {
+    assert.doesNotThrow(() => assertPublicVerificationClaims({
+      pr_body: prBody,
+    }, {
+      patched_observation: {
+        command: 'node test/run.mjs && npm test',
+        result: 'PASS',
+        exit_code: 0,
+      },
+    }));
+  }
+
+  for (const prBody of [
+    '## Testing\nThe full command output is unavailable because the full command could not run.',
+    '## Testing\nOutput for the full command is unavailable because the full command did not run.',
+    '## Testing\nThe full command could not execute locally, then syntax checks passed.',
+    '## Testing\n`npm test` failed, then the lint check passed.',
+    '## Testing\n`npm test` passed previously, but could not run in the clean verifier.',
+    '## Testing\n`npm test` passed in CI, but could not run in the clean verifier.',
+    '## Testing\n`npm test` passed in CI, but it could not run in the clean verifier.',
+  ]) {
+    assert.throws(() => assertPublicVerificationClaims({
+      pr_body: prBody,
+    }, {
+      patched_observation: {
+        command: 'node test/run.mjs && npm test',
+        result: 'PASS',
+        exit_code: 0,
+      },
+    }), /PR body says the clean verifier command did not run/);
+  }
+
+  assert.doesNotThrow(() => assertPublicVerificationClaims({
+    pr_body: `## Testing\n- \`${chainedCommand}\` passed in the clean verifier\n- npm run lint was not run`,
+  }, {
+    patched_observation: {command: chainedCommand, result: 'PASS', exit_code: 0},
   }));
 });
 
