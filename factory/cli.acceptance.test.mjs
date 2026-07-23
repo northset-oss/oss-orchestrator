@@ -486,8 +486,9 @@ test('a transient preflight failure still drains queued work and retries on the 
   const db = fakeDb({stats: () => ({ready_items: 1})});
   let fills = 0;
   let cycles = 0;
-  const transient = new Error('temporary GitHub preflight timeout');
-  transient.code = 'ETIMEDOUT';
+  const transient = new Error('gh api graphql failed: error connecting to api.github.com');
+  transient.code = 'GH_COMMAND_FAILED';
+  transient.stderr = 'check your internet connection or https://githubstatus.com';
   const result = await executeFactoryCli(['run', '--poll-ms', '0'], {
     env: {},
     signal: controller.signal,
@@ -512,7 +513,7 @@ test('a transient preflight failure still drains queued work and retries on the 
   assert.equal(cycles, 2);
   assert.equal(result.claimed, 1);
   assert.equal(result.source_failures, 1);
-  assert.match(result.last_source_error, /temporary GitHub preflight timeout/);
+  assert.match(result.last_source_error, /error connecting to api\.github\.com/);
 });
 
 test('run performs one bounded asynchronous reconciliation pass without blocking local work', async () => {

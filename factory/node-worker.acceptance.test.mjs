@@ -15,6 +15,8 @@ import {
   runBounded,
   runtimeDockerArgs,
 } from './node-worker.mjs';
+import {createCommandDriver} from './worker.mjs';
+import {SOURCE_MUTATION_MARKER} from './verifier.mjs';
 
 const IMAGE = 'northset-oss-author:test';
 const IMAGE_DIGEST = `sha256:${'a'.repeat(64)}`;
@@ -135,6 +137,10 @@ test('N1c author must bind every required repository check into the verifier com
     scout: {required_checks: ['npm test', 'npm run typecheck'], estimated_risk: 'GREEN'},
   }), /author test_command omits required repository checks: npm test/);
   assert.match(invocation.prompt, /pr_title becomes the canonical commit subject/);
+  assert.match(invocation.prompt, /read and follow any existing repository pull-request template/);
+  assert.match(invocation.prompt, /Preserve its required fields and checklist items/);
+  assert.match(invocation.prompt, /leave any unrun QA or UAT check unchecked/);
+  assert.match(invocation.prompt, /do not invent evidence or an\s+API-contract classification/);
   assert.match(invocation.prompt, /exact\s+command the clean verifier and receipt will bind/);
   assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');
 });
@@ -224,6 +230,12 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
   assert.match(runtime, /src=\/private\/factory\/repository,dst=\/source,readonly/);
   assert.match(runtime, /\/workspace:rw,exec,nosuid,nodev,size=2g/);
   assert.match(runtime, /tar -C \/source/);
+  assert.match(runtime, /NORTHSET_VERIFY_COMMAND=node --test/);
+  assert.match(runtime, /northset_snapshot \/source \/tmp\/northset-source-before\.tar/);
+  assert.match(runtime, /northset_snapshot \/workspace \/tmp\/northset-source-after\.tar/);
+  assert.match(runtime, /tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner/);
+  assert.doesNotMatch(runtime, /git diff|exclude-standard/);
+  assert.match(runtime, new RegExp(SOURCE_MUTATION_MARKER));
 
   const authRoot = await temporary(t, 'factory-codex-auth');
   const sourceHome = path.join(authRoot, 'source-home');
@@ -254,6 +266,97 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
   assert.match(isolatedConfig, /\[permissions\.factory_workspace\.filesystem\]/);
   assert.match(isolatedConfig, new RegExp(`${sourceHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" = "deny"`));
   assert.match(isolatedConfig, new RegExp(`${isolatedHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" = "deny"`));
+});
+
+test('N2b runtime detects tracked and untracked mutations inside the real container copy', async (t) => {
+  const image = process.env.OSS_AUTHOR_IMAGE ?? 'northset-oss-author:0.144.1';
+  let available;
+  try {
+    available = await runBounded('docker', ['image', 'inspect', image], {timeoutMs: 30_000});
+  } catch {
+    t.skip('Docker is unavailable');
+    return;
+  }
+  if (available.code !== 0) {
+    t.skip(`verifier image ${image} is unavailable`);
+    return;
+  }
+
+  const {root, checkout} = await repository(t);
+  await writeFile(path.join(checkout, '.gitignore'), 'ignored-output.txt\n');
+  await git(['-C', checkout, 'add', '.gitignore']);
+  await git(['-C', checkout, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+    'commit', '-q', '-m', 'ignore generated output']);
+  const volume = `northset-verifier-test-${path.basename(root).replace(/[^a-zA-Z0-9_.-]/g, '-')}`;
+  const created = await runBounded('docker', ['volume', 'create', volume], {timeoutMs: 30_000});
+  assert.equal(created.code, 0, created.stderr || created.stdout);
+  t.after(() => runBounded('docker', ['volume', 'rm', '-f', volume], {timeoutMs: 30_000}));
+
+  const runVerification = (command) => runBounded('docker', runtimeDockerArgs({
+    checkout, volume, image, command,
+  }), {timeoutMs: 30_000});
+
+  const cleanPass = await runVerification('node -e "process.exit(0)"');
+  assert.equal(cleanPass.code, 0, cleanPass.stderr || cleanPass.stdout);
+  assert.doesNotMatch(cleanPass.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const metadataOnlyTouch = await runVerification('touch src/value.mjs');
+  assert.equal(metadataOnlyTouch.code, 0, metadataOnlyTouch.stderr || metadataOnlyTouch.stdout);
+  assert.doesNotMatch(metadataOnlyTouch.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const cleanFailure = await runVerification('node -e "process.exit(7)"');
+  assert.equal(cleanFailure.code, 7, cleanFailure.stderr || cleanFailure.stdout);
+  assert.doesNotMatch(cleanFailure.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const spoofedMarker = await runVerification(
+    `node -e "console.error('${SOURCE_MUTATION_MARKER}'); process.exit(0)"`,
+  );
+  assert.equal(spoofedMarker.code, 0, spoofedMarker.stderr || spoofedMarker.stdout);
+  assert.match(spoofedMarker.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const spoofedMarkerFailure = await runVerification(
+    `node -e "console.error('${SOURCE_MUTATION_MARKER}'); process.exit(7)"`,
+  );
+  assert.equal(spoofedMarkerFailure.code, 7,
+    spoofedMarkerFailure.stderr || spoofedMarkerFailure.stdout);
+  assert.match(spoofedMarkerFailure.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const trackedMutation = await runVerification(
+    'node -e "require(\'node:fs\').writeFileSync(\'src/value.mjs\', \'formatted\\n\')"',
+  );
+  assert.equal(trackedMutation.code, 86, trackedMutation.stderr || trackedMutation.stdout);
+  assert.match(trackedMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const normalizedTrackedMutation = await runVerification(
+    'node -e "require(\'node:fs\').writeFileSync(\'src/value.mjs\', \'export function value() { return 1; }\\r\\n\')"',
+  );
+  assert.equal(normalizedTrackedMutation.code, 86,
+    normalizedTrackedMutation.stderr || normalizedTrackedMutation.stdout);
+  assert.match(normalizedTrackedMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const untrackedMutationAfterFailure = await runVerification(
+    'node -e "require(\'node:fs\').writeFileSync(\'generated-source.mjs\', \'generated\\n\'); process.exit(7)"',
+  );
+  assert.equal(untrackedMutationAfterFailure.code, 86,
+    untrackedMutationAfterFailure.stderr || untrackedMutationAfterFailure.stdout);
+  assert.match(untrackedMutationAfterFailure.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const ignoredMutation = await runVerification(
+    'node -e "require(\'node:fs\').writeFileSync(\'ignored-output.txt\', \'ignored\\n\')"',
+  );
+  assert.equal(ignoredMutation.code, 86, ignoredMutation.stderr || ignoredMutation.stdout);
+  assert.match(ignoredMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const modeMutation = await runVerification('chmod +x src/value.mjs');
+  assert.equal(modeMutation.code, 86, modeMutation.stderr || modeMutation.stdout);
+  assert.match(modeMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
+
+  const typeAndSymlinkMutation = await runVerification(
+    'rm src/value.mjs && ln -s ../package.json src/value.mjs',
+  );
+  assert.equal(typeAndSymlinkMutation.code, 86,
+    typeAndSymlinkMutation.stderr || typeAndSymlinkMutation.stdout);
+  assert.match(typeAndSymlinkMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
 });
 
 test('N3 bootstrap creates one content-keyed volume and then reuses its frozen marker', async (t) => {
@@ -335,7 +438,8 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
     const source = checkoutMount.slice('type=bind,src='.length).split(',dst=/source,readonly')[0];
     const cleanEnvironment = Object.fromEntries(Object.entries(process.env)
       .filter(([name]) => !name.startsWith('NODE_TEST')));
-    const commandInWorkspace = args.at(-1).split(' && ').slice(1).join(' && ');
+    const commandInWorkspace = args.find((arg) => typeof arg === 'string' &&
+      arg.startsWith('NORTHSET_VERIFY_COMMAND=')).slice('NORTHSET_VERIFY_COMMAND='.length);
     const result = await runBounded('sh', ['-lc', commandInWorkspace], {
       cwd: source, env: cleanEnvironment,
       timeoutMs: options.timeoutMs, maxOutputBytes: options.maxOutputBytes,
@@ -444,4 +548,54 @@ test('N6 subprocess execution is bounded by both wall time and aggregate output'
   await assert.rejects(() => runBounded(process.execPath, ['-e', "process.stdout.write('x'.repeat(4096))"], {
     timeoutMs: 2_000, maxOutputBytes: 128,
   }), (error) => error.code === 'EOUTPUTLIMIT');
+});
+
+test('N6b outer worker timeout relays termination to nested bounded work', async (t) => {
+  const root = await temporary(t, 'factory-node-worker-group');
+  const started = path.join(root, 'started');
+  const orphaned = path.join(root, 'orphaned');
+  const nested = [
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(started)}, 'started');`,
+    `setTimeout(() => fs.writeFileSync(${JSON.stringify(orphaned)}, 'orphaned'), 1200);`,
+  ].join('\n');
+  const wrapper = [
+    `import {runBounded} from ${JSON.stringify(new URL('./node-worker.mjs', import.meta.url).href)};`,
+    `await runBounded(process.execPath, ['-e', ${JSON.stringify(nested)}], {timeoutMs: 10_000});`,
+  ].join('\n');
+  const driver = createCommandDriver({
+    command: process.execPath,
+    args: ['--input-type=module', '-e', wrapper],
+  });
+
+  await assert.rejects(
+    driver.scout({}, root, {timeoutMs: 500}),
+    /worker command timed out after 500ms/,
+  );
+  assert.equal(await readFile(started, 'utf8'), 'started');
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  await assert.rejects(readFile(orphaned, 'utf8'), (error) => error.code === 'ENOENT');
+});
+
+test('N6c bounded command timeout terminates its spawned grandchild', async (t) => {
+  const root = await temporary(t, 'factory-node-worker-subtree');
+  const started = path.join(root, 'started');
+  const orphaned = path.join(root, 'orphaned');
+  const grandchild = [
+    "const fs = require('node:fs');",
+    `setTimeout(() => fs.writeFileSync(${JSON.stringify(orphaned)}, 'orphaned'), 1200);`,
+  ].join('\n');
+  const child = [
+    "const {spawn} = require('node:child_process');",
+    "const fs = require('node:fs');",
+    `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], {stdio: 'ignore'});`,
+    `fs.writeFileSync(${JSON.stringify(started)}, 'started');`,
+    'setTimeout(() => {}, 10_000);',
+  ].join('\n');
+
+  await assert.rejects(runBounded(process.execPath, ['-e', child], {timeoutMs: 500}),
+    (error) => error.code === 'ETIMEDOUT');
+  assert.equal(await readFile(started, 'utf8'), 'started');
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  await assert.rejects(readFile(orphaned, 'utf8'), (error) => error.code === 'ENOENT');
 });

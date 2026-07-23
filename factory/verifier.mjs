@@ -13,6 +13,7 @@ export const CLAIM_TYPES = Object.freeze([
   'test_infrastructure_fix',
 ]);
 export const OSS_COMMIT_IDENTITY = Object.freeze({name: 'Aysajan Eziz', email: 'aeziz@northset.ai'});
+export const SOURCE_MUTATION_MARKER = 'NORTHSET_VERIFIER_SOURCE_MUTATION';
 
 function isoTime(value, label) {
   const date = value instanceof Date ? value : new Date(value);
@@ -190,6 +191,13 @@ function assertClaimObservations(claimType, base, patched) {
   if (base.exit_code === 0) throw new Error(`${claimType} requires a failing base observation`);
 }
 
+function assertNoSourceMutation(phase, result) {
+  const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  if (Number(result.code ?? result.exit_code) === 86 && output.includes(SOURCE_MUTATION_MARKER)) {
+    throw new Error(`${phase} changed source during clean verification`);
+  }
+}
+
 function classifyPath(file, status) {
   const normalized = file.toLowerCase();
   const name = path.basename(normalized);
@@ -278,6 +286,7 @@ export async function verifyContribution(input, {
     mounts,
     claimType: input.claimType,
   });
+  assertNoSourceMutation('base observation', baseResult);
   const baseFinishedAt = isoTime(now(), 'base observation finish');
   const patchedStartedAt = isoTime(now(), 'patched observation start');
   const patchedResult = await runContainer({
@@ -288,6 +297,7 @@ export async function verifyContribution(input, {
     mounts,
     claimType: input.claimType,
   });
+  assertNoSourceMutation('patched observation', patchedResult);
   const patchedFinishedAt = isoTime(now(), 'patched observation finish');
   const baseObservation = commandResult(baseResult, {
     phase: 'base_observation',

@@ -130,7 +130,8 @@ function localDockerRun(calls) {
     const checkout = mount.slice('type=bind,src='.length).split(',dst=/source,readonly')[0];
     const cleanEnvironment = Object.fromEntries(Object.entries(process.env)
       .filter(([name]) => !name.startsWith('NODE_TEST')));
-    const commandInWorkspace = args.at(-1).split(' && ').slice(1).join(' && ');
+    const commandInWorkspace = args.find((argument) => typeof argument === 'string' &&
+      argument.startsWith('NORTHSET_VERIFY_COMMAND=')).slice('NORTHSET_VERIFY_COMMAND='.length);
     return runBounded('sh', ['-lc', commandInWorkspace], {
       cwd: checkout, env: cleanEnvironment,
       timeoutMs: options.timeoutMs, maxOutputBytes: options.maxOutputBytes,

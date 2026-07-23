@@ -11,6 +11,7 @@ import {
   bootstrapDependencies,
   buildProof,
   dependencyCacheKey,
+  SOURCE_MUTATION_MARKER,
   verifyContribution,
 } from './verifier.mjs';
 
@@ -215,6 +216,50 @@ test('V5 tracked source mutation during final verification fails', async (t) => 
       if (plan.phase === 'patched_observation') await writeFile(path.join(fixture.root, 'value.mjs'), 'mutated\n');
     }}),
   }), /tracked source changed/i);
+});
+
+test('V5b container-copy mutation fails even when the patched command succeeds', async (t) => {
+  const fixture = await makeGitFixture(t);
+  await assert.rejects(() => verifyContribution(input(fixture, 'regression_fix'), {
+    runContainer: async (plan) => plan.phase === 'base_observation'
+      ? {code: 1, stdout: 'base', stderr: 'failed'}
+      : {code: 86, stdout: 'patched', stderr: SOURCE_MUTATION_MARKER},
+  }), /patched observation changed source during clean verification/i);
+});
+
+test('V5c expected base failure cannot mask a container-copy mutation', async (t) => {
+  const fixture = await makeGitFixture(t);
+  let calls = 0;
+  await assert.rejects(() => verifyContribution(input(fixture, 'regression_fix'), {
+    runContainer: async () => {
+      calls += 1;
+      return {code: 86, stdout: 'failed', stderr: SOURCE_MUTATION_MARKER};
+    },
+  }), /base observation changed source during clean verification/i);
+  assert.equal(calls, 1);
+});
+
+test('V5d command output cannot spoof the structured mutation verdict', async (t) => {
+  const fixture = await makeGitFixture(t);
+  const result = await verifyContribution(input(fixture, 'regression_fix'), {
+    runContainer: async (plan) => plan.phase === 'base_observation'
+      ? {code: 1, stdout: 'failed', stderr: ''}
+      : {code: 0, stdout: SOURCE_MUTATION_MARKER, stderr: ''},
+  });
+  assert.equal(result.patched_observation.exit_code, 0);
+  assert.equal(result.patched_observation.result, 'PASS');
+});
+
+test('V5e expected base failure may print the marker without spoofing mutation', async (t) => {
+  const fixture = await makeGitFixture(t);
+  const result = await verifyContribution(input(fixture, 'regression_fix'), {
+    runContainer: async (plan) => plan.phase === 'base_observation'
+      ? {code: 1, stdout: `failed\n${SOURCE_MUTATION_MARKER}`, stderr: ''}
+      : {code: 0, stdout: 'patched', stderr: ''},
+  });
+  assert.equal(result.base_observation.exit_code, 1);
+  assert.equal(result.base_observation.result, 'FAIL');
+  assert.equal(result.base_observation.expectation_met, true);
 });
 
 test('V6 patch tree or commit binding mismatch fails', async (t) => {

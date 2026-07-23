@@ -326,6 +326,8 @@ test('recent common claim and collaborator-offer phrases block while stale inter
     "I'd love to investigate this issue. Could I be assigned?",
     'Please let me know if I can work on this.',
     'I have implemented the unit tests and would like to request that this issue be assigned to me.',
+    'assign me pls.',
+    'kindly merge PR #270',
     'This one is yours if you want it.',
   ];
   for (const body of phrases) {

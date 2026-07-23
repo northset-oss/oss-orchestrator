@@ -18,6 +18,7 @@ import {fileURLToPath} from 'node:url';
 import {
   CLAIM_TYPES,
   OSS_COMMIT_IDENTITY,
+  SOURCE_MUTATION_MARKER,
   dependencyCacheKey,
   verifyContribution,
 } from './verifier.mjs';
@@ -86,6 +87,24 @@ function terminate(child, signal) {
   }
 }
 
+const activeChildGroups = new Set();
+
+function relaySigterm() {
+  for (const child of activeChildGroups) terminate(child, 'SIGTERM');
+  process.removeListener('SIGTERM', relaySigterm);
+  process.kill(process.pid, 'SIGTERM');
+}
+
+function trackChildGroup(child) {
+  if (process.platform === 'win32') return () => {};
+  if (activeChildGroups.size === 0) process.once('SIGTERM', relaySigterm);
+  activeChildGroups.add(child);
+  return () => {
+    activeChildGroups.delete(child);
+    if (activeChildGroups.size === 0) process.removeListener('SIGTERM', relaySigterm);
+  };
+}
+
 /** A bounded subprocess primitive. It never uses a shell and never forwards stdin or output. */
 export function runBounded(command, args, {
   cwd,
@@ -101,6 +120,7 @@ export function runBounded(command, args, {
       detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    const untrackChildGroup = trackChildGroup(child);
     const stdout = [];
     const stderr = [];
     let outputBytes = 0;
@@ -121,10 +141,12 @@ export function runBounded(command, args, {
     child.stderr.on('data', (chunk) => collect(stderr, chunk));
     child.on('error', (error) => {
       clearTimeout(timer);
+      untrackChildGroup();
       reject(error);
     });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
+      untrackChildGroup();
       if (terminalError) {
         terminalError.code = /timed out/.test(terminalError.message) ? 'ETIMEDOUT' : 'EOUTPUTLIMIT';
         reject(terminalError);
@@ -424,11 +446,14 @@ For existing_check_repair or test_infrastructure_fix, the declared existing chec
 The single test_command must run the focused check first and then every repository-required command
 listed in Scout decision.required_checks. Run that complete command after the fix; it is the exact
 command the clean verifier and receipt will bind. Follow repository-specific pull-request title and
-commit-subject conventions: pr_title becomes the canonical commit subject. Accurately list the exact
-complete command in the PR body. If an honest, bounded patch is not possible, return SKIP. Write a
-factual PR title/body without claiming maintainer approval, production readiness, guaranteed
-correctness, or that checks beyond the reported commands passed. Return only the output-schema JSON.
-Never call GitHub.`;
+commit-subject conventions: pr_title becomes the canonical commit subject. Before writing pr_body,
+read and follow any existing repository pull-request template, including templates under .github.
+Preserve its required fields and checklist items. Fill them accurately for this patch, link the issue
+where requested, leave any unrun QA or UAT check unchecked, and do not invent evidence or an
+API-contract classification. Accurately list the exact complete command in the PR body. If an honest,
+bounded patch is not possible, return SKIP. Write a factual PR title/body without claiming maintainer
+approval, production readiness, guaranteed correctness, or that checks beyond the reported commands
+passed. Return only the output-schema JSON. Never call GitHub.`;
 }
 
 function assertScout(result, task = {}) {
@@ -542,11 +567,27 @@ export function runtimeDockerArgs({checkout, volume, image, command}) {
     '--mount', `type=bind,src=${path.join(checkout, '.git')},dst=/workspace/.git,readonly`,
     '--mount', `type=volume,src=${volume},dst=/workspace/node_modules,readonly`,
     '--workdir', '/workspace', '--env', 'HOME=/tmp', '--env', 'CI=true',
+    '--env', `NORTHSET_VERIFY_COMMAND=${command}`,
     '--tmpfs', '/workspace:rw,exec,nosuid,nodev,size=2g',
     '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=2g',
     image, 'sh', '-lc', [
       "tar -C /source --exclude='./.git' --exclude='./node_modules' --exclude='*/node_modules' -cf - . | tar -C /workspace -xf -",
-      command,
+      [
+        'sh -lc "$NORTHSET_VERIFY_COMMAND"',
+        'northset_command_status=$?',
+        'northset_snapshot() {',
+        "  tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C \"$1\" --exclude='./.git' --exclude='*/.git' --exclude='./node_modules' --exclude='*/node_modules' -cf \"$2\" .",
+        '}',
+        'northset_snapshot /source /tmp/northset-source-before.tar &&',
+        '  northset_snapshot /workspace /tmp/northset-source-after.tar',
+        'northset_snapshot_status=$?',
+        'if [ "$northset_snapshot_status" -ne 0 ] ||',
+        '   ! cmp -s /tmp/northset-source-before.tar /tmp/northset-source-after.tar; then',
+        `  printf '%s\\n' '${SOURCE_MUTATION_MARKER}' >&2`,
+        '  exit 86',
+        'fi',
+        'exit "$northset_command_status"',
+      ].join('\n'),
     ].join(' && '),
   ];
 }

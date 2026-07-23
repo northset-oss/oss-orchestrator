@@ -315,6 +315,9 @@ function sourceSummary(value) {
 function recoverableSourceError(error) {
   if (error?.transient === true) return true;
   if (Number(error?.httpStatus ?? error?.status) >= 500) return true;
+  if (String(error?.code ?? '').toUpperCase() === 'GH_COMMAND_FAILED' &&
+      /error connecting to api\.github\.com|check your internet connection/i
+        .test(`${error?.message ?? ''}\n${error?.stderr ?? ''}`)) return true;
   return [
     'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETDOWN', 'ENETUNREACH',
     'EHOSTUNREACH', 'GH_COMMAND_TIMEOUT', 'GH_OUTPUT_LIMIT', 'SQLITE_BUSY', 'SQLITE_LOCKED',

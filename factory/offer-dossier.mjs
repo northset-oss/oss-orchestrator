@@ -14,6 +14,14 @@ const OFFER_STAGES = new Set([
   'identified', 'offer_drafted', 'offer_sent', 'yes', 'run_delivered',
   'five_questions_recorded', 'second_invocation', 'declined', 'no_response',
 ]);
+const OFFER_TRANSITIONS = new Map([
+  ['identified', new Set(['offer_drafted'])],
+  ['offer_drafted', new Set(['offer_sent'])],
+  ['offer_sent', new Set(['yes', 'declined', 'no_response'])],
+  ['yes', new Set(['run_delivered', 'declined'])],
+  ['run_delivered', new Set(['five_questions_recorded'])],
+  ['five_questions_recorded', new Set(['second_invocation'])],
+]);
 const OFFER_TYPES = new Set(['self_authored_verify', 'foreign_pr_verify', 'issue_choice']);
 export const PUBLIC_LEDGER_URL = 'https://northset-oss.github.io/verification-pilot/ledger.json';
 
@@ -337,7 +345,7 @@ export async function buildOfferDossier({
     };
     dossiers.push(dossier);
     if (best) {
-      appendDemandRecordOnce(funnelPath, {
+      const identified = {
         ts: generatedAt,
         offer_id: `OF-${repo}-${best.number}`,
         repo,
@@ -346,7 +354,19 @@ export async function buildOfferDossier({
         stage: 'identified',
         maintainer_login: maintainer ?? '',
         note: best['why-it-hurts'],
-      }, (record) => `${record.offer_id}\0${record.stage}`);
+      };
+      appendDemandRecordOnce(
+        funnelPath, identified, (record) => `${record.offer_id}\0${record.stage}`,
+      );
+      const current = readDemandRecords(funnelPath)
+        .findLast((record) => record.offer_id === identified.offer_id);
+      if (current?.stage === 'identified') {
+        appendDemandRecordOnce(funnelPath, {
+          ...identified,
+          stage: 'offer_drafted',
+          note: 'Dossier draft generated for operator review.',
+        }, (record) => `${record.offer_id}\0${record.stage}`);
+      }
     }
   }
 
@@ -357,10 +377,12 @@ export async function buildOfferDossier({
 
 export function advanceOfferStage(filePath, {offer_id: offerId, stage, note = '', now = () => new Date()}) {
   if (!OFFER_STAGES.has(stage)) throw new TypeError(`unsupported offer stage ${JSON.stringify(stage)}`);
-  const records = fs.readFileSync(filePath, 'utf8').split('\n').filter(Boolean)
-    .map((line) => JSON.parse(line));
+  const records = readDemandRecords(filePath);
   const current = records.findLast((record) => record.offer_id === offerId);
   if (!current) throw new Error(`offer ${offerId} was not found`);
+  if (!OFFER_TRANSITIONS.get(current.stage)?.has(stage)) {
+    throw new Error(`invalid offer stage transition for ${offerId}: ${current.stage} -> ${stage}`);
+  }
   const next = {
     ts: timestamp(now),
     offer_id: current.offer_id,

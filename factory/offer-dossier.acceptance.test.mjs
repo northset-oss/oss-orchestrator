@@ -199,25 +199,30 @@ test('buildOfferDossier ranks verification pain and appends exact demand schemas
     });
 
     const funnelPath = path.join(demand, 'offer_funnel.jsonl');
-    const identified = JSON.parse((await readFile(funnelPath, 'utf8')).trim());
+    const initialFunnel = (await readFile(funnelPath, 'utf8')).trim().split('\n').map(JSON.parse);
+    const [identified, drafted] = initialFunnel;
     assert.deepEqual(Object.keys(identified), FUNNEL_KEYS);
     assert.equal(identified.offer_id, 'OF-warm/repo-10');
     assert.equal(identified.offer_type, 'foreign_pr_verify');
     assert.equal(identified.stage, 'identified');
     assert.equal(identified.maintainer_login, 'maintainer-one');
+    assert.deepEqual(Object.keys(drafted), FUNNEL_KEYS);
+    assert.equal(drafted.offer_id, identified.offer_id);
+    assert.equal(drafted.stage, 'offer_drafted');
 
     const advanced = advanceOfferStage(funnelPath, {
       offer_id: identified.offer_id,
-      stage: 'offer_drafted',
-      note: 'Draft prepared for operator review.',
+      stage: 'offer_sent',
+      note: 'Operator sent the reviewed draft.',
       now: () => new Date('2026-07-21T13:00:00.000Z'),
     });
     assert.deepEqual(Object.keys(advanced), FUNNEL_KEYS);
-    assert.equal(advanced.stage, 'offer_drafted');
+    assert.equal(advanced.stage, 'offer_sent');
     const funnelLines = (await readFile(funnelPath, 'utf8')).trim().split('\n').map(JSON.parse);
-    assert.equal(funnelLines.length, 2);
+    assert.equal(funnelLines.length, 3);
     assert.equal(funnelLines[0].stage, 'identified');
     assert.equal(funnelLines[1].stage, 'offer_drafted');
+    assert.equal(funnelLines[2].stage, 'offer_sent');
 
     await buildOfferDossier({
       db,
@@ -235,10 +240,49 @@ test('buildOfferDossier ranks verification pain and appends exact demand schemas
       }]}),
     });
     assert.equal((await readFile(path.join(demand, 'icp_log.jsonl'), 'utf8')).trim().split('\n').length, 1);
-    assert.equal((await readFile(funnelPath, 'utf8')).trim().split('\n').length, 2);
+    assert.equal((await readFile(funnelPath, 'utf8')).trim().split('\n').length, 3);
     const relationships = loadDossierRelationships(path.join(demand, 'offer_dossiers.json'));
     assert.equal(relationships.repositories.has('warm/repo'), true);
     assert.equal(relationships.owners.has('warm'), true);
+  } finally {
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('offer funnel rejects skipped, backward, and terminal-stage transitions', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'offer-funnel-'));
+  try {
+    const funnelPath = path.join(root, 'offer_funnel.jsonl');
+    const identified = identifyOffer(funnelPath, {
+      repo: 'warm/repo', pr_number: 10, offer_type: 'foreign_pr_verify',
+      maintainer_login: 'maintainer-one',
+      now: () => new Date('2026-07-21T12:00:00.000Z'),
+    });
+
+    assert.throws(
+      () => advanceOfferStage(funnelPath, {offer_id: identified.offer_id, stage: 'yes'}),
+      /identified -> yes/,
+    );
+    advanceOfferStage(funnelPath, {offer_id: identified.offer_id, stage: 'offer_drafted'});
+    assert.throws(
+      () => advanceOfferStage(funnelPath, {offer_id: identified.offer_id, stage: 'offer_drafted'}),
+      /offer_drafted -> offer_drafted/,
+    );
+    advanceOfferStage(funnelPath, {offer_id: identified.offer_id, stage: 'offer_sent'});
+    assert.throws(
+      () => advanceOfferStage(funnelPath, {offer_id: identified.offer_id, stage: 'offer_drafted'}),
+      /offer_sent -> offer_drafted/,
+    );
+    advanceOfferStage(funnelPath, {offer_id: identified.offer_id, stage: 'no_response'});
+    assert.throws(
+      () => advanceOfferStage(funnelPath, {offer_id: identified.offer_id, stage: 'yes'}),
+      /no_response -> yes/,
+    );
+
+    const records = (await readFile(funnelPath, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(records.map((record) => record.stage), [
+      'identified', 'offer_drafted', 'offer_sent', 'no_response',
+    ]);
   } finally {
     await rm(root, {recursive: true, force: true});
   }
