@@ -7,6 +7,69 @@ import test from 'node:test';
 
 import {FACTORY_SCHEMA_VERSION, openFactoryDb} from './db.mjs';
 
+test('public limits persist in policy state and cannot increase during the first twenty', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-public-limits-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const database = path.join(root, 'factory.sqlite');
+  const db = openFactoryDb(database);
+  const firstTwenty = {
+    repositoryOpen: 1,
+    ownerRolling7d: 2,
+    perHour: 1,
+    perDay: 3,
+  };
+  const postCohort = {
+    repositoryOpen: 1,
+    ownerRolling7d: 3,
+    perHour: 2,
+    perDay: 5,
+  };
+  assert.deepEqual(db.getPolicyState().public_limits, firstTwenty);
+  assert.throws(() => db.setPublicLimits({
+    limits: postCohort,
+    changedBy: 'internal-user:aeziz',
+    reason: 'premature increase',
+  }), /cannot increase before twenty/);
+
+  const resumedAt = new Date('2026-07-24T12:00:00.000Z');
+  db.resumePublication({
+    releasedBy: 'internal-user:aeziz',
+    reason: 'test cohort started',
+    now: resumedAt,
+  });
+  db.connection.exec('PRAGMA foreign_keys = OFF');
+  const insertPublication = db.connection.prepare(`INSERT INTO publications(
+    mission_id,submitted_at,publication_state,updated_at
+  ) VALUES(?,?,'SUBMITTED',?)`);
+  for (let index = 1; index <= 20; index += 1) {
+    const submittedAt = new Date(resumedAt.getTime() + index * 1_000).toISOString();
+    insertPublication.run(`M-${index}`, submittedAt, submittedAt);
+  }
+  db.connection.exec('PRAGMA foreign_keys = ON');
+  const changedAt = new Date('2026-07-25T12:00:00.000Z');
+  const changed = db.setPublicLimits({
+    limits: postCohort,
+    changedBy: 'internal-user:aeziz',
+    reason: 'first twenty reviewed',
+    now: changedAt,
+  });
+  assert.equal(changed.contribution_prs_since_resume, 20);
+  assert.deepEqual(changed.public_limits, postCohort);
+  assert.equal(changed.public_limits_changed_at, changedAt.toISOString());
+  assert.equal(changed.public_limits_changed_by, 'internal-user:aeziz');
+  assert.equal(changed.public_limits_change_reason, 'first twenty reviewed');
+  assert.throws(() => db.setPublicLimits({
+    limits: {...postCohort, repositoryOpen: 2},
+    changedBy: 'internal-user:aeziz',
+    reason: 'invalid repository cap',
+  }), /repositoryOpen must remain 1/);
+  db.close();
+
+  const reopened = openFactoryDb(database);
+  t.after(() => reopened.close());
+  assert.deepEqual(reopened.getPolicyState().public_limits, postCohort);
+});
+
 test('schema v1 publication checkpoints migrate additively and retain async recovery fields', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-migration-'));
   t.after(() => rm(root, {recursive: true, force: true}));

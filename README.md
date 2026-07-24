@@ -155,6 +155,23 @@ node factory/cli.mjs github-resume \
   --reason "<maintainer or founder decision>"
 ```
 
+`github-status` reports the public-action limits currently stored in policy state. The first twenty
+post-incident contributions stay at one open PR per repository, two PRs per owner per rolling seven
+days, one PR per hour, and three PRs per day. Those limits do not change automatically. After the
+first twenty have been reviewed, the owner can deliberately select the next profile:
+
+```sh
+node factory/cli.mjs publication-limits \
+  --repository-open 1 \
+  --owner-rolling-7d 3 \
+  --per-hour 2 \
+  --per-day 5 \
+  --reason "First twenty post-incident contributions reviewed."
+```
+
+The repository-open limit must remain one. An increase is rejected until twenty post-resume
+contributions have been recorded.
+
 ## Defaults and environment
 
 | Setting | Default | Override |

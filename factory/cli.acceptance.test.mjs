@@ -207,6 +207,22 @@ test('parser provides stable paths and strictly validates command-specific argum
   assert.equal(parseFactoryCliArgs([
     'github-resume', '--reason', 'reviewed', '--acknowledge-forbidden',
   ], {env: {}}).acknowledgeForbidden, true);
+  assert.deepEqual(parseFactoryCliArgs([
+    'publication-limits',
+    '--repository-open', '1',
+    '--owner-rolling-7d', '3',
+    '--per-hour', '2',
+    '--per-day', '5',
+    '--reason', 'first twenty reviewed',
+  ], {env: {}}).limits, {
+    repositoryOpen: 1,
+    ownerRolling7d: 3,
+    perHour: 2,
+    perDay: 5,
+  });
+  assert.throws(() => parseFactoryCliArgs([
+    'publication-limits', '--repository-open', '1',
+  ], {env: {}}), /--reason is required|positive integer/);
 });
 
 test('discover routes every search through the current GitHub safety queue and transport', async () => {
@@ -823,6 +839,11 @@ test('github-status is read-only and github-resume performs one injected probe p
     env: {},
     stdout: statusOutput.stream,
     dependencies: {
+      openDb: () => fakeDb({
+        getPolicyState: () => ({
+          public_limits: {repositoryOpen: 1, ownerRolling7d: 3, perHour: 2, perDay: 5},
+        }),
+      }),
       transport: async () => assert.fail('status must not call transport'),
       createSafety: (options) => {
         safetyOptions = options;
@@ -832,6 +853,8 @@ test('github-status is read-only and github-resume performs one injected probe p
   });
   assert.equal(statusResult, status);
   assert.equal(safetyOptions.pauseFile, FACTORY_DEFAULTS.pauseFile);
+  assert.deepEqual(safetyOptions.publicLimits,
+    {repositoryOpen: 1, ownerRolling7d: 3, perHour: 2, perDay: 5});
   assert.equal(JSON.parse(statusOutput.read()).paused, true);
 
   const resumeOutput = output();
@@ -889,6 +912,10 @@ test('publication status and owner resume use only persisted policy state', asyn
       calls.push(input);
       return {policy_version: 2, publication_paused: false};
     },
+    setPublicLimits: (input) => {
+      calls.push(input);
+      return {policy_version: 2, public_limits: input.limits};
+    },
     close() {},
   };
   const dependencies = {
@@ -912,6 +939,22 @@ test('publication status and owner resume use only persisted policy state', asyn
   assert.deepEqual(calls.at(-1), {
     releasedBy: 'internal-user:aeziz',
     reason: 'review complete',
+  });
+  const limits = await executeFactoryCli([
+    'publication-limits',
+    '--repository-open', '1',
+    '--owner-rolling-7d', '3',
+    '--per-hour', '2',
+    '--per-day', '5',
+    '--reason', 'first twenty reviewed',
+    '--changed-by', 'internal-user:aeziz',
+  ], {dependencies, stdout: {write() {}}});
+  assert.deepEqual(limits.public_limits,
+    {repositoryOpen: 1, ownerRolling7d: 3, perHour: 2, perDay: 5});
+  assert.deepEqual(calls.at(-1), {
+    limits: {repositoryOpen: 1, ownerRolling7d: 3, perHour: 2, perDay: 5},
+    changedBy: 'internal-user:aeziz',
+    reason: 'first twenty reviewed',
   });
 });
 

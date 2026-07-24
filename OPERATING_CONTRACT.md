@@ -111,6 +111,15 @@ The publisher, in order:
 8. reads the PR back and verifies title, body, base, and head OID;
 9. records `SUBMITTED` and leaves factual reconciliation asynchronous.
 
+Public-action limits come from persisted policy state and are injected into the single GitHub safety
+queue; the publisher does not carry a second copy. The first-twenty values remain in force until the
+owner deliberately records a replacement profile after reviewing that cohort.
+
+Public-surface remediation is complete only when an external no-cache fetch matches its
+source-bound deployment manifest. That requirement blocks public receipt publication, public
+correction claims, and claims that a public surface was removed. Pages availability does not block a
+private-record contribution PR.
+
 Public actions pass through one serialized safety queue. Mutations are spaced, public contribution
 caps are enforced, primary exhaustion waits for reset, and transient network/5xx failures receive one
 bounded retry. A secondary-limit pause requires its cooldown plus one explicit `github-resume` action
@@ -139,6 +148,9 @@ node factory/cli.mjs board
 node factory/cli.mjs approve --board sha256:<digest> --ids M-201,M-202
 node factory/cli.mjs publish --board sha256:<digest>
 node factory/cli.mjs reconcile --limit 30
+node factory/cli.mjs publication-status
+node factory/cli.mjs publication-resume --reason "<owner-reviewed incident clearance>"
+node factory/cli.mjs publication-limits --repository-open 1 --owner-rolling-7d 3 --per-hour 2 --per-day 5 --reason "<owner-reviewed cohort decision>"
 node factory/cli.mjs github-status
 node factory/cli.mjs github-resume --reason "<founder decision>"
 ```

@@ -2,19 +2,17 @@ import {mkdir, readFile, rename, rm, stat, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 
+import {
+  FIRST_TWENTY_PUBLIC_LIMITS,
+  normalizePublicLimits,
+} from './public-limits.mjs';
+
 const PRIORITIES = Object.freeze({
   maintainer_response: 1,
   final_submission: 2,
   reconciliation: 3,
   live_preflight: 4,
   discovery_top_up: 5,
-});
-
-const PUBLIC_LIMITS = Object.freeze({
-  repositoryOpen: 1,
-  ownerRolling7d: 2,
-  perHour: 1,
-  perDay: 3,
 });
 
 export class GitHubSafetyError extends Error {
@@ -365,6 +363,7 @@ export function createGitHubSafety({
   mutationSpacingMs = 1_250,
   searchSpacingMs = 2_000,
   repositoryState = null,
+  publicLimits = FIRST_TWENTY_PUBLIC_LIMITS,
   leaseStaleMs = 5 * 60_000,
   leaseHeartbeatMs = Math.min(30_000, Math.max(10, Math.floor(leaseStaleMs / 3))),
 } = {}) {
@@ -377,6 +376,7 @@ export function createGitHubSafety({
   if (![leaseStaleMs, leaseHeartbeatMs].every((value) => Number.isFinite(value) && value >= 10)) {
     throw new TypeError('GitHub lease timing values must be at least 10 milliseconds');
   }
+  const limits = normalizePublicLimits(publicLimits);
 
   const queue = [];
   const sessionPublications = [];
@@ -419,7 +419,7 @@ export function createGitHubSafety({
     const repositoryOpenOverride = typeof missionId === 'string' &&
       repositoryOpenOverrideMissionId === missionId;
     if (!repositoryOpenOverride &&
-        (repoOpen >= PUBLIC_LIMITS.repositoryOpen || sessionRepoOpen || durableRepoOpen)) {
+        (repoOpen >= limits.repositoryOpen || sessionRepoOpen || durableRepoOpen)) {
       throw new GitHubPublicLimitError(`one-open-PR cap reached for ${repository}`);
     }
     const ownerRolling7d = Math.max(
@@ -428,15 +428,15 @@ export function createGitHubSafety({
         item.owner.toLowerCase() === effectiveOwner.toLowerCase()).length,
       durable.filter((item) => item.owner.toLowerCase() === effectiveOwner.toLowerCase()).length,
     );
-    if (ownerRolling7d >= PUBLIC_LIMITS.ownerRolling7d) {
+    if (ownerRolling7d >= limits.ownerRolling7d) {
       throw new GitHubPublicLimitError(`owner/rolling-7-day cap reached for ${effectiveOwner}`);
     }
     const hourCount = Math.max(numberField(state, ['prs_last_hour', 'prsLastHour', 'new_prs_last_hour']),
       recent.length, durableRecent.length);
-    if (hourCount >= PUBLIC_LIMITS.perHour) throw new GitHubPublicLimitError('hourly PR cap reached');
+    if (hourCount >= limits.perHour) throw new GitHubPublicLimitError('hourly PR cap reached');
     const dayCount = Math.max(numberField(state, ['prs_today', 'prsToday', 'new_prs_today']),
       sessionToday.length, durableToday.length);
-    if (dayCount >= PUBLIC_LIMITS.perDay) throw new GitHubPublicLimitError('daily PR cap reached');
+    if (dayCount >= limits.perDay) throw new GitHubPublicLimitError('daily PR cap reached');
     return true;
   };
 
@@ -589,7 +589,7 @@ export function createGitHubSafety({
       queue_depth: queue.length,
       active,
       primary_wait_until: primaryWaitUntil === null ? null : new Date(primaryWaitUntil).toISOString(),
-      limits: {...PUBLIC_LIMITS},
+      limits: {...limits},
       governor,
     };
   };

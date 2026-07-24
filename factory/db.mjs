@@ -7,6 +7,11 @@ import {
   normalizeConsentScopes,
   promotionFreePrBody,
 } from './publication-policy.mjs';
+import {
+  FIRST_TWENTY_PUBLIC_LIMITS,
+  exceedsPublicLimits,
+  normalizePublicLimits,
+} from './public-limits.mjs';
 
 export const FACTORY_SCHEMA_VERSION = 8;
 export const TASK_STATES = Object.freeze([
@@ -582,6 +587,15 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
   connection.prepare(`INSERT INTO factory_meta(key,value) VALUES(?,?)
     ON CONFLICT(key) DO NOTHING`).run('publication_pause_reason',
     'Incident 901 publication hold; owner manual release required');
+  for (const [key, value] of Object.entries({
+    public_limit_repository_open: FIRST_TWENTY_PUBLIC_LIMITS.repositoryOpen,
+    public_limit_owner_rolling_7d: FIRST_TWENTY_PUBLIC_LIMITS.ownerRolling7d,
+    public_limit_per_hour: FIRST_TWENTY_PUBLIC_LIMITS.perHour,
+    public_limit_per_day: FIRST_TWENTY_PUBLIC_LIMITS.perDay,
+  })) {
+    connection.prepare(`INSERT INTO factory_meta(key,value) VALUES(?,?)
+      ON CONFLICT(key) DO NOTHING`).run(key, String(value));
+  }
   const seedBlock = connection.prepare(`INSERT INTO interaction_blocks(
     scope,subject,block_authoring,block_outreach,reason,reason_code,source_url,created_at,release_policy
   ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(scope,subject) DO NOTHING`);
@@ -1376,11 +1390,20 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
   function getPolicyState() {
     const rows = connection.prepare(`SELECT key,value FROM factory_meta
       WHERE key IN ('policy_version','publication_paused','publication_pause_reason',
-        'publication_resumed_at','publication_resumed_by','publication_resume_reason')`).all();
+        'publication_resumed_at','publication_resumed_by','publication_resume_reason',
+        'public_limit_repository_open','public_limit_owner_rolling_7d',
+        'public_limit_per_hour','public_limit_per_day',
+        'public_limits_changed_at','public_limits_changed_by','public_limits_change_reason')`).all();
     const values = Object.fromEntries(rows.map((row) => [row.key, row.value]));
     const resumedAt = values.publication_resumed_at ?? null;
     const contributionCount = resumedAt ? Number(connection.prepare(`SELECT count(*) AS count
       FROM publications WHERE submitted_at>=?`).get(resumedAt).count) : 0;
+    const publicLimits = normalizePublicLimits({
+      repositoryOpen: values.public_limit_repository_open,
+      ownerRolling7d: values.public_limit_owner_rolling_7d,
+      perHour: values.public_limit_per_hour,
+      perDay: values.public_limit_per_day,
+    });
     return {
       policy_version: Number(values.policy_version),
       publication_paused: values.publication_paused !== '0',
@@ -1389,7 +1412,38 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       publication_resumed_by: values.publication_resumed_by ?? null,
       publication_resume_reason: values.publication_resume_reason ?? null,
       contribution_prs_since_resume: contributionCount,
+      public_limits: {...publicLimits},
+      public_limits_changed_at: values.public_limits_changed_at ?? null,
+      public_limits_changed_by: values.public_limits_changed_by ?? null,
+      public_limits_change_reason: values.public_limits_change_reason ?? null,
     };
+  }
+
+  function setPublicLimits({limits, changedBy, reason, now = new Date()} = {}) {
+    if (!/^internal-user:[A-Za-z0-9_.-]+$/.test(String(changedBy ?? ''))) {
+      throw new Error('public limit change requires an internal owner identity');
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      throw new Error('public limit change requires a reason');
+    }
+    const normalized = normalizePublicLimits(limits);
+    const current = getPolicyState();
+    if (current.contribution_prs_since_resume < 20 &&
+        exceedsPublicLimits(normalized, FIRST_TWENTY_PUBLIC_LIMITS)) {
+      throw new Error('public limits cannot increase before twenty post-incident contributions');
+    }
+    return transaction(() => {
+      const set = connection.prepare(`INSERT INTO factory_meta(key,value) VALUES(?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
+      set.run('public_limit_repository_open', String(normalized.repositoryOpen));
+      set.run('public_limit_owner_rolling_7d', String(normalized.ownerRolling7d));
+      set.run('public_limit_per_hour', String(normalized.perHour));
+      set.run('public_limit_per_day', String(normalized.perDay));
+      set.run('public_limits_changed_at', iso(now));
+      set.run('public_limits_changed_by', changedBy);
+      set.run('public_limits_change_reason', reason.trim());
+      return getPolicyState();
+    });
   }
 
   function resumePublication({releasedBy, reason, now = new Date()} = {}) {
@@ -1576,6 +1630,7 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     getPublicActionState,
     setRepositoryState,
     getPolicyState,
+    setPublicLimits,
     resumePublication,
     recordInteractionBlock,
     listInteractionBlocks,

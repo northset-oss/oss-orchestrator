@@ -65,7 +65,11 @@ function ok(stdout = '') {
 test('N1 scout uses the bounded structured read-only contract', async (t) => {
   const {checkout, task} = await repository(t);
   task.issue_snapshot.labels = ['good first issue'];
-  task.issue_snapshot.comments = [{author: 'AysajanE', body: 'I would like to work on this.'}];
+  task.issue_snapshot.body = '<!-- ordinary template guidance -->Please add a regression and fix value().';
+  task.issue_snapshot.comments = [{
+    author: 'AysajanE',
+    body: '<!-- do not send this hidden text to the model --!>I would like to work on this.',
+  }];
   let invocation;
   const worker = createNodeWorker({image: IMAGE, codexRunner: async (options) => {
     invocation = options;
@@ -88,6 +92,7 @@ test('N1 scout uses the bounded structured read-only contract', async (t) => {
   assert.match(invocation.prompt, /future\s+pull-request number/);
   assert.match(invocation.prompt, /Existing issue comments/);
   assert.match(invocation.prompt, /I would like to work on this/);
+  assert.doesNotMatch(invocation.prompt, /ordinary template guidance|do not send this hidden text/);
   assert.match(invocation.prompt, /pre_work_rule/);
   assert.match(invocation.prompt, /current maintainer-authored issue already satisfies it/);
   assert.match(invocation.prompt, /required_checks/);

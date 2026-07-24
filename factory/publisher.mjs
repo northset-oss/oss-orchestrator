@@ -426,15 +426,6 @@ function openPrCapReached(repositoryState) {
   return Number.isFinite(open) && open >= 1;
 }
 
-function pilotCapReason(state) {
-  if (Number(value(state?.prs_last_hour, state?.prsLastHour, 0)) >= 1) return 'one-PR-per-hour cap reached';
-  if (Number(value(state?.prs_today, state?.prsToday, 0)) >= 3) return 'three-PR-per-day cap reached';
-  if (Number(value(state?.owner_prs_rolling_7d, state?.ownerPrsRolling7d, 0)) >= 2) {
-    return 'two-PR-per-owner rolling-seven-day cap reached';
-  }
-  return null;
-}
-
 function contributionOnlyReason(manifest) {
   if (classifyRisk(manifest) !== 'GREEN') return 'first-20 contribution lane accepts Green items only';
   const forbidden = new Set([
@@ -827,13 +818,6 @@ export async function publishBoard(boardDigest, {
     if (blocked) {
       results.push(await failItem(db, plan, 'PUBLICATION_REPOSITORY_BLOCKED', blocked));
       continue;
-    }
-    if (contributionOnlyPilot) {
-      const cap = pilotCapReason(repoState);
-      if (cap) {
-        results.push(await deferItem(db, plan, 'GITHUB_PUBLIC_LIMIT', cap));
-        continue;
-      }
     }
     const task = typeof db.getTask === 'function' ? await db.getTask(plan.task_id) : null;
     const invitation = task?.live_state?.candidate ?? {};

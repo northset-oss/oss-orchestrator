@@ -36,6 +36,7 @@ export const FACTORY_DEFAULTS = Object.freeze({
 const COMMANDS = new Set([
   'discover', 'run', 'board', 'approve', 'publish', 'reconcile',
   'github-status', 'github-resume', 'publication-status', 'publication-resume',
+  'publication-limits',
 ]);
 const COMMON_VALUE_FLAGS = new Set(['--db', '--pause-file', '--gh-bin']);
 const COMMAND_VALUE_FLAGS = Object.freeze({
@@ -51,6 +52,10 @@ const COMMAND_VALUE_FLAGS = Object.freeze({
   'github-resume': new Set(['--reason', '--cleared-by', '--repository']),
   'publication-status': new Set(),
   'publication-resume': new Set(['--reason', '--cleared-by']),
+  'publication-limits': new Set([
+    '--repository-open', '--owner-rolling-7d', '--per-hour', '--per-day',
+    '--reason', '--changed-by',
+  ]),
 });
 const COMMAND_BOOLEAN_FLAGS = Object.freeze({
   discover: new Set(),
@@ -63,6 +68,7 @@ const COMMAND_BOOLEAN_FLAGS = Object.freeze({
   'github-resume': new Set(['--acknowledge-forbidden']),
   'publication-status': new Set(),
   'publication-resume': new Set(),
+  'publication-limits': new Set(),
 });
 
 async function canonicalDatabasePath(database) {
@@ -161,7 +167,7 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
   const values = [...argv];
   const command = values.shift();
   if (!COMMANDS.has(command)) {
-    throw new Error('command must be discover, run, board, approve, publish, reconcile, publication-status, publication-resume, github-status, or github-resume');
+    throw new Error('command must be discover, run, board, approve, publish, reconcile, publication-status, publication-resume, publication-limits, github-status, or github-resume');
   }
   const allowedValues = new Set([...COMMON_VALUE_FLAGS, ...COMMAND_VALUE_FLAGS[command]]);
   const allowedBooleans = COMMAND_BOOLEAN_FLAGS[command];
@@ -292,6 +298,21 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
       clearedBy: parsed.get('--cleared-by') ?? env.OSS_FACTORY_APPROVED_BY ?? 'internal-user:aeziz',
     };
   }
+  if (command === 'publication-limits') {
+    const reason = parsed.get('--reason');
+    if (!reason?.trim()) throw new Error('--reason is required for publication-limits');
+    return {
+      ...common,
+      limits: {
+        repositoryOpen: positiveInteger(parsed.get('--repository-open'), '--repository-open', 100),
+        ownerRolling7d: positiveInteger(parsed.get('--owner-rolling-7d'), '--owner-rolling-7d', 100),
+        perHour: positiveInteger(parsed.get('--per-hour'), '--per-hour', 100),
+        perDay: positiveInteger(parsed.get('--per-day'), '--per-day', 100),
+      },
+      reason: reason.trim(),
+      changedBy: parsed.get('--changed-by') ?? env.OSS_FACTORY_APPROVED_BY ?? 'internal-user:aeziz',
+    };
+  }
   return common;
 }
 
@@ -374,15 +395,21 @@ export async function executeFactoryCli(argv, {
 } = {}) {
   const options = parseFactoryCliArgs(argv, {env});
   const deps = {...DEFAULT_DEPENDENCIES, ...dependencies};
-  if (options.command === 'publication-status' || options.command === 'publication-resume') {
+  if (['publication-status', 'publication-resume', 'publication-limits'].includes(options.command)) {
     const db = deps.openDb(options.database);
     try {
       const result = options.command === 'publication-status'
         ? await db.getPolicyState()
-        : await db.resumePublication({
+        : options.command === 'publication-resume'
+          ? await db.resumePublication({
           releasedBy: options.clearedBy,
           reason: options.reason,
-        });
+        })
+          : await db.setPublicLimits({
+            limits: options.limits,
+            changedBy: options.changedBy,
+            reason: options.reason,
+          });
       printJson(stdout, result);
       return result;
     } finally {
@@ -395,10 +422,20 @@ export async function executeFactoryCli(argv, {
     : transport(request);
 
   if (options.command === 'github-status') {
-    const safety = deps.createSafety({pauseFile: options.pauseFile, transport: safetyTransport});
-    const result = await safety.status();
-    printJson(stdout, result);
-    return result;
+    const db = deps.openDb(options.database);
+    try {
+      const policy = typeof db.getPolicyState === 'function' ? await db.getPolicyState() : null;
+      const safety = deps.createSafety({
+        pauseFile: options.pauseFile,
+        transport: safetyTransport,
+        ...(policy?.public_limits ? {publicLimits: policy.public_limits} : {}),
+      });
+      const result = await safety.status();
+      printJson(stdout, result);
+      return result;
+    } finally {
+      db.close?.();
+    }
   }
   if (options.command === 'github-resume') {
     if (options.repository !== null) {
@@ -441,10 +478,13 @@ export async function executeFactoryCli(argv, {
 
   const db = deps.openDb(options.database);
   try {
+    const policy = typeof db.getPolicyState === 'function' ? await db.getPolicyState() : null;
+    const publicLimitOptions = policy?.public_limits ? {publicLimits: policy.public_limits} : {};
     if (options.command === 'discover') {
       const safety = deps.createSafety({
         pauseFile: options.pauseFile,
         transport: safetyTransport,
+        ...publicLimitOptions,
         repositoryState: typeof db.getPublicActionState === 'function'
           ? db.getPublicActionState.bind(db) : db,
       });
@@ -473,6 +513,7 @@ export async function executeFactoryCli(argv, {
       const safety = deps.createSafety({
         pauseFile: options.pauseFile,
         transport: safetyTransport,
+        ...publicLimitOptions,
         repositoryState: typeof db.getPublicActionState === 'function'
           ? db.getPublicActionState.bind(db) : db,
       });
@@ -494,6 +535,7 @@ export async function executeFactoryCli(argv, {
       const safety = deps.createSafety({
         pauseFile: options.pauseFile,
         transport: safetyTransport,
+        ...publicLimitOptions,
         repositoryState: typeof db.getPublicActionState === 'function'
           ? db.getPublicActionState.bind(db) : db,
       });
@@ -676,6 +718,7 @@ export async function executeFactoryCli(argv, {
       const safety = deps.createSafety({
         pauseFile: options.pauseFile,
         transport: safetyTransport,
+        ...publicLimitOptions,
         repositoryState: typeof db.getPublicActionState === 'function'
           ? db.getPublicActionState.bind(db) : db,
       });

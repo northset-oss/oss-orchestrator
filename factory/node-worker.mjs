@@ -22,6 +22,7 @@ import {
   dependencyCacheKey,
   verifyContribution,
 } from './verifier.mjs';
+import {stripHtmlComments} from './source.mjs';
 import {removeWorkTree} from './worker.mjs';
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -388,12 +389,15 @@ async function defaultCodexRunner({
 
 function issueText(task) {
   const issue = task.issue_snapshot ?? {};
-  const comments = Array.isArray(issue.comments) ? issue.comments : [];
+  const comments = Array.isArray(issue.comments) ? issue.comments.map((comment) => ({
+    ...comment,
+    body: stripHtmlComments(comment?.body),
+  })) : [];
   return [
     `Repository: ${task.repository}`,
     `Issue: ${task.candidate ?? `${task.repository}#${task.issue_number}`}`,
-    `Title: ${issue.title ?? ''}`,
-    `Body:\n${issue.body ?? issue.bodyText ?? ''}`,
+    `Title: ${stripHtmlComments(issue.title)}`,
+    `Body:\n${stripHtmlComments(issue.body ?? issue.bodyText)}`,
     `Labels: ${JSON.stringify(issue.labels ?? [])}`,
     `Assignees: ${JSON.stringify(issue.assignees ?? [])}`,
     `Existing issue comments:\n${comments.length ? JSON.stringify(comments, null, 2) : '(none)'}`,

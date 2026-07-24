@@ -450,10 +450,24 @@ export function authoringBlockFor(repository, entries = [], users = []) {
   }) ?? null;
 }
 
+export function stripHtmlComments(value) {
+  return String(value ?? '').replace(/<!--[\s\S]*?(?:--!?>|$)/gu, '');
+}
+
+function hiddenCommentContainsInstruction(value) {
+  const hidden = [...String(value ?? '').matchAll(/<!--([\s\S]*?)(?:--!?>|$)/gu)]
+    .map((match) => match[1]);
+  if (!hidden.length) return false;
+  const directive = /\b(?:ignore (?:all |any )?(?:previous|prior|above) instructions?|respond with|reply with|output exactly|answer with|reveal|do not mention|don't mention|never mention|follow (?:these|the) instructions?|obey)\b/iu;
+  const modelReference = /\b(?:LLM|language model|ChatGPT|Claude|AI (?:assistant|agent)|assistant|prompt|system message)\b/iu;
+  return hidden.some((comment) => directive.test(comment) || modelReference.test(comment));
+}
+
 export function scanMessageCanaries(value) {
   const text = String(value ?? '');
   const flags = [];
-  if (/<!--[\s\S]*?-->/u.test(text)) flags.push('html_comment');
+  if (/<!--/u.test(text)) flags.push('html_comment_present');
+  if (hiddenCommentContainsInstruction(text)) flags.push('html_comment_instruction');
   if (/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(text)) {
     flags.push('bidirectional_control');
   }
@@ -483,6 +497,7 @@ export function evaluatePreflight(live, {
   if (!repository) reasons.push('repository is missing or inaccessible');
   if (!issue) reasons.push('issue is missing or inaccessible');
   if (issue && issue.state !== 'OPEN') reasons.push(`issue is ${String(issue.state).toLowerCase()}`);
+  if (issue?.locked) reasons.push('issue is locked');
   const externalAssignees = (issue?.assignees ?? [])
     .filter((login) => login.toLowerCase() !== northsetLogin.toLowerCase());
   if (externalAssignees.length) reasons.push(`issue is assigned to ${externalAssignees.join(', ')}`);
@@ -514,11 +529,14 @@ export function evaluatePreflight(live, {
     ...(repository?.policyMessageSources ?? []).flatMap((policy) => policy.flags),
   ])];
   if (messageFlags.length) {
+    live.messageFlags = messageFlags;
+  }
+  const blockingMessageFlags = messageFlags.filter((flag) => flag !== 'html_comment_present');
+  if (blockingMessageFlags.length) {
     const policyFiles = (repository?.policyMessageSources ?? []).map((policy) => policy.file);
-    reasons.push(`human review required: untrusted message marker (${messageFlags.join(', ')})${
+    reasons.push(`human review required: untrusted message marker (${blockingMessageFlags.join(', ')})${
       policyFiles.length ? ` in repository prose (${policyFiles.join(', ')})` : ''
     }`);
-    live.messageFlags = messageFlags;
   }
   if (repository && !/^[0-9a-f]{40}$/i.test(repository.defaultOid ?? '')) reasons.push('current default-branch OID is unavailable');
 
