@@ -2,8 +2,13 @@ import {createHash, randomUUID} from 'node:crypto';
 import {mkdirSync} from 'node:fs';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import {
+  assertPublicationManifest,
+  normalizeConsentScopes,
+  promotionFreePrBody,
+} from './publication-policy.mjs';
 
-export const FACTORY_SCHEMA_VERSION = 7;
+export const FACTORY_SCHEMA_VERSION = 8;
 export const TASK_STATES = Object.freeze([
   'DISCOVERED', 'QUEUED', 'WORKING', 'VERIFIED', 'READY', 'APPROVED',
   'PR_OPENED', 'RECEIPT_ATTESTED', 'SKIPPED', 'FAILED',
@@ -64,6 +69,9 @@ export function readyItemDigest(manifest) {
     base_failure_contains: manifest.base_failure_contains,
     proof: manifest.proof,
     receipt_claim: manifest.receipt_claim,
+    receipt_visibility: manifest.receipt_visibility,
+    consent_scopes: manifest.consent_scopes,
+    interaction_users: manifest.interaction_users,
     receipt_url: manifest.receipt_url,
     risk_tier: manifest.risk_tier,
     changed_files: manifest.changed_files,
@@ -205,6 +213,52 @@ function mapPublication(row) {
   };
 }
 
+function policyV2ReadyManifest(current, {now = new Date()} = {}) {
+  const missionId = current.mission_id;
+  const old = current.manifest;
+  const issueUrl = old.issue_url ??
+    `https://github.com/${old.repository}/issues/${old.issue_number}`;
+  const checks = (old.checks ?? []).map((check) =>
+    Array.isArray(check) ? check.join(' ') : String(check)).filter(Boolean);
+  if (!checks.length) throw new Error(`${missionId} has no exact checks for policy v2 refresh`);
+  const consentScopes = normalizeConsentScopes({
+    contribution_invitation: {
+      status: 'granted',
+      evidence: {kind: 'public_url', value: issueUrl},
+      granted_at: old.ready_at ?? current.ready_at,
+      granted_by: `repository:${old.repository}`,
+    },
+  }, {missionId});
+  const slug = String(old.pr_title ?? `issue-${old.issue_number}`).toLowerCase()
+    .replace(/[^a-z0-9]+/gu, '-').replace(/^-|-$/gu, '').slice(0, 48)
+    .replace(/-$/u, '');
+  const manifest = {
+    ...old,
+    mission_id: missionId,
+    task_id: current.task_id,
+    issue_url: issueUrl,
+    branch: `fix/${slug || `issue-${old.issue_number}`}`,
+    pr_body: promotionFreePrBody(old.pr_body, checks),
+    receipt_visibility: 'private_internal',
+    consent_scopes: consentScopes,
+    receipt_url: null,
+    planned_actions: (old.planned_actions ?? [])
+      .filter((action) => action !== 'publish-proof'),
+    ready_at: iso(now),
+  };
+  const {proof_sha256: _oldProofSha, ...oldProof} = old.proof ?? {};
+  const proof = {
+    ...oldProof,
+    schema_version: 3,
+    mission_id: missionId,
+    receipt_visibility: manifest.receipt_visibility,
+    consent_scopes: manifest.consent_scopes,
+  };
+  manifest.proof = {...proof, proof_sha256: sha256(Buffer.from(canonical(proof), 'utf8'))};
+  assertPublicationManifest(manifest);
+  return manifest;
+}
+
 const SCHEMA = `
 PRAGMA foreign_keys=ON;
 PRAGMA journal_mode=WAL;
@@ -334,12 +388,21 @@ CREATE TABLE IF NOT EXISTS repository_state(
   last_pr_at TEXT,
   updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS verification_prospects(
-  repository TEXT PRIMARY KEY COLLATE NOCASE,
-  owner_login TEXT NOT NULL COLLATE NOCASE,
+CREATE TABLE IF NOT EXISTS interaction_blocks(
+  scope TEXT NOT NULL CHECK(scope IN ('repository','owner','user')),
+  subject TEXT NOT NULL COLLATE NOCASE,
+  block_authoring INTEGER NOT NULL DEFAULT 0 CHECK(block_authoring IN (0,1)),
+  block_outreach INTEGER NOT NULL DEFAULT 0 CHECK(block_outreach IN (0,1)),
+  reason TEXT NOT NULL,
   reason_code TEXT NOT NULL,
-  mission_id TEXT NOT NULL,
-  observed_at TEXT NOT NULL
+  source_url TEXT,
+  mission_id TEXT,
+  created_at TEXT NOT NULL,
+  release_policy TEXT NOT NULL DEFAULT 'manual_only' CHECK(release_policy='manual_only'),
+  released_at TEXT,
+  released_by TEXT,
+  release_reason TEXT,
+  PRIMARY KEY(scope,subject)
 );
 `;
 
@@ -443,10 +506,9 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     connection.exec('BEGIN IMMEDIATE');
     try {
       if (!columns.has('reason')) connection.exec('ALTER TABLE attempts ADD COLUMN reason TEXT');
-      connection.prepare("UPDATE factory_meta SET value=? WHERE key='schema_version'")
-        .run(String(FACTORY_SCHEMA_VERSION));
+      connection.prepare("UPDATE factory_meta SET value='6' WHERE key='schema_version'").run();
       connection.exec('COMMIT');
-      version = FACTORY_SCHEMA_VERSION;
+      version = 6;
     } catch (error) {
       connection.exec('ROLLBACK');
       throw error;
@@ -456,7 +518,91 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     connection.prepare("UPDATE factory_meta SET value='7' WHERE key='schema_version'").run();
     version = 7;
   }
+  if (version === 7) {
+    connection.exec('BEGIN IMMEDIATE');
+    try {
+      const legacyExists = connection.prepare(
+        "SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name='verification_prospects'",
+      ).get();
+      if (legacyExists) {
+        connection.exec(`INSERT INTO interaction_blocks(
+          scope,subject,block_authoring,block_outreach,reason,reason_code,mission_id,created_at,release_policy
+        ) SELECT 'repository',repository,1,1,
+          'Migrated maintainer signal: ' || replace(reason_code,'_',' '),
+          reason_code,mission_id,observed_at,'manual_only'
+          FROM verification_prospects
+          WHERE 1
+          ON CONFLICT(scope,subject) DO NOTHING`);
+        connection.exec('DROP TABLE verification_prospects');
+      }
+      const migrationAt = new Date();
+      const activeRows = connection.prepare(`SELECT r.*
+        FROM ready_items r
+        JOIN tasks t ON t.task_id=r.task_id
+        LEFT JOIN publications p ON p.mission_id=r.mission_id
+        LEFT JOIN boards b ON b.board_id=r.board_id
+        WHERE r.approval_state='PENDING' AND t.state='READY'
+          AND r.manifest_json NOT LIKE '%"receipt_visibility"%'
+          AND coalesce(p.publication_state,'') NOT IN ('SUBMITTED','PR_OPENED')
+          AND (r.board_id IS NULL OR b.state='OPEN')
+        ORDER BY r.mission_id`).all().map(mapReady);
+      const openBoardIds = [...new Set(activeRows.map((row) => row.board_id).filter(Boolean))];
+      const updateReady = connection.prepare(`UPDATE ready_items SET manifest_sha256=?,item_digest=?,
+        manifest_json=?,ready_at=?,board_id=NULL,approval_state='PENDING' WHERE mission_id=?`);
+      const updateTask = connection.prepare(`UPDATE tasks SET state='READY',last_error=NULL,updated_at=?
+        WHERE task_id=? AND state='READY'`);
+      for (const current of activeRows) {
+        const manifest = policyV2ReadyManifest(current, {now: migrationAt});
+        updateReady.run(
+          sha256(Buffer.from(canonical(manifest), 'utf8')),
+          readyItemDigest(manifest),
+          json(manifest),
+          manifest.ready_at,
+          current.mission_id,
+        );
+        updateTask.run(manifest.ready_at, current.task_id);
+      }
+      const supersedeBoard = connection.prepare("UPDATE boards SET state='SUPERSEDED' WHERE board_id=? AND state='OPEN'");
+      for (const boardId of openBoardIds) supersedeBoard.run(boardId);
+      connection.prepare("UPDATE factory_meta SET value='8' WHERE key='schema_version'").run();
+      connection.exec('COMMIT');
+      version = 8;
+    } catch (error) {
+      connection.exec('ROLLBACK');
+      throw error;
+    }
+  }
   if (version !== FACTORY_SCHEMA_VERSION) throw new Error(`unsupported factory schema version ${version}`);
+
+  const seededAt = '2026-07-23T19:02:03.000Z';
+  connection.prepare(`INSERT INTO factory_meta(key,value) VALUES(?,?)
+    ON CONFLICT(key) DO NOTHING`).run('policy_version', '2');
+  connection.prepare(`INSERT INTO factory_meta(key,value) VALUES(?,?)
+    ON CONFLICT(key) DO NOTHING`).run('publication_paused', '1');
+  connection.prepare(`INSERT INTO factory_meta(key,value) VALUES(?,?)
+    ON CONFLICT(key) DO NOTHING`).run('publication_pause_reason',
+    'Incident 901 publication hold; owner manual release required');
+  const seedBlock = connection.prepare(`INSERT INTO interaction_blocks(
+    scope,subject,block_authoring,block_outreach,reason,reason_code,source_url,created_at,release_policy
+  ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(scope,subject) DO NOTHING`);
+  seedBlock.run('repository', 'nodejs/doc-kit', 1, 1,
+    'Maintainer requested that Northset stop authoring and outreach for this repository.',
+    'maintainer_stop', 'https://github.com/nodejs/doc-kit/pull/901#pullrequestreview-4767280794',
+    seededAt, 'manual_only');
+  seedBlock.run('owner', 'nodejs', 1, 1,
+    'Owner-wide precaution after the nodejs/doc-kit maintainer stop request.',
+    'owner_precaution', 'https://github.com/nodejs/doc-kit/pull/901#pullrequestreview-4767280794',
+    seededAt, 'manual_only');
+  seedBlock.run('user', 'avivkeller', 0, 1,
+    'Do not contact this maintainer without an explicit owner release.',
+    'maintainer_no_contact', 'https://github.com/nodejs/doc-kit/pull/901#pullrequestreview-4767280794',
+    seededAt, 'manual_only');
+  connection.prepare(`UPDATE interaction_blocks SET source_url=?,mission_id='M-014',
+    block_authoring=1,block_outreach=1,release_policy='manual_only'
+    WHERE scope='repository' AND lower(subject)='prometheus/client_js'
+      AND reason_code='ai_rejection'`).run(
+    'https://github.com/prometheus/client_js/pull/773#issuecomment-4953870322',
+  );
 
   function transaction(operation) {
     connection.exec('BEGIN IMMEDIATE');
@@ -1104,19 +1250,6 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
       ORDER BY updated_at,mission_id LIMIT ?`).all(...states, limit).map(mapPublication);
   }
 
-  function listWarmRepositories() {
-    return connection.prepare(`SELECT t.repository,
-      coalesce(max(rs.owner_login),substr(t.repository,1,instr(t.repository,'/')-1)) AS owner_login,
-      max(p.pr_number) AS relationship_pr_number,
-      min(p.mission_id) AS mission_id,max(rs.last_pr_at) AS last_pr_at
-      FROM publications p
-      JOIN tasks t ON t.task_id=p.task_id
-      LEFT JOIN repository_state rs ON lower(rs.repository)=lower(t.repository)
-      WHERE p.pr_state='MERGED' OR p.merged=1
-      GROUP BY lower(t.repository)
-      ORDER BY lower(t.repository)`).all();
-  }
-
   function listReconciliationCandidates({limit = 30} = {}) {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
       throw new Error('reconciliation limit must be an integer from 1 through 1000');
@@ -1195,23 +1328,27 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     if (!Number.isFinite(observed.getTime())) throw new Error('public action state timestamp is invalid');
     const today = observed.toISOString().slice(0, 10);
     const hourStart = new Date(observed.getTime() - 60 * 60_000).toISOString();
+    const sevenDaysAgo = new Date(observed.getTime() - 7 * 24 * 60 * 60_000).toISOString();
     const repositoryState = getRepositoryState(repository) ?? {};
     const counts = connection.prepare(`SELECT
       sum(CASE WHEN lower(substr(t.repository,1,instr(t.repository,'/')-1))=lower(?) AND
         substr(p.submitted_at,1,10)=? THEN 1 ELSE 0 END) AS owner_today,
+      sum(CASE WHEN lower(substr(t.repository,1,instr(t.repository,'/')-1))=lower(?) AND
+        p.submitted_at>=? THEN 1 ELSE 0 END) AS owner_rolling_7d,
       sum(CASE WHEN p.submitted_at>=? THEN 1 ELSE 0 END) AS last_hour,
       sum(CASE WHEN substr(p.submitted_at,1,10)=? THEN 1 ELSE 0 END) AS today
       FROM publications p
       JOIN ready_items r ON r.mission_id=p.mission_id
       JOIN tasks t ON t.task_id=r.task_id
       WHERE p.submitted_at IS NOT NULL`).get(
-      owner, today, hourStart, today,
+      owner, today, owner, sevenDaysAgo, hourStart, today,
     );
     return {
       ...repositoryState,
       repository,
       owner_login: owner,
       owner_prs_today: Number(counts.owner_today ?? 0),
+      owner_prs_rolling_7d: Number(counts.owner_rolling_7d ?? 0),
       prs_last_hour: Number(counts.last_hour ?? 0),
       prs_today: Number(counts.today ?? 0),
     };
@@ -1236,41 +1373,148 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     return getRepositoryState(repository);
   }
 
-  function priorMergeRelationships() {
-    const rows = connection.prepare(`SELECT DISTINCT lower(t.repository) AS repository,
-      lower(substr(t.repository,1,instr(t.repository,'/')-1)) AS owner
-      FROM publications p LEFT JOIN ready_items r ON r.mission_id=p.mission_id
-      JOIN tasks t ON t.task_id=coalesce(p.task_id,r.task_id)
-      WHERE p.merged=1 OR upper(coalesce(p.pr_state,''))='MERGED'`).all();
+  function getPolicyState() {
+    const rows = connection.prepare(`SELECT key,value FROM factory_meta
+      WHERE key IN ('policy_version','publication_paused','publication_pause_reason',
+        'publication_resumed_at','publication_resumed_by','publication_resume_reason')`).all();
+    const values = Object.fromEntries(rows.map((row) => [row.key, row.value]));
+    const resumedAt = values.publication_resumed_at ?? null;
+    const contributionCount = resumedAt ? Number(connection.prepare(`SELECT count(*) AS count
+      FROM publications WHERE submitted_at>=?`).get(resumedAt).count) : 0;
     return {
-      repositories: new Set(rows.map((row) => row.repository)),
-      owners: new Set(rows.map((row) => row.owner)),
+      policy_version: Number(values.policy_version),
+      publication_paused: values.publication_paused !== '0',
+      publication_pause_reason: values.publication_pause_reason ?? null,
+      publication_resumed_at: values.publication_resumed_at ?? null,
+      publication_resumed_by: values.publication_resumed_by ?? null,
+      publication_resume_reason: values.publication_resume_reason ?? null,
+      contribution_prs_since_resume: contributionCount,
     };
   }
 
-  function recordVerificationProspect({repository, owner, reasonCode, missionId, observedAt = new Date()} = {}) {
-    if (typeof repository !== 'string' || !repository.includes('/')) {
-      throw new Error('verification prospect requires repository owner/name');
+  function resumePublication({releasedBy, reason, now = new Date()} = {}) {
+    if (!/^internal-user:[A-Za-z0-9_.-]+$/.test(String(releasedBy ?? ''))) {
+      throw new Error('publication release requires an internal owner identity');
     }
-    const ownerLogin = owner ?? repository.split('/')[0];
-    if (!['ai_policy_concern', 'ai_rejection', 'not_wanted'].includes(reasonCode)) {
-      throw new Error('verification prospect requires an AI or not-wanted reason');
+    if (typeof reason !== 'string' || !reason.trim()) {
+      throw new Error('publication release requires a reason');
     }
-    if (typeof missionId !== 'string' || !missionId) throw new Error('verification prospect requires mission_id');
-    connection.prepare(`INSERT INTO verification_prospects(
-      repository,owner_login,reason_code,mission_id,observed_at
-    ) VALUES(?,?,?,?,?) ON CONFLICT(repository) DO UPDATE SET
-      owner_login=excluded.owner_login,reason_code=excluded.reason_code,
-      mission_id=excluded.mission_id,observed_at=excluded.observed_at`).run(
-      repository, ownerLogin, reasonCode, missionId, iso(observedAt),
-    );
-    return connection.prepare('SELECT * FROM verification_prospects WHERE repository=?').get(repository);
+    return transaction(() => {
+      const set = connection.prepare(`INSERT INTO factory_meta(key,value) VALUES(?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
+      set.run('publication_paused', '0');
+      set.run('publication_resumed_at', iso(now));
+      set.run('publication_resumed_by', releasedBy);
+      set.run('publication_resume_reason', reason.trim());
+      return getPolicyState();
+    });
   }
 
-  function listDoNotAuthor() {
-    return connection.prepare(`SELECT repository,owner_login,reason_code,mission_id,observed_at
-      FROM verification_prospects ORDER BY lower(owner_login),lower(repository)`).all()
-      .map((row) => ({...row}));
+  function recordInteractionBlock({
+    scope = 'repository',
+    subject,
+    blockAuthoring = true,
+    blockOutreach = true,
+    reason,
+    reasonCode,
+    sourceUrl = null,
+    missionId = null,
+    createdAt = new Date(),
+  } = {}) {
+    if (!['repository', 'owner', 'user'].includes(scope)) throw new Error('unsupported interaction block scope');
+    if (typeof subject !== 'string' || !subject.trim()) throw new Error('interaction block requires a subject');
+    if (typeof reason !== 'string' || !reason.trim()) throw new Error('interaction block requires a reason');
+    if (typeof reasonCode !== 'string' || !reasonCode.trim()) {
+      throw new Error('interaction block requires a reason code');
+    }
+    const normalized = subject.trim().toLowerCase();
+    connection.prepare(`INSERT INTO interaction_blocks(
+      scope,subject,block_authoring,block_outreach,reason,reason_code,source_url,mission_id,
+      created_at,release_policy,released_at,released_by,release_reason
+    ) VALUES(?,?,?,?,?,?,?,?,?,'manual_only',NULL,NULL,NULL)
+    ON CONFLICT(scope,subject) DO UPDATE SET
+      block_authoring=excluded.block_authoring,block_outreach=excluded.block_outreach,
+      reason=excluded.reason,reason_code=excluded.reason_code,source_url=excluded.source_url,
+      mission_id=excluded.mission_id,created_at=excluded.created_at,release_policy='manual_only',
+      released_at=NULL,released_by=NULL,release_reason=NULL`).run(
+      scope, normalized, blockAuthoring ? 1 : 0, blockOutreach ? 1 : 0, reason.trim(),
+      reasonCode.trim(), sourceUrl, missionId, iso(createdAt),
+    );
+    return connection.prepare('SELECT * FROM interaction_blocks WHERE scope=? AND subject=?')
+      .get(scope, normalized);
+  }
+
+  function listInteractionBlocks({action = null, activeOnly = true} = {}) {
+    if (action !== null && !['authoring', 'outreach'].includes(action)) {
+      throw new Error('interaction block action must be authoring or outreach');
+    }
+    const clauses = [];
+    if (activeOnly) clauses.push('released_at IS NULL');
+    if (action === 'authoring') clauses.push('block_authoring=1');
+    if (action === 'outreach') clauses.push('block_outreach=1');
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    return connection.prepare(`SELECT * FROM interaction_blocks ${where}
+      ORDER BY scope,lower(subject)`).all().map((row) => ({
+      ...row,
+      block_authoring: Boolean(row.block_authoring),
+      block_outreach: Boolean(row.block_outreach),
+    }));
+  }
+
+  function findInteractionBlocks({
+    repository = null,
+    user = null,
+    users = [],
+    action = 'authoring',
+  } = {}) {
+    if (!Array.isArray(users)) throw new Error('interaction block users must be an array');
+    const owner = repository?.split('/')[0]?.toLowerCase();
+    const userSubjects = new Set([user, ...users].filter(Boolean)
+      .map((value) => String(value).toLowerCase()));
+    return listInteractionBlocks({action}).filter((block) => {
+      const subject = block.subject.toLowerCase();
+      if (block.scope === 'repository') return subject === repository?.toLowerCase();
+      if (block.scope === 'owner') return subject === owner;
+      return block.scope === 'user' && userSubjects.has(subject);
+    });
+  }
+
+  function releaseInteractionBlock(scope, subject, {releasedBy, reason, now = new Date()} = {}) {
+    if (!/^internal-user:[A-Za-z0-9_.-]+$/.test(String(releasedBy ?? ''))) {
+      throw new Error('interaction block release requires an internal owner identity');
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      throw new Error('interaction block release requires a reason');
+    }
+    const result = connection.prepare(`UPDATE interaction_blocks SET released_at=?,released_by=?,
+      release_reason=? WHERE scope=? AND subject=? AND released_at IS NULL`).run(
+      iso(now), releasedBy, reason.trim(), scope, String(subject).toLowerCase(),
+    );
+    if (result.changes !== 1) throw new Error('active interaction block not found');
+    return connection.prepare('SELECT * FROM interaction_blocks WHERE scope=? AND subject=?')
+      .get(scope, String(subject).toLowerCase());
+  }
+
+  function refreshPolicyV2Ready(missionId, {now = new Date()} = {}) {
+    return transaction(() => {
+      const current = getReadyItem(missionId);
+      if (!current || current.approval_state !== 'POLICY_V2_REQUIRED' || current.board_id !== null) {
+        throw new Error('policy v2 refresh requires an invalidated unboarded READY item');
+      }
+      if (getPublication(missionId)?.publication_state === 'SUBMITTED') {
+        throw new Error('submitted publications use historical compatibility, not READY refresh');
+      }
+      const manifest = policyV2ReadyManifest(current, {now});
+      const manifestSha = sha256(Buffer.from(canonical(manifest), 'utf8'));
+      const itemDigest = readyItemDigest(manifest);
+      connection.prepare(`UPDATE ready_items SET manifest_sha256=?,item_digest=?,manifest_json=?,
+        ready_at=?,approval_state='PENDING' WHERE mission_id=?`).run(
+        manifestSha, itemDigest, json(manifest), manifest.ready_at, missionId,
+      );
+      connection.prepare(`UPDATE tasks SET state='READY',last_error=NULL,updated_at=?
+        WHERE task_id=?`).run(manifest.ready_at, current.task_id);
+      return getReadyItem(missionId);
+    });
   }
 
   function stats() {
@@ -1325,16 +1569,19 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
     savePublication,
     getPublication,
     listPublications,
-    listWarmRepositories,
     listReconciliationCandidates,
     recordPublicationObservation,
     updateTaskState,
     getRepositoryState,
     getPublicActionState,
     setRepositoryState,
-    priorMergeRelationships,
-    recordVerificationProspect,
-    listDoNotAuthor,
+    getPolicyState,
+    resumePublication,
+    recordInteractionBlock,
+    listInteractionBlocks,
+    findInteractionBlocks,
+    releaseInteractionBlock,
+    refreshPolicyV2Ready,
     candidateAttemptStats,
     stats,
   };

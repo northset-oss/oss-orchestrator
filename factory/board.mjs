@@ -1,5 +1,6 @@
 import {canonical, sha256} from './db.mjs';
 import {verifyReadyArtifacts} from './artifact-integrity.mjs';
+import {assertPublicationManifest} from './publication-policy.mjs';
 
 const RED_CLASSES = new Set([
   'dependency', 'lockfile', 'ci', 'security', 'migration', 'release',
@@ -42,6 +43,15 @@ function ageMs(readyAt, now) {
   return Math.max(0, now.getTime() - value);
 }
 
+function consentSummary(manifest, scopeName) {
+  const scope = manifest.consent_scopes?.scopes?.[scopeName] ?? {status: 'absent'};
+  const parts = [scope.status ?? 'absent'];
+  if (scope.evidence) parts.push(`${scope.evidence.kind}: ${scope.evidence.value}`);
+  if (scope.granted_at) parts.push(`granted_at: ${scope.granted_at}`);
+  if (scope.granted_by) parts.push(`granted_by: ${scope.granted_by}`);
+  return parts.map(inline).join(' | ');
+}
+
 export function createBoardIfDue(db, {
   minSize = 10,
   maxAgeMinutes = 30,
@@ -56,6 +66,7 @@ export function createBoardIfDue(db, {
   if (current) return current;
   const ready = db.listReady({unboarded: true, states: ['PENDING'], limit: maximum});
   if (!ready.length) return null;
+  for (const item of ready) assertPublicationManifest(item.manifest);
   const dueByAge = ageMs(ready[0].ready_at, now) >= maxAgeMinutes * 60_000;
   if (!force && ready.length < minSize && !dueByAge && ready.length < maximum) return null;
   const digest = boardDigest(ready);
@@ -184,7 +195,17 @@ export function renderBoard(board) {
       '',
       `Receipt claim: ${inline(manifest.receipt_claim?.statement ?? manifest.receipt_claim)}`,
       '',
-      `Receipt: ${manifest.receipt_url}`,
+      `receipt_visibility: ${manifest.receipt_visibility ?? 'private_internal'}`,
+      '',
+      `contribution_invitation: ${consentSummary(manifest, 'contribution_invitation')}`,
+      '',
+      `verification_execution_consent: ${consentSummary(manifest, 'verification_execution_consent')}`,
+      '',
+      `receipt_publication_consent: ${consentSummary(manifest, 'receipt_publication_consent')}`,
+      '',
+      `marketing_reference_consent: ${consentSummary(manifest, 'marketing_reference_consent')}`,
+      '',
+      `Receipt: ${manifest.receipt_url ?? 'private internal artifact'}`,
       '',
       `Issue: ${manifest.issue_url}`,
     );

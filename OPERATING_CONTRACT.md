@@ -7,6 +7,10 @@ is one content-bound approval over exact READY items before public GitHub public
 GitHub secondary-limit hold or a maintainer repository cooldown also requires an explicit operator
 reason.
 
+Policy version 2 adds a separate owner-cleared publication pause. Approval does not clear it. While
+the pause is active, local preparation and factual reconciliation of already-open PRs continue, but
+no new upstream PR, public receipt, offer, dossier, or outreach action may begin.
+
 The active production modules are only those under `factory/`. Files under `archive/` are historical
 records and must not be imported by the active runtime.
 
@@ -14,7 +18,9 @@ records and must not be imported by the active runtime.
 
 ```text
 DISCOVERED -> QUEUED -> WORKING -> VERIFIED -> READY
-                                      READY -> APPROVED -> PR_OPENED -> RECEIPT_ATTESTED
+                                      READY -> APPROVED -> PR_OPENED
+                                                               -> PRIVATE_RECORDED
+                                                               -> PUBLIC_RECEIPT_ATTESTED (explicit consent only)
 ```
 
 Terminal or side states are:
@@ -56,6 +62,14 @@ metric may block local work.
 7. A rate limit, abuse response, platform warning, or account restriction stops the GitHub queue
    immediately. It does not stop queued local preparation.
 8. Claim comments are not part of the normal path.
+9. Repository, owner, and user interaction blocks are manual-release controls checked before
+   authoring and again before publication. A cap override cannot bypass them.
+10. Contribution invitation, verification-execution consent, receipt-publication consent, and
+    marketing-reference consent are independent. Merge, approval, review, CI, silence, and prior
+    interaction do not grant any of them.
+11. Authored PRs are private-record by default and promotion-free. A public receipt requires explicit
+    receipt-publication consent; a named marketing or repository reference requires separate
+    marketing-reference consent.
 
 ## Attempts and risk
 
@@ -74,11 +88,11 @@ configured age, the maximum is reached, or the operator runs `board`. There is a
 at a time.
 
 The immutable board binds each mission's target, patch and manifest digests, commit/tree, checks,
-exact PR title/body, receipt claim, and planned public actions. The operator may approve a subset,
-reject a subset or reject the complete board. Unspecified items return to READY. A mutation or clean
-base refresh invalidates only the affected item and requires a new board approval. Approval and
-publication both reread the durable patch and repository to prove those review links still bind the
-stored base, commit, and tested tree.
+exact PR title/body, record visibility, four consent scopes, and planned public actions. The operator
+may approve a subset, reject a subset or reject the complete board. Unspecified items return to
+READY. A mutation or clean base refresh invalidates only the affected item and requires a new board
+approval. Approval and publication both reread the durable patch and repository to prove those
+review links still bind the stored base, commit, and tested tree.
 
 Approval itself performs no GitHub action. `publish --board <digest>` is the explicit authorization to
 execute only the approved public plan.
@@ -87,13 +101,15 @@ execute only the approved public plan.
 
 The publisher, in order:
 
-1. validates the immutable board and owner approval;
-2. performs a final live collision, claimant, opt-out, issue-state, and base-state check;
-3. publishes one immutable receipt batch bound to the approval digest;
-4. pushes the exact approved commit without force;
-5. creates or adopts the exact upstream PR;
-6. reads the PR back and verifies title, body, base, and head OID;
-7. records `SUBMITTED` and leaves attestation/status reconciliation asynchronous.
+1. requires the owner-cleared policy publication pause;
+2. validates the immutable board, owner approval, promotion-free body, visibility, and permissions;
+3. rechecks repository, owner, and user interaction blocks;
+4. performs a final live collision, claimant, issue-state, and base-state check;
+5. publishes immutable receipt bytes only for an explicitly consented public receipt;
+6. pushes the exact approved commit without force;
+7. creates or adopts the exact upstream PR;
+8. reads the PR back and verifies title, body, base, and head OID;
+9. records `SUBMITTED` and leaves factual reconciliation asynchronous.
 
 Public actions pass through one serialized safety queue. Mutations are spaced, public contribution
 caps are enforced, primary exhaustion waits for reset, and transient network/5xx failures receive one

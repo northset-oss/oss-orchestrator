@@ -112,7 +112,7 @@ test('V1 regression fix records base red and patched green', async (t) => {
   assert.match(result.verification_finished_at, /^\d{4}-\d{2}-\d{2}T/);
 });
 
-test('V1b proof v2 separates executed evidence from declared checks that were not run', async (t) => {
+test('V1b proof v3 separates executed evidence from declared checks that were not run', async (t) => {
   const fixture = await makeGitFixture(t);
   const verification = await verifyContribution(input(fixture, 'regression_fix'), {
     runContainer: fakeRunner(),
@@ -132,7 +132,7 @@ test('V1b proof v2 separates executed evidence from declared checks that were no
       receipt_claim: {type: 'regression_fix', statement: 'Focused regression evidence only.'},
     },
   });
-  assert.equal(proof.schema_version, 2);
+  assert.equal(proof.schema_version, 3);
   assert.equal(proof.executed_commands.length, 2);
   assert.deepEqual(proof.checks_not_run, [{
     check: 'npm test',

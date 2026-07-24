@@ -12,9 +12,9 @@ const PRIORITIES = Object.freeze({
 
 const PUBLIC_LIMITS = Object.freeze({
   repositoryOpen: 1,
-  ownerPerDay: 2,
-  perHour: 6,
-  perDay: 30,
+  ownerRolling7d: 2,
+  perHour: 1,
+  perDay: 3,
 });
 
 export class GitHubSafetyError extends Error {
@@ -407,7 +407,8 @@ export function createGitHubSafety({
     const today = new Date(nowMs).toISOString().slice(0, 10);
     const recent = sessionPublications.filter((item) => item.at > nowMs - 60 * 60 * 1_000);
     const sessionToday = sessionPublications.filter((item) => item.day === today);
-    const durable = (governor.publications ?? []).filter((item) => Number(item.at) > nowMs - 48 * 60 * 60_000);
+    const durable = (governor.publications ?? []).filter((item) =>
+      Number(item.at) > nowMs - 7 * 24 * 60 * 60_000);
     const durableRecent = durable.filter((item) => Number(item.at) > nowMs - 60 * 60_000);
     const durableToday = durable.filter((item) => item.day === today);
     const repoOpen = numberField(state, ['open_northset_prs', 'openNorthsetPrs']);
@@ -421,13 +422,14 @@ export function createGitHubSafety({
         (repoOpen >= PUBLIC_LIMITS.repositoryOpen || sessionRepoOpen || durableRepoOpen)) {
       throw new GitHubPublicLimitError(`one-open-PR cap reached for ${repository}`);
     }
-    const ownerToday = Math.max(
-      numberField(state, ['owner_prs_today', 'ownerPrsToday', 'owner_new_prs_today']),
-      sessionToday.filter((item) => item.owner.toLowerCase() === effectiveOwner.toLowerCase()).length,
-      durableToday.filter((item) => item.owner.toLowerCase() === effectiveOwner.toLowerCase()).length,
+    const ownerRolling7d = Math.max(
+      numberField(state, ['owner_prs_rolling_7d', 'ownerPrsRolling7d']),
+      sessionPublications.filter((item) => item.at > nowMs - 7 * 24 * 60 * 60_000 &&
+        item.owner.toLowerCase() === effectiveOwner.toLowerCase()).length,
+      durable.filter((item) => item.owner.toLowerCase() === effectiveOwner.toLowerCase()).length,
     );
-    if (ownerToday >= PUBLIC_LIMITS.ownerPerDay) {
-      throw new GitHubPublicLimitError(`owner/day cap reached for ${effectiveOwner}`);
+    if (ownerRolling7d >= PUBLIC_LIMITS.ownerRolling7d) {
+      throw new GitHubPublicLimitError(`owner/rolling-7-day cap reached for ${effectiveOwner}`);
     }
     const hourCount = Math.max(numberField(state, ['prs_last_hour', 'prsLastHour', 'new_prs_last_hour']),
       recent.length, durableRecent.length);

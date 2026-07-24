@@ -6,6 +6,11 @@ import {createBoardIfDue, classifyRisk} from './board.mjs';
 import {sha256} from './db.mjs';
 import {receiptUrlFor} from './receipt-publisher.mjs';
 import {buildProof} from './verifier.mjs';
+import {
+  assertPublicationManifest,
+  normalizeConsentScopes,
+  promotionFreePrBody,
+} from './publication-policy.mjs';
 
 const REMOVE_TREE_OPTIONS = Object.freeze({
   recursive: true,
@@ -72,101 +77,64 @@ async function oneInfrastructureRetry(operation) {
   }
 }
 
-function renderedVerificationCommand(command) {
-  const rendered = Array.isArray(command) ? command.join(' ') : String(command ?? '');
-  return rendered.length > 80 ? "the repository's declared test command" : `\`${rendered}\``;
+function exactCommand(command) {
+  return Array.isArray(command) ? command.join(' ') : String(command ?? '').trim();
 }
 
-function hasMechanicallyVerifiedNoCiFiles(changedFiles) {
-  if (!Array.isArray(changedFiles)) return false;
-  return changedFiles.every((file) => {
-    const filePath = typeof file === 'string' ? file : file?.path;
-    if (typeof filePath !== 'string' || !filePath) return false;
-    const normalized = filePath.replaceAll('\\', '/').replace(/^\.\//, '').toLowerCase();
-    const knownCiPath = normalized.startsWith('.github/workflows/') ||
-      normalized.startsWith('.github/actions/') ||
-      /^(?:\.circleci|\.buildkite|ci|workflows?)(?:\/|$)/.test(normalized) ||
-      /^(?:\.gitlab-ci\.ya?ml|\.travis\.ya?ml|azure-pipelines\.ya?ml|jenkinsfile)$/.test(normalized);
-    return file?.class !== 'ci' && !knownCiPath;
-  });
-}
-
-function receiptBlock(missionId, receiptUrl, {command, commitOid, changedFiles} = {}) {
-  const lines = [
-    `<!-- northset-receipt:${missionId}:start -->`,
-    '### Verification',
-    '',
-    `${renderedVerificationCommand(command)} exited 0 on this exact head (\`${String(commitOid).slice(0, 7)}\`) in a network-off container, before this PR was opened.`,
-  ];
-  if (hasMechanicallyVerifiedNoCiFiles(changedFiles)) {
-    lines.push('No workflow or CI files are modified in this change.');
-  }
-  lines.push(
-    `Commands, environment, and hashes: [receipt ${missionId}](${receiptUrl}) — checkable in ~30 seconds without trusting us.`,
-    'Self-run by the contributor, not maintainer verification.',
-    `<!-- northset-receipt:${missionId}:end -->`,
-  );
-  return lines.join('\n');
-}
-
-function receiptFooter(missionId, receiptUrl, verificationFacts) {
-  return [
-    '---',
-    receiptBlock(missionId, receiptUrl, verificationFacts),
-    '',
-    'AI-assisted and reviewed by Northset; I take responsibility for this submission.',
-  ].join('\n');
+export function descriptiveBranch(title, issueNumber) {
+  const slug = String(title ?? '').toLowerCase()
+    .replace(/[^a-z0-9]+/gu, '-').replace(/^-|-$/gu, '').slice(0, 48)
+    .replace(/-$/u, '');
+  return `fix/${slug || `issue-${issueNumber}`}`;
 }
 
 export function finalizePrBody(body, missionId, receiptUrl, {
-  replaceExisting = false,
-  ...verificationFacts
+  command,
+  checks = null,
 } = {}) {
-  let rendered = String(body ?? '')
-    .replaceAll('{{MISSION_ID}}', missionId)
-    .replaceAll('{{RECEIPT_URL}}', receiptUrl)
-    .trimEnd();
-  const startMarker = `<!-- northset-receipt:${missionId}:start -->`;
-  const endMarker = `<!-- northset-receipt:${missionId}:end -->`;
-  const start = rendered.indexOf(startMarker);
-  if (start === -1) {
-    rendered = `${rendered}\n\n${receiptFooter(missionId, receiptUrl, verificationFacts)}`.trim();
-  } else if (replaceExisting) {
-    const end = rendered.indexOf(endMarker, start);
-    if (end === -1) throw new Error(`receipt block for ${missionId} is missing its end marker`);
-    const separator = rendered.lastIndexOf('\n---\n', start);
-    if (separator !== -1 || rendered.startsWith('---\n')) {
-      const footerStart = separator === -1 ? 0 : separator;
-      rendered = `${rendered.slice(0, footerStart).trimEnd()}\n\n${
-        receiptFooter(missionId, receiptUrl, verificationFacts)}`.trim();
-    } else {
-      rendered = `${rendered.slice(0, start)}${receiptBlock(missionId, receiptUrl, verificationFacts)}${
-        rendered.slice(end + endMarker.length)}`.trimEnd();
-    }
-  }
-  return `${rendered}\n`;
+  const declared = checks ?? [exactCommand(command)].filter(Boolean);
+  return promotionFreePrBody(body, declared, {receiptUrl});
 }
 
 export function buildReadyManifest(task, authorResult, verification, missionId) {
-  const receiptUrl = receiptUrlFor(missionId, verification.commit_oid);
+  const issueUrl = authorResult.issue_url ??
+    `https://github.com/${task.repository}/issues/${task.issue_number}`;
+  const consentScopes = normalizeConsentScopes({
+    contribution_invitation: {
+      status: 'granted',
+      evidence: {kind: 'public_url', value: issueUrl},
+      granted_at: task.issue_snapshot?.updatedAt ?? task.live_state?.issue?.updatedAt ??
+        task.updated_at ?? task.created_at ?? verification.verification_started_at ??
+        verification.verification_finished_at,
+      granted_by: `repository:${task.repository}`,
+    },
+    ...authorResult.consent_scopes,
+  }, {missionId});
+  const receiptVisibility = authorResult.receipt_visibility === 'public_opt_in' &&
+    consentScopes.scopes.receipt_publication_consent.status === 'granted'
+    ? 'public_opt_in' : 'private_internal';
+  const receiptUrl = receiptVisibility === 'public_opt_in'
+    ? receiptUrlFor(missionId, verification.commit_oid) : null;
+  const verifiedCommand = exactCommand(
+    verification.patched_observation?.command ?? authorResult.test_command,
+  );
   const body = finalizePrBody(authorResult.pr_body, missionId, receiptUrl, {
-    command: verification.patched_observation?.command,
-    commitOid: verification.commit_oid,
-    changedFiles: verification.changed_files,
+    checks: [verifiedCommand].filter(Boolean),
   });
-  const verifiedCommand = verification.patched_observation?.command ?? authorResult.test_command;
   const manifest = {
+    mission_id: missionId,
+    task_id: task.task_id,
     repository: task.repository,
     fork_repository: authorResult.fork_repository ?? task.live_state?.fork_repository ?? null,
     repository_path: authorResult.repository_path ?? null,
     patch_path: authorResult.patch_path ?? null,
     verification_path: authorResult.verification_path ?? null,
     issue_number: task.issue_number,
-    issue_url: authorResult.issue_url ?? `https://github.com/${task.repository}/issues/${task.issue_number}`,
+    issue_url: issueUrl,
     invitation_summary: task.live_state?.invitation_summary ?? 'Live preflight confirmed an invited, unoccupied issue.',
     base_branch: authorResult.base_branch ?? task.live_state?.repository?.defaultBranch ??
       task.live_state?.default_branch ?? 'main',
-    branch: authorResult.branch ?? `northset/${missionId.toLowerCase()}`,
+    branch: authorResult.branch ?? descriptiveBranch(authorResult.pr_title, task.issue_number),
     base_oid: task.base_oid,
     patch_sha256: verification.patch_sha256,
     tested_tree_oid: verification.tested_tree_oid,
@@ -188,10 +156,18 @@ export function buildReadyManifest(task, authorResult, verification, missionId) 
       type: verification.claim_type,
       statement: authorResult.receipt_claim ?? verification.claim_type,
     },
+    receipt_visibility: receiptVisibility,
+    consent_scopes: consentScopes,
+    interaction_users: [...new Set((task.live_state?.interactionUsers ?? [])
+      .map((user) => String(user).toLowerCase()))],
     receipt_url: receiptUrl,
-    planned_actions: ['publish-proof', 'push-approved-commit', 'open-upstream-pr', 'verify-pr-readback'],
+    planned_actions: [
+      ...(receiptVisibility === 'public_opt_in' ? ['publish-proof'] : []),
+      'push-approved-commit', 'open-upstream-pr', 'verify-pr-readback',
+    ],
   };
   manifest.proof = buildProof({task, verification, manifest});
+  assertPublicationManifest(manifest);
   return manifest;
 }
 
@@ -353,7 +329,29 @@ async function processClaim(claim, {
   const {task, attempt} = claim;
   const began = now().getTime();
   let checkout = null;
+  const authoringBlockReason = async () => {
+    if (typeof db.findInteractionBlocks !== 'function') return null;
+    const blocks = await db.findInteractionBlocks({
+      repository: task.repository,
+      users: task.live_state?.interactionUsers ?? [],
+      action: 'authoring',
+    });
+    if (!blocks.length) return null;
+    return blocks.map((block) => block.reason).filter(Boolean).join('; ') ||
+      `Authoring is blocked for ${task.repository}`;
+  };
   try {
+    const initialBlockReason = await authoringBlockReason();
+    if (initialBlockReason) {
+      db.finishAttempt(attempt.attempt_id, {
+        outcome: 'SKIPPED',
+        failureClass: 'interaction_block',
+        durationMs: now().getTime() - began,
+        error: initialBlockReason,
+        now: now(),
+      });
+      return {task_id: task.task_id, state: 'SKIPPED', reason: initialBlockReason};
+    }
     checkout = await semaphores.clone.run(() => oneInfrastructureRetry(() => driver.checkout(task, attempt)));
     const scout = await semaphores.scout.run(() => oneInfrastructureRetry(() =>
       driver.scout(task, checkout, {effort: 'medium', timeoutMs: 90_000})));
@@ -380,14 +378,17 @@ async function processClaim(claim, {
     let lastError = null;
     for (let authorAttempt = 1; authorAttempt <= 2; authorAttempt += 1) {
       try {
-        const authored = await semaphores.author.run(() => oneInfrastructureRetry(() =>
-          driver.author(task, checkout, scout, {
+        const authored = await semaphores.author.run(() => oneInfrastructureRetry(async () => {
+          const lateBlockReason = await authoringBlockReason();
+          if (lateBlockReason) return {outcome: 'SKIP', reason: lateBlockReason};
+          return driver.author(task, checkout, scout, {
             attempt: authorAttempt,
             effort: authorAttempt === 1 ? 'high' : (driver.secondEffort ?? 'high'),
             timeoutMs: 10 * 60_000,
             verifierFeedback: feedback,
             dependencyMaterial,
-          })));
+          });
+        }));
         if (!authored || authored.outcome === 'SKIP') {
           db.finishAttempt(attempt.attempt_id, {
             outcome: 'SKIPPED', failureClass: 'authoring',

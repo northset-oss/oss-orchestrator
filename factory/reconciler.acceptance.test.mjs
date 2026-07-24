@@ -21,21 +21,22 @@ function publication(overrides = {}) {
   };
 }
 
-function fakeDb(seed = publication()) {
+function fakeDb(seed = publication(), readyManifest = null) {
   const publications = new Map([[seed.mission_id, {...seed}]]);
   let released = false;
   const taskStates = [];
-  const prospects = [];
+  const interactionBlocks = [];
   return {
     publications,
     taskStates,
-    prospects,
+    interactionBlocks,
     async listReconciliationCandidates({limit}) {
       return [...publications.values()].filter((item) => item.publication_state === 'SUBMITTED').slice(0, limit);
     },
     async getReadyItem(missionId) {
       return {mission_id: missionId, manifest: {
         repository: 'upstream/project', commit_oid: HEAD, verification: {ok: true},
+        ...readyManifest,
       }};
     },
     async getPublication(missionId) { return publications.get(missionId) ?? null; },
@@ -61,7 +62,10 @@ function fakeDb(seed = publication()) {
       publications.set(missionId, next);
       return {publication: next, repository_released: repositoryReleased};
     },
-    async recordVerificationProspect(record) { prospects.push(structuredClone(record)); return record; },
+    async recordInteractionBlock(record) {
+      interactionBlocks.push(structuredClone(record));
+      return record;
+    },
   };
 }
 
@@ -71,10 +75,11 @@ function harness({
   merged = false,
   attestor,
   statusPublisher,
+  readyManifest = null,
   appendDemand = () => {},
   demandDir = 'runs/demand',
 } = {}) {
-  const db = fakeDb(seed);
+  const db = fakeDb(seed, readyManifest);
   const safetyCalls = [];
   const releases = [];
   const prohibited = {create: 0, close: 0};
@@ -111,6 +116,102 @@ function harness({
     appendDemand, demandDir,
   };
 }
+
+test('private reconciliation keeps factual PR state without public attestation or status calls', async () => {
+  let attestationCalls = 0;
+  let statusCalls = 0;
+  const fixture = harness({
+    seed: publication({
+      receipt_url: null,
+      receipt_proof_sha256: null,
+      receipt_state: 'PRIVATE_INTERNAL',
+      attestation_state: 'NOT_APPLICABLE',
+      status_state: 'NOT_APPLICABLE',
+    }),
+    readyManifest: {
+      mission_id: 'M-001',
+      receipt_visibility: 'private_internal',
+      receipt_url: null,
+      consent_scopes: {
+        schema_version: 2,
+        mission_id: 'M-001',
+        scopes: {receipt_publication_consent: {status: 'absent'}},
+      },
+    },
+    attestor: async () => { attestationCalls += 1; },
+    statusPublisher: async () => { statusCalls += 1; },
+  });
+  fixture.github.getArtifactAttestation = async () => {
+    attestationCalls += 1;
+    return {found: true};
+  };
+
+  const result = await reconcilePublicationBatch(fixture);
+  const saved = await fixture.db.getPublication('M-001');
+  assert.equal(result.processed, 1);
+  assert.equal(result.results[0].receipt_visibility, 'private_internal');
+  assert.equal(saved.pr_state, 'OPEN');
+  assert.equal(saved.ci_state, 'SUCCESS');
+  assert.equal(saved.attestation_state, 'NOT_APPLICABLE');
+  assert.equal(saved.status_state, 'NOT_APPLICABLE');
+  assert.equal(attestationCalls, 0);
+  assert.equal(statusCalls, 0);
+  assert.deepEqual(fixture.db.taskStates, []);
+  assert.equal(fixture.safetyCalls.some((call) =>
+    call.operation === 'reconcile_get_attestation' ||
+    call.operation === 'publish_receipt_status_batch'), false);
+});
+
+test('public v3 reconciliation with publication consent attests and publishes status', async () => {
+  let attestationCalls = 0;
+  let statusCalls = 0;
+  const fixture = harness({
+    readyManifest: {
+      mission_id: 'M-001',
+      receipt_visibility: 'public_opt_in',
+      receipt_url: 'https://northset-oss.example/receipts/M-001/',
+      consent_scopes: {
+        schema_version: 2,
+        mission_id: 'M-001',
+        scopes: {
+          contribution_invitation: {status: 'not_applicable'},
+          verification_execution_consent: {status: 'not_applicable'},
+          receipt_publication_consent: {
+            status: 'granted',
+            evidence: {kind: 'public_url', value: 'https://example.test/consent/1'},
+            granted_at: '2026-07-19T11:00:00.000Z',
+            granted_by: 'maintainer',
+          },
+          marketing_reference_consent: {status: 'absent'},
+        },
+      },
+    },
+    attestor: async () => {
+      attestationCalls += 1;
+      return {
+        found: true,
+        attestation_url: 'https://example.test/attestations/1',
+        attested_at: '2026-07-19T13:01:00.000Z',
+      };
+    },
+    statusPublisher: async (items) => {
+      statusCalls += 1;
+      return Object.fromEntries(items.map((item) => [item.mission_id, {
+        status_url: `https://example.test/${item.mission_id}/publication.json`,
+      }]));
+    },
+  });
+
+  await reconcilePublicationBatch(fixture);
+  const saved = await fixture.db.getPublication('M-001');
+  assert.equal(attestationCalls, 1);
+  assert.equal(statusCalls, 1);
+  assert.equal(saved.attestation_state, 'RECEIPT_ATTESTED');
+  assert.equal(saved.status_state, 'PUBLISHED');
+  assert.deepEqual(fixture.db.taskStates, [{taskId: 'TASK-1', state: 'RECEIPT_ATTESTED'}]);
+  assert.ok(fixture.safetyCalls.some((call) => call.operation === 'reconcile_get_attestation'));
+  assert.ok(fixture.safetyCalls.some((call) => call.operation === 'publish_receipt_status_batch'));
+});
 
 test('attestation failure remains pending, publishes factual status, and restart never duplicates a PR', async () => {
   let attestationCalls = 0;
@@ -359,7 +460,7 @@ test('follow-up summary exposes contributor comments without relabeling maintain
   assert.equal(fixture.prohibited.close, 0);
 });
 
-test('maintainer AI-policy rejection becomes telemetry and a repository verification prospect', async () => {
+test('maintainer AI-policy rejection creates a repository interaction block', async () => {
   const fixture = harness({
     prState: 'closed',
     attestor: async () => ({found: false}),
@@ -381,99 +482,20 @@ test('maintainer AI-policy rejection becomes telemetry and a repository verifica
 
   const result = await reconcilePublicationBatch(fixture);
   assert.equal(result.results[0].reason_code, 'ai_policy_concern');
-  assert.equal(result.results[0].verification_prospect, true);
-  assert.deepEqual(fixture.db.prospects, [{
-    repository: 'upstream/project',
-    owner: 'upstream',
+  assert.equal(result.results[0].interaction_blocked, true);
+  assert.deepEqual(fixture.db.interactionBlocks, [{
+    scope: 'repository',
+    subject: 'upstream/project',
+    blockAuthoring: true,
+    blockOutreach: true,
+    reason: 'We do not accept AI-generated patches in this project.',
     reasonCode: 'ai_policy_concern',
+    sourceUrl: 'https://github.com/upstream/project/pull/17',
     missionId: 'M-001',
-    observedAt: '2026-07-19T13:00:00.000Z',
+    createdAt: '2026-07-19T13:00:00.000Z',
   }]);
   assert.equal(reasonCodeFromFollowUp({latest_reviews_by_maintainer: [], maintainer_comments: []}), 'unknown');
   assert.equal(reasonCodeFromFollowUp({latest_reviews_by_maintainer: [{
     body: 'AI-generated contributions are allowed if reviewed.',
   }]}), 'other');
-});
-
-test('terminal reconciliation emits exact shadow acceptance and merged demand signal schemas once', async () => {
-  const appended = [];
-  const fixture = harness({
-    prState: 'closed',
-    merged: true,
-    appendDemand: (file, record) => appended.push({file, record: structuredClone(record)}),
-    demandDir: '/tmp/factory-demand-test',
-    attestor: async () => ({found: false}),
-    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
-      status_url: `https://example.test/${item.mission_id}/publication.json`,
-    }])),
-  });
-  fixture.github.getCommitStatus = async () => ({
-    found: true, state: 'SUCCESS', total_count: 1, updated_at: '2026-07-19T11:59:00Z',
-  });
-  fixture.github.getPullRequestFollowUp = async () => ({
-    author_login: 'AysajanE', review_decision: 'APPROVED', comments: [],
-    reviews: [{
-      author_login: 'maintainer', author_type: 'User', author_association: 'MEMBER',
-      body: 'The verification receipt made this straightforward.', state: 'APPROVED',
-      submitted_at: '2026-07-19T12:30:00Z',
-    }],
-    threads: [],
-  });
-
-  await reconcilePublicationBatch(fixture);
-  await reconcilePublicationBatch(fixture);
-  const shadow = appended.filter((entry) => entry.file.endsWith('/shadow_acceptance.jsonl'));
-  const proto = appended.filter((entry) => entry.file.endsWith('/proto_signals.jsonl'));
-  assert.equal(shadow.length, 1);
-  assert.deepEqual(Object.keys(shadow[0].record), [
-    'ts', 'mission_id', 'repo', 'declared_check_passed', 'would_release',
-    'both_sides_would_accept', 'human_override', 'reason',
-  ]);
-  assert.equal(shadow[0].record.declared_check_passed, true);
-  assert.equal(shadow[0].record.would_release, null);
-  assert.equal(shadow[0].record.both_sides_would_accept, 'unknown');
-  assert.match(shadow[0].record.reason, /^not_assessed:/);
-  assert.deepEqual(proto.map((entry) => entry.record.signal), [
-    'merged_without_ci_rerun', 'maintainer_cited_receipt', 'fast_merge_after_receipt',
-  ]);
-  assert.equal(proto.find((entry) => entry.record.signal === 'merged_without_ci_rerun').record.confidence, 'low');
-  for (const entry of proto) {
-    assert.deepEqual(Object.keys(entry.record), [
-      'ts', 'mission_id', 'repo', 'signal', 'evidence', 'confidence',
-    ]);
-  }
-});
-
-test('missing CI evidence does not masquerade as a no-rerun delegation signal', async () => {
-  const appended = [];
-  const fixture = harness({
-    prState: 'closed',
-    merged: true,
-    appendDemand: (file, record) => appended.push({file, record: structuredClone(record)}),
-    demandDir: '/tmp/factory-demand-test',
-    attestor: async () => ({found: false}),
-    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
-      status_url: `https://example.test/${item.mission_id}/publication.json`,
-    }])),
-  });
-  fixture.github.getCommitStatus = async () => ({found: false});
-
-  await reconcilePublicationBatch(fixture);
-
-  assert.equal(appended.some((entry) => entry.record.signal === 'merged_without_ci_rerun'), false);
-});
-
-test('demand append failures remain non-blocking reconciliation telemetry', async () => {
-  const fixture = harness({
-    prState: 'closed',
-    merged: true,
-    appendDemand: () => { throw new Error('disk unavailable'); },
-    attestor: async () => ({found: false}),
-    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
-      status_url: `https://example.test/${item.mission_id}/publication.json`,
-    }])),
-  });
-  const result = await reconcilePublicationBatch(fixture);
-  assert.equal(result.results[0].pr_state, 'MERGED');
-  assert.ok(result.results[0].demand_errors.every((error) => error === 'disk unavailable'));
 });

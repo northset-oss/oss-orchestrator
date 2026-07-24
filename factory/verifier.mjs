@@ -415,7 +415,7 @@ export function buildProof({task, verification, approvalDigest = null, manifest}
     ...(Array.isArray(manifest.limitations) ? manifest.limitations : []),
   ];
   const proof = {
-    schema_version: 2,
+    schema_version: 3,
     task_id: task.task_id,
     candidate: task.candidate,
     repository: task.repository,
@@ -434,6 +434,8 @@ export function buildProof({task, verification, approvalDigest = null, manifest}
     base_observation: verification.base_observation,
     patched_observation: verification.patched_observation,
     claim: manifest.receipt_claim,
+    receipt_visibility: manifest.receipt_visibility,
+    consent_scopes: manifest.consent_scopes,
     batch_approval_digest: approvalDigest,
   };
   return {...proof, proof_sha256: sha256(Buffer.from(canonical(proof), 'utf8'))};

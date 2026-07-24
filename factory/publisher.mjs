@@ -1,6 +1,7 @@
-import {boardDigest as computeBoardDigest} from './board.mjs';
+import {boardDigest as computeBoardDigest, classifyRisk} from './board.mjs';
 import {batchApprovalDigest, canonical, readyItemDigest, sha256} from './db.mjs';
 import {verifyReadyArtifacts} from './artifact-integrity.mjs';
+import {assertPublicationManifest} from './publication-policy.mjs';
 
 const FINAL_SUBMISSION = 'final_submission';
 
@@ -158,7 +159,7 @@ function evidenceAssetFor(snapshot, id, forkRepository, prBranch, patchCommit) {
   };
 }
 
-function exactPlan(ready, immutable) {
+function exactPlan(ready, immutable, {allowLegacySubmitted = false} = {}) {
   const manifest = manifestFor(ready);
   const snapshot = manifestFor(immutable);
   const id = requiredString(value(missionId(ready), missionId(immutable)), 'mission_id');
@@ -184,7 +185,9 @@ function exactPlan(ready, immutable) {
   }
   const branch = requiredString(value(snapshot.branch, `northset/${id.toLowerCase()}`),
     `${id} branch`);
-  const receiptUrl = requiredString(snapshot.receipt_url, `${id} receipt_url`);
+  assertPublicationManifest(snapshot, {allowLegacySubmitted});
+  const receiptUrl = snapshot.receipt_url === null ? null :
+    requiredString(snapshot.receipt_url, `${id} receipt_url`);
   const taskId = requiredString(value(immutable.task_id, snapshot.task_id),
     `${id} task_id`);
   const evidenceAsset = evidenceAssetFor(snapshot, id, forkRepository, branch, commitOid);
@@ -203,6 +206,10 @@ function exactPlan(ready, immutable) {
     pr_body: body,
     receipt_claim: receiptClaim,
     receipt_url: receiptUrl,
+    receipt_visibility: snapshot.receipt_visibility ??
+      (allowLegacySubmitted ? 'legacy_submitted' : null),
+    interaction_users: Array.isArray(snapshot.interaction_users)
+      ? snapshot.interaction_users.map((user) => String(user).toLowerCase()) : [],
     branch,
     evidence_asset: evidenceAsset,
     manifest: snapshot,
@@ -419,6 +426,27 @@ function openPrCapReached(repositoryState) {
   return Number.isFinite(open) && open >= 1;
 }
 
+function pilotCapReason(state) {
+  if (Number(value(state?.prs_last_hour, state?.prsLastHour, 0)) >= 1) return 'one-PR-per-hour cap reached';
+  if (Number(value(state?.prs_today, state?.prsToday, 0)) >= 3) return 'three-PR-per-day cap reached';
+  if (Number(value(state?.owner_prs_rolling_7d, state?.ownerPrsRolling7d, 0)) >= 2) {
+    return 'two-PR-per-owner rolling-seven-day cap reached';
+  }
+  return null;
+}
+
+function contributionOnlyReason(manifest) {
+  if (classifyRisk(manifest) !== 'GREEN') return 'first-20 contribution lane accepts Green items only';
+  const forbidden = new Set([
+    'dependency', 'lockfile', 'ci', 'security', 'migration', 'public_api',
+    'broad_design', 'architecture', 'generated', 'generated_output',
+  ]);
+  const found = (manifest.changed_files ?? []).map((file) =>
+    typeof file === 'string' ? 'production' : String(file.class ?? 'production').toLowerCase())
+    .find((item) => forbidden.has(item));
+  return found ? `first-20 contribution lane excludes ${found} changes` : null;
+}
+
 function receiptFor(result, id) {
   if (!result) return null;
   if (Array.isArray(result)) return result.find((item) => missionId(item) === id) ?? null;
@@ -585,6 +613,7 @@ async function publishOne(plan, {
   const stored = prFields(readback);
   const closed = String(stored.state ?? '').toUpperCase() === 'CLOSED';
   const observedAt = timestamp(now);
+  const privateReceipt = plan.receipt_visibility === 'private_internal';
   const alreadyCounted = wasSubmitted &&
     Number(priorPublication.pr_number) === stored.number && priorPublication.pr_url === stored.url;
   await checkpoint(db, plan.mission_id, {
@@ -596,15 +625,32 @@ async function publishOne(plan, {
     merged: stored.merged === true,
     outcome_recorded_at: closed ? observedAt : null,
     publication_state: 'SUBMITTED',
-    attestation_state: alreadyCounted
-      ? priorPublication.attestation_state : 'ATTESTATION_PENDING',
-    status_state: alreadyCounted ? priorPublication.status_state : 'PENDING',
+    ...(privateReceipt ? {
+      receipt_url: null,
+      receipt_state: 'PRIVATE_INTERNAL',
+      receipt_proof_sha256: null,
+      receipt_batch_commit_oid: null,
+      receipt_approval_digest: null,
+      proof_published: false,
+      attestation_state: 'NOT_APPLICABLE',
+      attestation_url: null,
+      attested_at: null,
+      attestation_error: null,
+      status_state: 'NOT_APPLICABLE',
+      status_url: null,
+      status_error: null,
+    } : {
+      receipt_url: plan.receipt_url,
+      attestation_state: alreadyCounted
+        ? priorPublication.attestation_state : 'ATTESTATION_PENDING',
+      status_state: alreadyCounted ? priorPublication.status_state : 'PENDING',
+    }),
     submitted_at: alreadyCounted ? priorPublication.submitted_at : observedAt,
     last_error: null,
     last_error_detail: null,
   }, `${plan.mission_id} submission`);
   await db.updateTaskState(plan.task_id,
-    alreadyCounted && priorPublication.attestation_state === 'RECEIPT_ATTESTED'
+    !privateReceipt && alreadyCounted && priorPublication.attestation_state === 'RECEIPT_ATTESTED'
       ? 'RECEIPT_ATTESTED' : 'PR_OPENED');
   if (!closed && !alreadyCounted && typeof db.setRepositoryState === 'function') {
     const latest = await db.getRepositoryState(plan.repository) ?? {};
@@ -633,6 +679,17 @@ export async function publishBoard(boardDigest, {
   repositoryOpenOverrideMissionId = null,
 } = {}) {
   if (!db) throw new TypeError('db is required');
+  if (typeof db.getPolicyState !== 'function') {
+    throw new Error('publication policy state is unavailable');
+  }
+  const policy = await db.getPolicyState();
+  if (policy?.policy_version !== 2 || policy.publication_paused !== false) {
+    const error = new Error(policy?.publication_pause_reason ??
+      'publication is paused pending owner manual release');
+    error.code = 'PUBLICATION_POLICY_PAUSED';
+    throw error;
+  }
+  const contributionOnlyPilot = Number(policy.contribution_prs_since_resume ?? 0) < 20;
   if (!github) throw new TypeError('github is required');
   if (!safety || typeof safety.request !== 'function') throw new TypeError('GitHub safety queue is required');
   if (typeof liveRecheck !== 'function') throw new TypeError('liveRecheck is required');
@@ -657,6 +714,9 @@ export async function publishBoard(boardDigest, {
       (!/^M-(?!0+$)[0-9]+$/.test(repositoryOpenOverrideMissionId) ||
        !approved.includes(repositoryOpenOverrideMissionId))) {
     throw new Error('repository-open override mission must be approved by the immutable board');
+  }
+  if (contributionOnlyPilot && repositoryOpenOverrideMissionId !== null) {
+    throw new Error('repository-open override is disabled during the first-20 contribution lane');
   }
   if (!approved.length) return {board_digest: boardDigest, results: []};
   const immutableById = new Map(boardItems(board).map((item) => [missionId(item), item]));
@@ -710,7 +770,7 @@ export async function publishBoard(boardDigest, {
       continue;
     }
     let plan;
-    try { plan = exactPlan(ready, immutable); }
+    try { plan = exactPlan(ready, immutable, {allowLegacySubmitted: submittedPr(priorPublication)}); }
     catch (error) {
       results.push({mission_id: id, state: 'FAILED', code: 'APPROVED_ITEM_INVALID', detail: error.message});
       continue;
@@ -741,11 +801,39 @@ export async function publishBoard(boardDigest, {
       results.push(await failItem(db, plan, 'ARTIFACT_INTEGRITY_FAILED', error.message));
       continue;
     }
-    const repoState = await db.getRepositoryState(plan.repository);
+    const interactionBlocks = typeof db.findInteractionBlocks === 'function'
+      ? await db.findInteractionBlocks({
+        repository: plan.repository,
+        users: plan.interaction_users,
+        action: 'authoring',
+      }) : [];
+    if (interactionBlocks.length) {
+      const detail = interactionBlocks
+        .map((block) => `${block.scope}:${block.subject} — ${block.reason}`).join('; ');
+      results.push(await failItem(db, plan, 'INTERACTION_BLOCKED', detail));
+      continue;
+    }
+    if (contributionOnlyPilot) {
+      const reason = contributionOnlyReason(plan.manifest);
+      if (reason) {
+        results.push(await failItem(db, plan, 'CONTRIBUTION_ONLY_POLICY', reason));
+        continue;
+      }
+    }
+    const repoState = typeof db.getPublicActionState === 'function'
+      ? await db.getPublicActionState({repository: plan.repository, now: now()})
+      : await db.getRepositoryState(plan.repository);
     const blocked = cooldownReason(repoState, now);
     if (blocked) {
       results.push(await failItem(db, plan, 'PUBLICATION_REPOSITORY_BLOCKED', blocked));
       continue;
+    }
+    if (contributionOnlyPilot) {
+      const cap = pilotCapReason(repoState);
+      if (cap) {
+        results.push(await deferItem(db, plan, 'GITHUB_PUBLIC_LIMIT', cap));
+        continue;
+      }
     }
     const task = typeof db.getTask === 'function' ? await db.getTask(plan.task_id) : null;
     const invitation = task?.live_state?.candidate ?? {};
@@ -801,10 +889,11 @@ export async function publishBoard(boardDigest, {
     }
   }
 
-  if (clean.length) {
+  const publicReceipts = clean.filter(({plan}) => plan.receipt_visibility === 'public_opt_in');
+  if (publicReceipts.length) {
     const receipts = await throughSafety(safety, 'git_push', 'publish_receipt_batch', {},
-      () => receiptPublisher(clean.map(({plan}) => ({...plan}))));
-    for (const {plan} of clean) {
+      () => receiptPublisher(publicReceipts.map(({plan}) => ({...plan}))));
+    for (const {plan} of publicReceipts) {
       const receipt = receiptFor(receipts, plan.mission_id);
       if (!receipt) throw new Error(`receipt publisher omitted ${plan.mission_id}`);
       const receiptUrl = requiredString(value(receipt.receipt_url, receipt.url),
@@ -903,63 +992,4 @@ export async function publishBoard(boardDigest, {
     }
   }
   return {board_digest: boardDigest, results};
-}
-
-export async function reconcileReceipt(missionIdValue, {
-  db,
-  attestor,
-  statusPublisher,
-  now = () => new Date(),
-} = {}) {
-  if (!db) throw new TypeError('db is required');
-  if (typeof attestor !== 'function') throw new TypeError('attestor is required');
-  if (typeof statusPublisher !== 'function') throw new TypeError('statusPublisher is required');
-  const publication = await db.getPublication(missionIdValue);
-  if (!publication || !['SUBMITTED', 'PR_OPENED'].includes(value(publication.publication_state, publication.state))) {
-    throw new Error(`${missionIdValue} is not in a recoverable submitted state`);
-  }
-  let current = publication;
-  const ready = typeof db.getReadyItem === 'function' ? await db.getReadyItem(missionIdValue) : null;
-  const taskId = value(publication.task_id, ready?.task_id, ready?.manifest?.task_id);
-  if (publication.attestation_state !== 'RECEIPT_ATTESTED') {
-    try {
-      const attestation = await attestor(publication);
-      current = await db.savePublication(missionIdValue, {
-        attestation_state: 'RECEIPT_ATTESTED',
-        attestation_url: value(attestation?.attestation_url, attestation?.url),
-        attested_at: value(attestation?.attested_at, timestamp(now)),
-        attestation_error: null,
-        publication_state: 'SUBMITTED',
-        last_error: null,
-      });
-      if (taskId) await db.updateTaskState(taskId, 'RECEIPT_ATTESTED');
-    } catch (error) {
-      current = await db.savePublication(missionIdValue, {
-        publication_state: 'SUBMITTED',
-        attestation_state: 'ATTESTATION_PENDING',
-        attestation_error: error.message,
-        last_error: `ATTESTATION_PENDING: ${error.message}`,
-      });
-    }
-  }
-  try {
-    const status = await statusPublisher(current);
-    current = await db.savePublication(missionIdValue, {
-      publication_state: 'SUBMITTED',
-      status_state: 'PUBLISHED',
-      status_url: value(status?.status_url, status?.url),
-      status_error: null,
-      last_error: current.attestation_state === 'ATTESTATION_PENDING' ? current.last_error : null,
-    });
-  } catch (error) {
-    current = await db.savePublication(missionIdValue, {
-      publication_state: 'SUBMITTED',
-      status_state: 'PENDING',
-      status_error: error.message,
-      last_error: `STATUS_PENDING: ${error.message}`,
-    });
-    return {mission_id: missionIdValue, state: 'SUBMITTED', status_state: 'PENDING'};
-  }
-  return {mission_id: missionIdValue, state: 'SUBMITTED', attestation_state: current.attestation_state,
-    status_state: current.status_state};
 }

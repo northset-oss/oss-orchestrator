@@ -211,8 +211,13 @@ test('parser provides stable paths and strictly validates command-specific argum
 
 test('discover routes every search through the current GitHub safety queue and transport', async () => {
   const calls = [];
+  const interactionBlocks = [{scope: 'repository', subject: 'blocked/repo', block_authoring: true}];
   const db = fakeDb({
     listTasks: async () => [{candidate: 'known/repo#7'}],
+    listInteractionBlocks: async (options) => {
+      assert.deepEqual(options, {action: 'authoring'});
+      return interactionBlocks;
+    },
   });
   const transport = async () => assert.fail('discover must use the GraphQL transport surface');
   transport.graphql = async (request) => {
@@ -232,6 +237,7 @@ test('discover routes every search through the current GitHub safety queue and t
       discoverCandidates: async (options) => {
         assert.equal(options.target, 32);
         assert.deepEqual(options.knownCandidates, ['known/repo#7']);
+        assert.deepEqual(options.interactionBlocks, interactionBlocks);
         for (const [index, name] of [
           'good_first_issue:global', 'good_first_issue:JavaScript', 'good_first_issue:TypeScript',
           'help_wanted:global', 'help_wanted:JavaScript', 'help_wanted:TypeScript',
@@ -870,6 +876,43 @@ test('github-status is read-only and github-resume performs one injected probe p
   assert.equal(repositoryResult.cooldown_cleared, true);
   assert.equal(repositoryResult.repository_state.cooldown_reason, null);
   assert.equal(repositoryDb.closed, true);
+});
+
+test('publication status and owner resume use only persisted policy state', async () => {
+  const calls = [];
+  const fakeDb = {
+    getPolicyState: () => ({policy_version: 2, publication_paused: true}),
+    resumePublication: (input) => {
+      if (!String(input.releasedBy).startsWith('internal-user:')) {
+        throw new Error('publication release requires an internal owner identity');
+      }
+      calls.push(input);
+      return {policy_version: 2, publication_paused: false};
+    },
+    close() {},
+  };
+  const dependencies = {
+    openDb: () => fakeDb,
+    createTransport: () => { throw new Error('publication policy commands must not construct GitHub transport'); },
+  };
+  const status = await executeFactoryCli(['publication-status'], {
+    dependencies, stdout: {write() {}},
+  });
+  assert.equal(status.publication_paused, true);
+  await assert.rejects(
+    executeFactoryCli(['publication-resume', '--reason', 'review complete', '--cleared-by', 'worker'], {
+      dependencies, stdout: {write() {}},
+    }),
+    /internal owner identity/,
+  );
+  const resumed = await executeFactoryCli([
+    'publication-resume', '--reason', 'review complete', '--cleared-by', 'internal-user:aeziz',
+  ], {dependencies, stdout: {write() {}}});
+  assert.equal(resumed.publication_paused, false);
+  assert.deepEqual(calls.at(-1), {
+    releasedBy: 'internal-user:aeziz',
+    reason: 'review complete',
+  });
 });
 
 test('environment paths and command adapters are resolved without shell parsing', () => {

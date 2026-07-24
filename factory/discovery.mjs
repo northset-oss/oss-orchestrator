@@ -144,6 +144,19 @@ function reasonCounts(records) {
   return counts;
 }
 
+function activeAuthoringBlocks(blocks) {
+  const repositories = new Set();
+  const owners = new Set();
+  for (const block of blocks) {
+    if (block?.released_at || block?.block_authoring === false || block?.block_authoring === 0) continue;
+    const subject = String(block?.subject ?? '').trim().toLowerCase();
+    if (!subject) continue;
+    if (block.scope === 'repository') repositories.add(subject);
+    if (block.scope === 'owner') owners.add(subject);
+  }
+  return {repositories, owners};
+}
+
 function assertLakeSchema(connection) {
   const tables = new Set(connection.prepare(
     "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('repositories','issues')",
@@ -242,13 +255,16 @@ export async function discoverCandidates({
   lakePath = 'candidate_lake.sqlite',
   target = DEFAULT_TARGET,
   knownCandidates = [],
+  interactionBlocks = [],
   search,
   now = new Date(),
 } = {}) {
   target = targetValue(target);
   validDate(now, 'now');
   if (typeof search !== 'function') throw new TypeError('search callback is required');
+  if (!Array.isArray(interactionBlocks)) throw new TypeError('interactionBlocks must be an array');
   const known = new Set(knownCandidates.map((value) => String(value).toLowerCase()));
+  const authoringBlocks = activeAuthoringBlocks(interactionBlocks);
   const cutoffMs = now.getTime() - DISCOVERY_WINDOW_DAYS * DAY_MS;
   const unique = new Map();
   const duplicates = new Map();
@@ -293,7 +309,15 @@ export async function discoverCandidates({
     left.candidate.localeCompare(right.candidate));
   const available = [];
   for (const record of ranked) {
-    if (known.has(record.candidate)) {
+    const repository = record.repository.nameWithOwner.toLowerCase();
+    const owner = String(record.repository.owner?.login ?? repository.split('/')[0]).toLowerCase();
+    if (authoringBlocks.repositories.has(repository)) {
+      skipped.push({candidate: record.candidate, reasons: ['repository authoring interaction block'],
+        stratum: [...record.strata].sort().join(',')});
+    } else if (authoringBlocks.owners.has(owner)) {
+      skipped.push({candidate: record.candidate, reasons: ['owner authoring interaction block'],
+        stratum: [...record.strata].sort().join(',')});
+    } else if (known.has(record.candidate)) {
       skipped.push({candidate: record.candidate, reasons: ['candidate is already known to factory'],
         stratum: [...record.strata].sort().join(',')});
     } else {

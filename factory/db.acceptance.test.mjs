@@ -88,7 +88,111 @@ test('schema v5 adds per-attempt reasons without rewriting existing attempts', a
   assert.equal(db.connection.prepare("SELECT reason FROM attempts WHERE attempt_id='ATTEMPT-1'").get().reason, null);
 });
 
-test('prior merges route ranking and verification prospects persist the owner pause list', async (t) => {
+test('schema v7 migration atomically refreshes only active pending READY bytes', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-policy-v2-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const database = path.join(root, 'factory.sqlite');
+  let db = openFactoryDb(database, {missionStart: 1068});
+  const {claim} = enqueueAndClaim(db);
+  const ready = db.finishVerifiedReady(claim.attempt.attempt_id, {
+    repository: 'owner/repo',
+    issue_url: 'https://github.com/owner/repo/issues/123',
+    pr_title: 'fix: bounded issue',
+    pr_body: `Fix it.\n\n<!-- northset-receipt:M-1068:start -->\nold\n<!-- northset-receipt:M-1068:end -->`,
+    checks: ['node --test'],
+    branch: 'northset/m-1068',
+    receipt_url: 'https://northset-oss.example/receipts/M-1068/',
+    planned_actions: ['publish-proof', 'open-upstream-pr'],
+    proof: {schema_version: 2, checks: ['node --test']},
+  }, {
+    patchSha256: `sha256:${'b'.repeat(64)}`,
+    commitOid: 'c'.repeat(40),
+    verification: {ok: true},
+  });
+  db.insertBoard({
+    boardId: 'B-OLD',
+    boardDigest: `sha256:${'d'.repeat(64)}`,
+    items: [ready],
+  });
+  const {claim: rejectedClaim} = enqueueAndClaim(db, 'owner/rejected#124');
+  const rejected = db.finishVerifiedReady(rejectedClaim.attempt.attempt_id, {
+    repository: 'owner/rejected',
+    issue_url: 'https://github.com/owner/rejected/issues/124',
+    pr_title: 'fix: rejected issue',
+    pr_body: 'Rejected terminal item.',
+    checks: ['node --test'],
+  }, {
+    patchSha256: `sha256:${'e'.repeat(64)}`,
+    commitOid: 'f'.repeat(40),
+    verification: {ok: true},
+  });
+  db.connection.prepare("UPDATE ready_items SET approval_state='REJECTED' WHERE mission_id=?")
+    .run(rejected.mission_id);
+  db.connection.prepare("UPDATE tasks SET state='REJECTED_BY_OWNER' WHERE task_id=?")
+    .run(rejected.task_id);
+  const {claim: supersededClaim} = enqueueAndClaim(db, 'owner/superseded#125');
+  const superseded = db.finishVerifiedReady(supersededClaim.attempt.attempt_id, {
+    repository: 'owner/superseded',
+    issue_url: 'https://github.com/owner/superseded/issues/125',
+    pr_title: 'fix: superseded issue',
+    pr_body: 'Superseded terminal item.',
+    checks: ['node --test'],
+  }, {
+    patchSha256: `sha256:${'1'.repeat(64)}`,
+    commitOid: '2'.repeat(40),
+    verification: {ok: true},
+  });
+  db.supersedeReady(superseded.mission_id, {reason: 'terminal before migration'});
+  db.close();
+
+  const legacy = new DatabaseSync(database);
+  legacy.exec(`
+    UPDATE factory_meta SET value='7' WHERE key='schema_version';
+    DROP TABLE interaction_blocks;
+    CREATE TABLE verification_prospects(
+      repository TEXT PRIMARY KEY COLLATE NOCASE,
+      owner_login TEXT NOT NULL COLLATE NOCASE,
+      reason_code TEXT NOT NULL,
+      mission_id TEXT NOT NULL,
+      observed_at TEXT NOT NULL
+    );
+    INSERT INTO verification_prospects VALUES(
+      'prometheus/client_js','prometheus','ai_rejection','M-014','2026-07-21T00:00:00.000Z'
+    );
+  `);
+  legacy.close();
+
+  db = openFactoryDb(database);
+  t.after(() => db.close());
+  assert.equal(db.getPolicyState().publication_paused, true);
+  const migrated = db.getReadyItem('M-1068');
+  assert.equal(migrated.approval_state, 'PENDING');
+  assert.equal(migrated.board_id, null);
+  assert.equal(migrated.manifest.receipt_visibility, 'private_internal');
+  assert.equal(migrated.manifest.receipt_url, null);
+  assert.match(migrated.manifest.branch, /^fix\//);
+  assert.doesNotMatch(migrated.manifest.pr_body, /northset-receipt|M-1068|without trusting us/iu);
+  assert.equal(db.getBoard('B-OLD').state, 'SUPERSEDED');
+  assert.equal(db.getReadyItem(rejected.mission_id).approval_state, 'REJECTED');
+  assert.equal(db.getTask(rejected.task_id).state, 'REJECTED_BY_OWNER');
+  assert.equal(db.getReadyItem(superseded.mission_id).approval_state, 'SUPERSEDED');
+  assert.equal(db.getTask(superseded.task_id).state, 'SUPERSEDED');
+  const [block] = db.findInteractionBlocks({
+    repository: 'prometheus/client_js',
+    action: 'authoring',
+  });
+  assert.equal(block.mission_id, 'M-014');
+  assert.equal(block.source_url,
+    'https://github.com/prometheus/client_js/pull/773#issuecomment-4953870322');
+  assert.equal(block.release_policy, 'manual_only');
+  db.close();
+  db = openFactoryDb(database);
+  assert.equal(db.getReadyItem('M-1068').approval_state, 'PENDING');
+  assert.equal(db.getReadyItem(rejected.mission_id).approval_state, 'REJECTED');
+  assert.equal(db.getReadyItem(superseded.mission_id).approval_state, 'SUPERSEDED');
+});
+
+test('interaction blocks persist exact scope, reason, and manual-only release', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-targeting-'));
   t.after(() => rm(root, {recursive: true, force: true}));
   const db = openFactoryDb(path.join(root, 'factory.sqlite'), {missionStart: 1});
@@ -105,31 +209,33 @@ test('prior merges route ranking and verification prospects persist the owner pa
     task_id: ready.task_id, publication_state: 'SUBMITTED', pr_state: 'MERGED', merged: true,
   });
 
-  const relationships = db.priorMergeRelationships();
-  assert.equal(relationships.repositories.has('owner/repo'), true);
-  assert.equal(relationships.owners.has('owner'), true);
-
-  db.recordVerificationProspect({
-    repository: 'Owner/Repo',
-    owner: 'Owner',
+  db.recordInteractionBlock({
+    scope: 'repository',
+    subject: 'Owner/Repo',
+    blockAuthoring: true,
+    blockOutreach: true,
+    reason: 'Maintainer asked us to stop.',
     reasonCode: 'not_wanted',
     missionId: ready.mission_id,
-    observedAt: '2026-07-21T15:00:00Z',
+    createdAt: '2026-07-21T15:00:00Z',
   });
-  assert.deepEqual(db.listDoNotAuthor(), [{
-    repository: 'Owner/Repo',
-    owner_login: 'Owner',
-    reason_code: 'not_wanted',
-    mission_id: ready.mission_id,
-    observed_at: '2026-07-21T15:00:00.000Z',
-  }]);
+  const [block] = db.findInteractionBlocks({repository: 'owner/repo', action: 'authoring'})
+    .filter((item) => item.reason_code === 'not_wanted');
+  assert.equal(block.scope, 'repository');
+  assert.equal(block.subject, 'owner/repo');
+  assert.equal(block.reason, 'Maintainer asked us to stop.');
+  assert.equal(block.release_policy, 'manual_only');
+  assert.throws(() => db.releaseInteractionBlock('repository', 'owner/repo', {
+    releasedBy: 'worker', reason: 'automatic',
+  }), /internal owner identity/);
 });
 
-function enqueueAndClaim(db) {
+function enqueueAndClaim(db, candidate = 'owner/repo#123') {
+  const [repository, issue] = candidate.split('#');
   const [task] = db.enqueueTasks([{
-    candidate: 'owner/repo#123',
-    repository: 'owner/repo',
-    issue_number: 123,
+    candidate,
+    repository,
+    issue_number: Number(issue),
     profile: 'node',
     base_oid: 'a'.repeat(40),
   }], {now: '2026-07-19T12:00:00.000Z'});

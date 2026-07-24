@@ -15,6 +15,7 @@ import {
   runFactoryCycle,
   runUntilIdle,
 } from './worker.mjs';
+import {assertPublicationManifest, PROMOTION_FREE_DISCLOSURE} from './publication-policy.mjs';
 
 async function makeFactory(t, {missionStart = 1000} = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'oss-factory-'));
@@ -130,27 +131,145 @@ test('READY claims use the exact clean verifier command instead of authored stat
   const [ready] = db.listReady({states: ['PENDING'], limit: 1});
   assert.deepEqual(ready.manifest.checks, ['node --test']);
   assert.deepEqual(ready.manifest.proof.checks_not_run, []);
-  assert.equal(ready.manifest.pr_body, [
-    '## Summary',
-    '',
-    'Fix issue 1.',
-    '',
-    '---',
-    '<!-- northset-receipt:M-1000:start -->',
-    '### Verification',
-    '',
-    '`node --test` exited 0 on this exact head (`2222222`) in a network-off container, before this PR was opened.',
-    'No workflow or CI files are modified in this change.',
-    'Commands, environment, and hashes: [receipt M-1000](https://northset-oss.github.io/verification-pilot/receipts/M-1000/) — checkable in ~30 seconds without trusting us.',
-    'Self-run by the contributor, not maintainer verification.',
-    '<!-- northset-receipt:M-1000:end -->',
-    '',
-    'AI-assisted and reviewed by Northset; I take responsibility for this submission.',
-    '',
-  ].join('\n'));
+  assert.match(ready.manifest.pr_body, new RegExp(PROMOTION_FREE_DISCLOSURE));
+  assert.match(ready.manifest.pr_body, /Checks:\n- `node --test` — passed/);
+  assert.doesNotMatch(ready.manifest.pr_body, /receipt|M-1000|reviewed by Northset/iu);
+  assert.equal(ready.manifest.receipt_visibility, 'private_internal');
+  assert.equal(ready.manifest.receipt_url, null);
+  assert.equal(ready.manifest.consent_scopes.scopes.receipt_publication_consent.status, 'absent');
+  assert.match(ready.manifest.branch, /^fix\/fix-issue-1$/);
+  assert.throws(() => assertPublicationManifest({
+    ...ready.manifest,
+    pr_body: '<!-- northset-receipt:M-1000:start -->old<!-- northset-receipt:M-1000:end -->',
+  }), /promotion-free disclosure|legacy promotional/);
+  const publicUrl = 'https://northset-oss.example/receipts/M-1000/';
+  assert.throws(() => assertPublicationManifest({
+    ...ready.manifest,
+    receipt_visibility: 'public_opt_in',
+    receipt_url: publicUrl,
+    pr_body: finalizePrBody('Fix issue 1.', 'M-1000', publicUrl, {command: 'node --test'}),
+    planned_actions: ['publish-proof', ...ready.manifest.planned_actions],
+  }), /explicit receipt_publication_consent/);
 });
 
-test('footer v2 renders argv commands and omits the CI claim on any uncertainty', () => {
+test('a late repository authoring block skips a queued task before checkout or model work', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  const reason = 'Maintainer requested no further authored contributions.';
+  db.recordInteractionBlock({
+    scope: 'repository',
+    subject: 'owner1/repo1',
+    blockAuthoring: true,
+    blockOutreach: true,
+    reason,
+    reasonCode: 'maintainer_stop',
+  });
+  let checkoutCalls = 0;
+  let scoutCalls = 0;
+  const driver = verifiedDriver({verified: 1});
+  driver.checkout = async () => { checkoutCalls += 1; return '/must-not-run'; };
+  driver.scout = async () => { scoutCalls += 1; return {decision: 'GO'}; };
+
+  const result = await runFactoryCycle({db, workers: 1, driver});
+  assert.equal(result.results[0].state, 'SKIPPED');
+  assert.equal(result.results[0].reason, reason);
+  assert.equal(checkoutCalls, 0);
+  assert.equal(scoutCalls, 0);
+  assert.equal(db.listTasks({limit: 10})[0].state, 'SKIPPED');
+  assert.equal(db.listTasks({limit: 10})[0].last_error, reason);
+});
+
+test('a late maintainer-user authoring block skips carried work before checkout', async (t) => {
+  const {db} = await makeFactory(t);
+  const [record] = candidates(1);
+  record.live_state.interactionUsers = ['maintainer-one'];
+  db.enqueueTasks([record]);
+  db.recordInteractionBlock({
+    scope: 'user',
+    subject: 'maintainer-one',
+    blockAuthoring: true,
+    blockOutreach: true,
+    reason: 'User-specific stop.',
+    reasonCode: 'maintainer_stop',
+  });
+  let checkoutCalls = 0;
+  const driver = verifiedDriver({verified: 1});
+  driver.checkout = async () => { checkoutCalls += 1; return '/must-not-run'; };
+
+  const result = await runFactoryCycle({db, workers: 1, driver});
+  assert.equal(result.results[0].state, 'SKIPPED');
+  assert.equal(result.results[0].reason, 'User-specific stop.');
+  assert.equal(checkoutCalls, 0);
+});
+
+test('an authoring block inserted during preparation stops the model at its final boundary', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  const reason = 'Maintainer stop arrived while the task was preparing.';
+  const driver = verifiedDriver({verified: 1});
+  const bootstrap = driver.bootstrap;
+  let authorCalls = 0;
+  driver.bootstrap = async (...args) => {
+    const result = await bootstrap(...args);
+    db.recordInteractionBlock({
+      scope: 'repository',
+      subject: 'owner1/repo1',
+      blockAuthoring: true,
+      blockOutreach: true,
+      reason,
+      reasonCode: 'maintainer_stop',
+    });
+    return result;
+  };
+  driver.author = async () => {
+    authorCalls += 1;
+    throw new Error('author must not run after the late block');
+  };
+
+  const result = await runFactoryCycle({db, workers: 1, driver});
+
+  assert.equal(result.results[0].state, 'SKIPPED');
+  assert.equal(result.results[0].reason, reason);
+  assert.equal(authorCalls, 0);
+  assert.equal(db.listTasks({limit: 10})[0].state, 'SKIPPED');
+  assert.equal(db.listTasks({limit: 10})[0].last_error, reason);
+});
+
+test('an authoring block inserted after a transient model failure stops its infrastructure retry', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  const reason = 'Maintainer stop arrived before the model retry.';
+  const driver = verifiedDriver({verified: 1});
+  let authorCalls = 0;
+  driver.author = async () => {
+    authorCalls += 1;
+    if (authorCalls === 1) {
+      db.recordInteractionBlock({
+        scope: 'repository',
+        subject: 'owner1/repo1',
+        blockAuthoring: true,
+        blockOutreach: true,
+        reason,
+        reasonCode: 'maintainer_stop',
+      });
+      const error = new Error('temporary model provider failure');
+      error.transient = true;
+      error.infrastructure = true;
+      throw error;
+    }
+    throw new Error('author retry must not run after the late block');
+  };
+
+  const result = await runFactoryCycle({db, workers: 1, driver});
+
+  assert.equal(result.results[0].state, 'SKIPPED');
+  assert.equal(result.results[0].reason, reason);
+  assert.equal(authorCalls, 1);
+  assert.equal(db.listTasks({limit: 10})[0].state, 'SKIPPED');
+  assert.equal(db.listTasks({limit: 10})[0].last_error, reason);
+});
+
+test('promotion-free footer renders the exact argv command', () => {
   const missionId = 'M-321';
   const receiptUrl = 'https://northset.test/receipts/M-321/';
   const facts = {
@@ -159,22 +278,12 @@ test('footer v2 renders argv commands and omits the CI claim on any uncertainty'
     changedFiles: [{path: 'src/value.mjs', class: 'production'}],
   };
   const rendered = finalizePrBody('Fix the value.', missionId, receiptUrl, facts);
-  assert.match(rendered,
-    /`node --test test\/value\.test\.mjs` exited 0 on this exact head \(`abcdef0`\)/);
-  assert.match(rendered, /No workflow or CI files are modified in this change\./);
-
-  for (const changedFiles of [
-    [{path: '.github/workflows/test.yml', class: 'ci'}],
-    [{path: 'custom-ci/config.yml', class: 'ci'}],
-    [{class: 'production'}],
-    null,
-  ]) {
-    const uncertain = finalizePrBody('Fix the value.', missionId, receiptUrl, {...facts, changedFiles});
-    assert.doesNotMatch(uncertain, /No workflow or CI files are modified in this change\./);
-  }
+  assert.match(rendered, /- `node --test test\/value\.test\.mjs` — passed/);
+  assert.match(rendered, new RegExp(PROMOTION_FREE_DISCLOSURE));
+  assert.doesNotMatch(rendered, /reviewed by Northset|without trusting us/iu);
 });
 
-test('footer v2 substitutes long commands and preserves a placeholder receipt block without duplication', () => {
+test('promotion-free footer preserves exact long commands and deletes old receipt markers', () => {
   const missionId = 'M-322';
   const receiptUrl = 'https://northset.test/receipts/M-322/';
   const longCommand = `node --test ${'test/deeply-nested/'.repeat(4)}value.test.mjs`;
@@ -183,9 +292,7 @@ test('footer v2 substitutes long commands and preserves a placeholder receipt bl
     commitOid: '1234567890abcdef1234567890abcdef12345678',
     changedFiles: [],
   });
-  assert.match(rendered,
-    /the repository's declared test command exited 0 on this exact head \(`1234567`\)/);
-  assert.doesNotMatch(rendered, new RegExp(longCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(rendered, new RegExp(longCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 
   const templated = [
     'Fix the value.',
@@ -194,20 +301,79 @@ test('footer v2 substitutes long commands and preserves a placeholder receipt bl
     '[receipt {{MISSION_ID}}]({{RECEIPT_URL}})',
     '<!-- northset-receipt:{{MISSION_ID}}:end -->',
   ].join('\n');
-  const finalized = finalizePrBody(templated, missionId, receiptUrl, {
+  const finalized = finalizePrBody(templated, missionId, null, {
     command: 'node --test', commitOid: '1'.repeat(40), changedFiles: [],
   });
-  assert.equal(finalized, `${templated
-    .replaceAll('{{MISSION_ID}}', missionId)
-    .replaceAll('{{RECEIPT_URL}}', receiptUrl)}\n`);
-  assert.equal(finalized.match(/northset-receipt:M-322:start/g)?.length, 1);
+  assert.doesNotMatch(finalized, /northset-receipt|M-322/);
+  assert.match(finalized, /- `node --test` — passed/);
 
-  const refreshed = finalizePrBody(finalized, missionId, receiptUrl, {
+  const refreshed = finalizePrBody(finalized, missionId, null, {
     command: ['npm', 'test'], commitOid: '2'.repeat(40), changedFiles: [], replaceExisting: true,
   });
-  assert.match(refreshed, /`npm test` exited 0 on this exact head \(`2222222`\)/);
-  assert.doesNotMatch(refreshed, /`1111111`/);
-  assert.equal(refreshed.match(/northset-receipt:M-322:start/g)?.length, 1);
+  assert.match(refreshed, /- `npm test` — passed/);
+  assert.equal(refreshed.match(/AI assistance was used/g)?.length, 1);
+});
+
+test('publication policy rejects incident product, CTA, and external-endorsement phrases', () => {
+  const manifest = (summary) => ({
+    mission_id: 'M-901',
+    receipt_visibility: 'private_internal',
+    receipt_url: null,
+    consent_scopes: {
+      schema_version: 2,
+      mission_id: 'M-901',
+      scopes: {
+        contribution_invitation: {status: 'not_applicable'},
+        verification_execution_consent: {status: 'not_applicable'},
+        receipt_publication_consent: {status: 'absent'},
+        marketing_reference_consent: {status: 'absent'},
+      },
+    },
+    planned_actions: [],
+    checks: ['node --test'],
+    pr_body: `${summary}\n\n${PROMOTION_FREE_DISCLOSURE}\n\nChecks:\n- \`node --test\` — passed\n`,
+  });
+  const incidentPhrases = [
+    'Upstream CI agreed with the receipt.',
+    'Upstream CI disagreed with this receipt.',
+    'CI validated this proof-of-pass receipt.',
+    'The maintainers endorsed the technical evidence.',
+    'The reviewer ratified our receipt.',
+    'This contribution was approved by upstream CI.',
+    'Request a verification run for your project.',
+    'We offer verification to maintainers.',
+    'Try the Northset verification product.',
+    'Try Northset Verify at https://northset.ai today.',
+    'Maintain nodejs/doc-kit?',
+    'Use the prefilled email to request a run.',
+    'View our public ledger for the result.',
+  ];
+  for (const phrase of incidentPhrases) {
+    assert.throws(() => assertPublicationManifest(manifest(phrase)),
+      /contribution-only|legacy promotional/, phrase);
+  }
+  for (const contributionText of [
+    'The parser validated the payload before returning it.',
+    'This implements the requested receipt parser behavior.',
+    'Approved configuration values are now preserved.',
+  ]) {
+    assert.equal(assertPublicationManifest(manifest(contributionText)), true);
+  }
+  const evidence = {
+    repository: 'northset/project',
+    commit_oid: 'a'.repeat(40),
+    path: '.github/test-evidence/result.png',
+  };
+  evidence.url =
+    `https://raw.githubusercontent.com/${evidence.repository}/${evidence.commit_oid}/${evidence.path}`;
+  assert.equal(assertPublicationManifest({
+    ...manifest(`Evidence: ${evidence.url}`),
+    evidence_asset: evidence,
+  }), true);
+  assert.throws(() => assertPublicationManifest({
+    ...manifest(`Evidence: https://raw.githubusercontent.com/northset/other/${evidence.commit_oid}/${evidence.path}`),
+    evidence_asset: evidence,
+  }), /contribution-only/);
 });
 
 test('PR text cannot deny that its exact clean verifier command ran and passed', () => {

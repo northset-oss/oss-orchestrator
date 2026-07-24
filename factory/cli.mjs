@@ -10,7 +10,6 @@ import {openFactoryDb} from './db.mjs';
 import {discoverCandidates, DISCOVERY_DEFAULT_TARGET, DISCOVERY_MAX_TARGET} from './discovery.mjs';
 import {createGhCliPublisherAdapter, createGhCliTransport} from './gh-cli.mjs';
 import {createGitHubSafety, resumeGitHub} from './github-safety.mjs';
-import {buildOfferDossier, loadDossierRelationships} from './offer-dossier.mjs';
 import {publishBoard} from './publisher.mjs';
 import {
   createReceiptPublisher,
@@ -35,8 +34,8 @@ export const FACTORY_DEFAULTS = Object.freeze({
 });
 
 const COMMANDS = new Set([
-  'discover', 'run', 'board', 'approve', 'publish', 'reconcile', 'dossier',
-  'github-status', 'github-resume',
+  'discover', 'run', 'board', 'approve', 'publish', 'reconcile',
+  'github-status', 'github-resume', 'publication-status', 'publication-resume',
 ]);
 const COMMON_VALUE_FLAGS = new Set(['--db', '--pause-file', '--gh-bin']);
 const COMMAND_VALUE_FLAGS = Object.freeze({
@@ -48,9 +47,10 @@ const COMMAND_VALUE_FLAGS = Object.freeze({
   approve: new Set(['--board', '--ids', '--reject-ids', '--approved-by']),
   publish: new Set(['--board', '--receipt-remote', '--artifact-root', '--repository-open-override']),
   reconcile: new Set(['--limit', '--receipt-remote']),
-  dossier: new Set(['--limit']),
   'github-status': new Set(),
   'github-resume': new Set(['--reason', '--cleared-by', '--repository']),
+  'publication-status': new Set(),
+  'publication-resume': new Set(['--reason', '--cleared-by']),
 });
 const COMMAND_BOOLEAN_FLAGS = Object.freeze({
   discover: new Set(),
@@ -59,9 +59,10 @@ const COMMAND_BOOLEAN_FLAGS = Object.freeze({
   approve: new Set(),
   publish: new Set(),
   reconcile: new Set(),
-  dossier: new Set(),
   'github-status': new Set(),
   'github-resume': new Set(['--acknowledge-forbidden']),
+  'publication-status': new Set(),
+  'publication-resume': new Set(),
 });
 
 async function canonicalDatabasePath(database) {
@@ -160,7 +161,7 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
   const values = [...argv];
   const command = values.shift();
   if (!COMMANDS.has(command)) {
-    throw new Error('command must be discover, run, board, approve, publish, reconcile, dossier, github-status, or github-resume');
+    throw new Error('command must be discover, run, board, approve, publish, reconcile, publication-status, publication-resume, github-status, or github-resume');
   }
   const allowedValues = new Set([...COMMON_VALUE_FLAGS, ...COMMAND_VALUE_FLAGS[command]]);
   const allowedBooleans = COMMAND_BOOLEAN_FLAGS[command];
@@ -271,7 +272,6 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
         FACTORY_DEFAULTS.receiptRemote,
     };
   }
-  if (command === 'dossier') return {...common, limit: positiveInteger(parsed.get('--limit') ?? '30', '--limit', 100)};
   if (command === 'github-resume') {
     const reason = parsed.get('--reason');
     if (!reason?.trim()) throw new Error('--reason is required for github-resume');
@@ -281,6 +281,15 @@ export function parseFactoryCliArgs(argv, {env = process.env} = {}) {
       clearedBy: parsed.get('--cleared-by') ?? env.OSS_FACTORY_APPROVED_BY ?? 'internal-user:aeziz',
       repository: parsed.get('--repository') ?? null,
       acknowledgeForbidden: parsed.get('--acknowledge-forbidden') === true,
+    };
+  }
+  if (command === 'publication-resume') {
+    const reason = parsed.get('--reason');
+    if (!reason?.trim()) throw new Error('--reason is required for publication-resume');
+    return {
+      ...common,
+      reason: reason.trim(),
+      clearedBy: parsed.get('--cleared-by') ?? env.OSS_FACTORY_APPROVED_BY ?? 'internal-user:aeziz',
     };
   }
   return common;
@@ -355,8 +364,6 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
   createStaleRefresher,
   createSafety: createGitHubSafety,
   resumeGitHub,
-  buildOfferDossier,
-  loadDossierRelationships,
 });
 
 export async function executeFactoryCli(argv, {
@@ -367,6 +374,21 @@ export async function executeFactoryCli(argv, {
 } = {}) {
   const options = parseFactoryCliArgs(argv, {env});
   const deps = {...DEFAULT_DEPENDENCIES, ...dependencies};
+  if (options.command === 'publication-status' || options.command === 'publication-resume') {
+    const db = deps.openDb(options.database);
+    try {
+      const result = options.command === 'publication-status'
+        ? await db.getPolicyState()
+        : await db.resumePublication({
+          releasedBy: options.clearedBy,
+          reason: options.reason,
+        });
+      printJson(stdout, result);
+      return result;
+    } finally {
+      db.close?.();
+    }
+  }
   const transport = dependencies.transport ?? deps.createTransport({ghExecutable: options.ghBin});
   const safetyTransport = (request) => typeof request.execute === 'function'
     ? request.execute()
@@ -428,10 +450,13 @@ export async function executeFactoryCli(argv, {
       });
       const knownTasks = typeof db.listTasks === 'function'
         ? await db.listTasks({profile: 'node', limit: 100_000}) : [];
+      const interactionBlocks = typeof db.listInteractionBlocks === 'function'
+        ? await db.listInteractionBlocks({action: 'authoring'}) : [];
       const result = await deps.discoverCandidates({
         lakePath: options.lake,
         target: options.target,
         knownCandidates: knownTasks.map((task) => task.candidate),
+        interactionBlocks,
         search: ({stratum, query, variables}) => safety.request({
           priority: 'discovery_top_up',
           kind: 'search',
@@ -442,18 +467,6 @@ export async function executeFactoryCli(argv, {
         }),
       });
       printJson(stdout, result);
-      return result;
-    }
-    if (options.command === 'dossier') {
-      const safety = deps.createSafety({
-        pauseFile: options.pauseFile,
-        transport: safetyTransport,
-        repositoryState: typeof db.getPublicActionState === 'function'
-          ? db.getPublicActionState.bind(db) : db,
-      });
-      const github = dependencies.github ?? deps.createPublisherAdapter({transport});
-      const result = await deps.buildOfferDossier({db, github, safety, limit: options.limit});
-      stdout.write(result.summary);
       return result;
     }
     if (options.command === 'reconcile') {
@@ -505,9 +518,6 @@ export async function executeFactoryCli(argv, {
         lakePath: options.lake,
         db,
         github: queuedGithub,
-        relationships: deps.loadDossierRelationships(path.resolve(
-          path.dirname(options.database), '..', 'demand', 'offer_dossiers.json',
-        )),
       });
       const checkoutProvider = async (task, attempt, allocatedRoot) => {
         if (typeof task?.base_oid !== 'string' || !task.base_oid) {

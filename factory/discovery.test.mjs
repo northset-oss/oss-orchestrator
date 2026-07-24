@@ -164,6 +164,38 @@ test('a high-score repository flood is capped at two while later repositories fi
   db.close();
 });
 
+test('repository and owner authoring blocks exclude candidates before lake persistence', async (t) => {
+  const lake = await temporaryLake(t);
+  const blockedRepository = issue('Blocked/Repo', 30, {stars: 20_000});
+  const blockedOwner = issue('Denied/Other', 31, {stars: 10_000});
+  const allowed = issue('Allowed/Repo', 32, {stars: 10});
+  let calls = 0;
+  const result = await discoverCandidates({
+    lakePath: lake,
+    target: 3,
+    now: NOW,
+    interactionBlocks: [{
+      scope: 'repository', subject: 'blocked/repo', block_authoring: true, released_at: null,
+    }, {
+      scope: 'owner', subject: 'denied', block_authoring: true, released_at: null,
+    }],
+    search: async () => ({body: {data: {search: {
+      nodes: calls++ === 0 ? [blockedRepository, blockedOwner, allowed] : [],
+    }}}}),
+  });
+
+  assert.equal(calls, 6);
+  assert.deepEqual(result.candidates.map((item) => item.candidate), ['allowed/repo#32']);
+  assert.equal(result.skipped_reason_counts['repository authoring interaction block'], 1);
+  assert.equal(result.skipped_reason_counts['owner authoring interaction block'], 1);
+  const db = new DatabaseSync(lake, {readOnly: true});
+  assert.deepEqual(db.prepare('SELECT candidate_key FROM issues ORDER BY candidate_key').all()
+    .map((row) => row.candidate_key), ['allowed/repo#32']);
+  assert.deepEqual(db.prepare('SELECT repo_key FROM repositories ORDER BY repo_key').all()
+    .map((row) => row.repo_key), ['allowed/repo']);
+  db.close();
+});
+
 test('discovery target rejects zero, non-integers, and values above the hard cap before search', async () => {
   for (const target of [0, 1.5, DISCOVERY_MAX_TARGET + 1]) {
     await assert.rejects(() => discoverCandidates({target, search: async () => assert.fail('must not search')}),

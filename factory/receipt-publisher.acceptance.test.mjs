@@ -12,6 +12,7 @@ import {
   receiptUrlFor,
   runBounded,
 } from './receipt-publisher.mjs';
+import {promotionFreePrBody} from './publication-policy.mjs';
 
 function oid(character) {
   return character.repeat(40);
@@ -34,6 +35,31 @@ function item(id, character, overrides = {}) {
     started_at: timestamp, finished_at: timestamp, duration_ms: 0, exit_code: 0,
     output_sha256: sha('4'), stdout_sha256: sha('5'), stderr_sha256: sha('6'),
   }];
+  const receiptUrl = `https://northset-oss.github.io/verification-pilot/receipts/${id}/`;
+  const consentScopes = {
+    schema_version: 2,
+    mission_id: id,
+    scopes: {
+      contribution_invitation: {
+        status: 'granted',
+        evidence: {kind: 'public_url', value: 'https://github.com/upstream/project/issues/17'},
+        granted_at: timestamp,
+        granted_by: 'repository:upstream/project',
+      },
+      verification_execution_consent: {
+        status: 'absent', evidence: null, granted_at: null, granted_by: null,
+      },
+      receipt_publication_consent: {
+        status: 'granted',
+        evidence: {kind: 'public_url', value: 'https://github.com/upstream/project/issues/17'},
+        granted_at: timestamp,
+        granted_by: 'maintainer',
+      },
+      marketing_reference_consent: {
+        status: 'absent', evidence: null, granted_at: null, granted_by: null,
+      },
+    },
+  };
   const manifest = {
     mission_id: id,
     task_id: `TASK-${id}`,
@@ -44,9 +70,16 @@ function item(id, character, overrides = {}) {
     commit_oid: oid(character),
     tested_tree_oid: oid('d'),
     checks: ['node --test', {command: 'npm test', exit_code: 0}],
+    pr_body: promotionFreePrBody('Fix the issue.', ['node --test', '[object Object]'], {
+      receiptUrl,
+    }),
+    receipt_visibility: 'public_opt_in',
+    consent_scopes: consentScopes,
+    receipt_url: receiptUrl,
+    planned_actions: ['publish-proof', 'open-upstream-pr'],
     receipt_claim: {type: 'regression_fix', statement: `Verified ${id}`},
     proof: {
-      schema_version: 2,
+      schema_version: 3,
       task_id: `TASK-${id}`,
       repository: 'upstream/project',
       issue_number: 17,
@@ -65,6 +98,8 @@ function item(id, character, overrides = {}) {
       base_observation: executedCommands[0],
       patched_observation: executedCommands[1],
       claim: {type: 'regression_fix', statement: `Verified ${id}`},
+      receipt_visibility: 'public_opt_in',
+      consent_scopes: consentScopes,
       batch_approval_digest: null,
       proof_sha256: sha('f'),
     },
@@ -193,7 +228,7 @@ test('one non-force batch push publishes deterministic exact proof bytes from an
     assert.equal(proof.commit_oid, entry.manifest.commit_oid);
     assert.equal(proof.tested_tree_oid, entry.manifest.tested_tree_oid);
     assert.deepEqual(proof.checks, entry.manifest.checks);
-    assert.equal(proof.schema_version, 2);
+    assert.equal(proof.schema_version, 3);
     assert.deepEqual(proof.executed_commands, entry.manifest.proof.executed_commands);
     assert.deepEqual(proof.checks_not_run, entry.manifest.proof.checks_not_run);
     assert.deepEqual(proof.limitations, entry.manifest.proof.limitations);
@@ -281,6 +316,9 @@ test('an existing proof with different approved bytes is rejected and never over
   const changed = item('M-1000', 'b', {
     manifest: {
       checks: ['node --test changed'],
+      pr_body: promotionFreePrBody('Fix the issue.', ['node --test changed'], {
+        receiptUrl: original.manifest.receipt_url,
+      }),
       proof: {
         schema_version: 1,
         base_oid: oid('a'), patch_sha256: sha('b'), commit_oid: oid('b'), tested_tree_oid: oid('d'),

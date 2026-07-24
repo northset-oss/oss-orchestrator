@@ -3,6 +3,7 @@ import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import {assertPublicationManifest} from './publication-policy.mjs';
 
 const RECEIPTS_BRANCH = 'receipts';
 const DEFAULT_REMOTE_URL = 'https://github.com/northset-oss/verification-pilot.git';
@@ -149,13 +150,14 @@ function validProofCommand(value) {
 }
 
 function assertV2ProofEvidence(proof, missionId) {
-  if (proof.schema_version !== 2) return;
+  if (![2, 3].includes(proof.schema_version)) return;
   const proofFields = [
     'schema_version', 'mission_id', 'task_id', 'repository', 'issue_number', 'candidate',
     'base_oid', 'patch_sha256', 'commit_oid', 'tested_tree_oid', 'checks', 'claim',
     'batch_approval_digest', 'environment', 'base_observation', 'patched_observation',
     'executed_commands', 'checks_not_run', 'limitations', 'verification_started_at',
     'verification_finished_at',
+    ...(proof.schema_version === 3 ? ['receipt_visibility', 'consent_scopes'] : []),
   ];
   if (!exactKeys(proof, proofFields) || !nonblank(proof.task_id) || !nonblank(proof.repository) ||
       !Number.isInteger(proof.issue_number) || proof.issue_number < 1 || !nonblank(proof.candidate) ||
@@ -228,6 +230,11 @@ function proofFor(item) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) throw new TypeError('receipt item must be an object');
   const manifest = item.manifest && typeof item.manifest === 'object' && !Array.isArray(item.manifest)
     ? item.manifest : item;
+  assertPublicationManifest(manifest);
+  if (manifest.receipt_visibility !== 'public_opt_in') {
+    throw new ReceiptPublisherError('public proof publication requires public_opt_in receipt visibility',
+      'RECEIPT_PUBLICATION_NOT_CONSENTED');
+  }
   const missionId = validMissionId(item.mission_id ?? manifest.mission_id);
   if (item.mission_id !== undefined && manifest.mission_id !== undefined &&
       item.mission_id !== manifest.mission_id) {
