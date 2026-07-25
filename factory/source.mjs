@@ -519,12 +519,9 @@ export function evaluatePreflight(live, {
   if (issue && isUnapproved(issue.labels)) reasons.push('issue is marked unapproved by the repository');
   if (issue && isAlreadyInDevelopment(issue.labels)) reasons.push('issue is already implemented in the development branch');
   if (repository?.archived || repository?.fork) reasons.push('repository is archived or forked');
-  const repositoryCreatedAt = Date.parse(repository?.createdAt ?? '');
-  if (repository && Number.isFinite(repositoryCreatedAt) &&
-      repositoryCreatedAt >= now.getTime() - 14 * DAY_MS &&
-      repository.stargazerCount === 0 && repository.forkCount === 0 &&
-      !repository.licenseSpdxId && repository.pullRequestCount === 0) {
-    reasons.push('new unlicensed zero-signal repository requires manual provenance review');
+  if (repository && (!repository.licenseSpdxId ||
+      repository.licenseSpdxId.toUpperCase() === 'NOASSERTION')) {
+    reasons.push('repository license is unavailable or unrecognized');
   }
   if (repository && !repository.hasRootPackageJson) reasons.push('root package.json is missing');
   if (repository?.unsupportedNodeLayout) reasons.push(repository.unsupportedNodeLayout);

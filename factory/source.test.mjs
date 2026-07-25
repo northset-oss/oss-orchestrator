@@ -392,10 +392,12 @@ test('each hard live-preflight violation returns SKIP', async (t) => {
     ['unapproved issue', normalizedLive({issue: {labels: ['good first issue', 'unapproved']}}), /marked unapproved/],
     ['already in development', normalizedLive({issue: {labels: ['good first issue', 'in-develop']}}), /development branch/],
     ['archived repository', normalizedLive({repository: {archived: true}}), /archived/],
-    ['new unlicensed zero-signal repository', normalizedLive({repository: {
-      createdAt: '2026-07-24T00:00:00Z', stargazerCount: 0, forkCount: 0,
-      licenseSpdxId: null, pullRequestCount: 0,
-    }}), /manual provenance review/],
+    ['missing repository license', normalizedLive({repository: {
+      licenseSpdxId: null,
+    }}), /license is unavailable or unrecognized/],
+    ['unrecognized repository license', normalizedLive({repository: {
+      licenseSpdxId: 'NOASSERTION',
+    }}), /license is unavailable or unrecognized/],
     ['missing root package', normalizedLive({repository: {hasRootPackageJson: false}}), /root package\.json/],
     ['unsupported workspace', normalizedLive({repository: {
       unsupportedNodeLayout: 'multi-package workspaces are outside the single-package Node lane',
@@ -424,6 +426,8 @@ test('recent common claim and collaborator-offer phrases block while stale inter
   const phrases = [
     "I'd like to take this one.",
     'I’d like to take this one.',
+    'I would appreciate the opportunity to pick this up.',
+    "I'd appreciate the opportunity to work on this.",
     'I’m working on this.',
     'I would like to work on this.',
     'I would love to work on this issue.',
