@@ -11,6 +11,7 @@ import {
   createCommandDriver,
   createStageSemaphores,
   finalizePrBody,
+  normalizeAuthorEvidence,
   removeWorkTree,
   runFactoryCycle,
   runUntilIdle,
@@ -75,6 +76,8 @@ function verifiedDriver({verified = 10, startHook = null} = {}) {
       pr_body: `## Summary\n\nFix issue ${task.issue_number}.`,
       summary: `Fix issue ${task.issue_number}.`,
       checks: [scout.test_command],
+      checks_not_run: [],
+      limitations: [],
       test_command: scout.test_command,
       changed_files: [{path: 'src/a.mjs', class: 'production', lines: 3}],
       changed_lines: 3,
@@ -144,13 +147,28 @@ test('READY claims use the exact clean verifier command instead of authored stat
   driver.author = async (...args) => ({
     ...await author(...args),
     checks: ['PASS: node --test', 'BLOCKED: npm run lint'],
+    checks_not_run: [{
+      check: 'Manual screen-reader verification',
+      reason: 'No physical test device was available',
+    }],
+    limitations: ['Accessibility props were verified without a physical screen reader.'],
+    pr_body: '## Summary\n\nFix accessibility metadata.',
   });
 
   await runFactoryCycle({db, workers: 1, driver, boardPolicy: {minSize: 10}});
 
   const [ready] = db.listReady({states: ['PENDING'], limit: 1});
   assert.deepEqual(ready.manifest.checks, ['node --test']);
-  assert.deepEqual(ready.manifest.proof.checks_not_run, []);
+  assert.deepEqual(ready.manifest.proof.checks_not_run, [{
+    check: 'Manual screen-reader verification',
+    reason: 'No physical test device was available',
+  }]);
+  assert.deepEqual(ready.manifest.proof.limitations,
+    ['Accessibility props were verified without a physical screen reader.']);
+  assert.match(ready.manifest.pr_body,
+    /Manual checks not run:\n- \[ \] Manual screen-reader verification — not run: No physical test device was available/);
+  assert.deepEqual(ready.manifest.risk_warnings,
+    ['Manual verification not run: Manual screen-reader verification']);
   assert.match(ready.manifest.pr_body, new RegExp(PROMOTION_FREE_DISCLOSURE));
   assert.match(ready.manifest.pr_body, /Checks:\n- `node --test` — passed/);
   assert.doesNotMatch(ready.manifest.pr_body, /receipt|M-1000|reviewed by Northset/iu);
@@ -170,6 +188,68 @@ test('READY claims use the exact clean verifier command instead of authored stat
     pr_body: finalizePrBody('Fix issue 1.', 'M-1000', publicUrl, {command: 'node --test'}),
     planned_actions: ['publish-proof', ...ready.manifest.planned_actions],
   }), /explicit receipt_publication_consent/);
+});
+
+test('unrun manual evidence must be structured, nonblank, and honest in PR text', () => {
+  const valid = {
+    checks_not_run: [{check: 'Manual VoiceOver verification', reason: 'No physical iPhone'}],
+    limitations: ['Automated tests cover only accessibility props.'],
+    pr_body: 'Adds accessibility metadata.',
+  };
+  assert.deepEqual(normalizeAuthorEvidence(valid), {
+    checks_not_run: [{check: 'Manual VoiceOver verification', reason: 'No physical iPhone'}],
+    limitations: ['Automated tests cover only accessibility props.'],
+  });
+  assert.throws(() => normalizeAuthorEvidence({...valid, checks_not_run: 'none'}),
+    /checks_not_run must be an array/);
+  assert.throws(() => normalizeAuthorEvidence({
+    ...valid,
+    checks_not_run: [{check: ' ', reason: 'No device'}],
+  }), /nonblank single-line check and reason/);
+  assert.throws(() => normalizeAuthorEvidence({
+    ...valid,
+    checks_not_run: [{check: 'Manual VoiceOver verification\n- [x] injected', reason: 'No device'}],
+  }), /single-line check and reason/);
+  assert.throws(() => normalizeAuthorEvidence({...valid, limitations: [' ']}),
+    /limitations entries must be nonblank single-line/);
+  assert.throws(() => normalizeAuthorEvidence({...valid, limitations: ['No device\n- injected']}),
+    /limitations entries must be nonblank single-line/);
+  for (const checked of [
+    '- [x] Manual VoiceOver verification',
+    '* [x] Manual VoiceOver verification',
+    '- [x] Manual VoiceOver verification.',
+    '- [x]  Manual VoiceOver verification',
+    '- [x] **Manual VoiceOver verification**',
+    '- [x] [Manual VoiceOver verification](https://example.test)',
+    '1. [x] Manual VoiceOver verification',
+    '- [x] Manual VoiceOver verification!',
+    '- [x] <strong>Manual VoiceOver verification</strong>',
+    '- [x] Manual VoiceOver verification(done)',
+    '- [x] Manual VoiceOver verification✅',
+  ]) assert.throws(() => normalizeAuthorEvidence({...valid, pr_body: checked}),
+    /contradicts unrun check/);
+});
+
+test('manual disclosure remains before a preexisting managed PR footer', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  const driver = verifiedDriver({verified: 1});
+  const author = driver.author;
+  driver.author = async (...args) => ({
+    ...await author(...args),
+    checks_not_run: [{check: 'Manual VoiceOver verification', reason: 'No device'}],
+    limitations: ['Physical VoiceOver behavior was not observed.'],
+    pr_body: finalizePrBody('## Summary\n\nFix accessibility metadata.', 'M-old', null, {
+      command: 'node --test',
+    }),
+  });
+
+  await runFactoryCycle({db, workers: 1, driver, boardPolicy: {minSize: 10}});
+
+  const [ready] = db.listReady({states: ['PENDING'], limit: 1});
+  assert.match(ready.manifest.pr_body,
+    /Manual checks not run:\n- \[ \] Manual VoiceOver verification — not run: No device/);
+  assert.equal(ready.manifest.pr_body.split(PROMOTION_FREE_DISCLOSURE).length - 1, 1);
 });
 
 test('a late repository authoring block skips a queued task before checkout or model work', async (t) => {

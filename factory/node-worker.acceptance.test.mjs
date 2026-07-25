@@ -335,6 +335,7 @@ test('N1c author must bind every required repository check into the verifier com
       test_command: 'npm test -- test/value.test.mjs && npm run typecheck',
       test_only_paths: ['test/value.test.mjs'], base_failure_contains: 'EXPECTED_TWO',
       checks: ['npm test -- test/value.test.mjs && npm run typecheck'],
+      checks_not_run: [], limitations: [],
     };
   }});
 
@@ -1157,6 +1158,7 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
       test_command: 'node --test test/value.test.mjs',
       test_only_paths: ['test/value.test.mjs'], base_failure_contains: 'BASE_MARKER_EXPECTED_TWO',
       checks: ['node --test test/value.test.mjs'],
+      checks_not_run: [], limitations: [],
     };
     },
   });
@@ -1170,6 +1172,7 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
   assert.equal(authorInvocation.dependencyMaterial, dependencyMaterial);
   assert.equal(authorInvocation.image, IMAGE_DIGEST);
   assert.match(authorInvocation.prompt, /feature_implementation/);
+  assert.match(authorInvocation.prompt, /every unrun manual check in checks_not_run/);
   assert.ok(AUTHOR_SCHEMA.properties.claim_type.enum.includes('feature_implementation'));
   assert.equal(await git(['-C', checkout, 'rev-parse', 'HEAD^']), baseOid);
   assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');

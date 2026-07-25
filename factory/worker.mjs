@@ -9,6 +9,7 @@ import {buildProof} from './verifier.mjs';
 import {
   assertPublicationManifest,
   normalizeConsentScopes,
+  PROMOTION_FREE_DISCLOSURE,
   promotionFreePrBody,
 } from './publication-policy.mjs';
 
@@ -98,6 +99,7 @@ export function finalizePrBody(body, missionId, receiptUrl, {
 }
 
 export function buildReadyManifest(task, authorResult, verification, missionId) {
+  const manualEvidence = normalizeAuthorEvidence(authorResult);
   const issueUrl = authorResult.issue_url ??
     `https://github.com/${task.repository}/issues/${task.issue_number}`;
   const consentScopes = normalizeConsentScopes({
@@ -119,7 +121,22 @@ export function buildReadyManifest(task, authorResult, verification, missionId) 
   const verifiedCommand = exactCommand(
     verification.patched_observation?.command ?? authorResult.test_command,
   );
-  const body = finalizePrBody(authorResult.pr_body, missionId, receiptUrl, {
+  const manualDisclosure = manualEvidence.checks_not_run.length ? [
+    'Manual checks not run:',
+    ...manualEvidence.checks_not_run.map(({check, reason}) => `- [ ] ${check} — not run: ${reason}`),
+    ...(manualEvidence.limitations.length ? [
+      '',
+      'Verification limitations:',
+      ...manualEvidence.limitations.map((limitation) => `- ${limitation}`),
+    ] : []),
+  ].join('\n') : '';
+  const managedDisclosureAt = authorResult.pr_body.indexOf(PROMOTION_FREE_DISCLOSURE);
+  const authoredCore = (managedDisclosureAt < 0
+    ? authorResult.pr_body : authorResult.pr_body.slice(0, managedDisclosureAt)).trim();
+  const body = finalizePrBody([
+    authoredCore,
+    manualDisclosure,
+  ].filter(Boolean).join('\n\n'), missionId, receiptUrl, {
     checks: [verifiedCommand].filter(Boolean),
   });
   const manifest = {
@@ -141,6 +158,8 @@ export function buildReadyManifest(task, authorResult, verification, missionId) 
     tested_tree_oid: verification.tested_tree_oid,
     commit_oid: verification.commit_oid,
     checks: [verifiedCommand].filter(Boolean),
+    checks_not_run: manualEvidence.checks_not_run,
+    limitations: manualEvidence.limitations,
     test_command: authorResult.test_command,
     install_command: authorResult.install_command ?? null,
     test_only_paths: authorResult.test_only_paths ?? [],
@@ -152,7 +171,10 @@ export function buildReadyManifest(task, authorResult, verification, missionId) 
     changed_files: verification.changed_files,
     changed_lines: verification.changed_lines,
     risk_tier: authorResult.risk_tier ?? classifyRisk(authorResult),
-    risk_warnings: authorResult.risk_warnings ?? [],
+    risk_warnings: [
+      ...(authorResult.risk_warnings ?? []),
+      ...manualEvidence.checks_not_run.map(({check}) => `Manual verification not run: ${check}`),
+    ],
     receipt_claim: {
       type: verification.claim_type,
       statement: authorResult.receipt_claim ?? verification.claim_type,
@@ -172,6 +194,47 @@ export function buildReadyManifest(task, authorResult, verification, missionId) 
   return manifest;
 }
 
+export function normalizeAuthorEvidence(authored) {
+  const checksNotRun = authored?.checks_not_run;
+  const limitations = authored?.limitations;
+  if (!Array.isArray(checksNotRun)) throw new Error('author checks_not_run must be an array');
+  if (!Array.isArray(limitations)) throw new Error('author limitations must be an array');
+  const normalizedChecks = checksNotRun.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+        typeof entry.check !== 'string' || !entry.check.trim() || /[\r\n]/u.test(entry.check) ||
+        typeof entry.reason !== 'string' || !entry.reason.trim() || /[\r\n]/u.test(entry.reason)) {
+      throw new Error('author checks_not_run entries require nonblank single-line check and reason strings');
+    }
+    return {check: entry.check.trim(), reason: entry.reason.trim()};
+  });
+  const normalizedLimitations = limitations.map((entry) => {
+    if (typeof entry !== 'string' || !entry.trim() || /[\r\n]/u.test(entry)) {
+      throw new Error('author limitations entries must be nonblank single-line strings');
+    }
+    return entry.trim();
+  });
+  const lines = String(authored?.pr_body ?? '').split(/\r?\n/u).map((line) => line.trim());
+  for (const {check} of normalizedChecks) {
+    const normalizedCheck = check.toLowerCase().replace(/\s+/gu, ' ');
+    if (lines.some((line) => {
+      const item = line.match(/^(?:[-*+]|\d+[.)])\s+\[\s*([xX ])\s*\]\s+(.+)$/u);
+      if (!item || item[1].toLowerCase() !== 'x') return false;
+      const text = item[2]
+        .replace(/\[([^\]]+)\]\([^)]+\)/gu, '$1')
+        .replace(/<[^>]*>/gu, '')
+        .replace(/[*_`~]/gu, '')
+        .trim()
+        .toLowerCase()
+        .replace(/[.!?,;:]+$/gu, '')
+        .replace(/\s+/gu, ' ');
+      if (!text.startsWith(normalizedCheck)) return false;
+      const boundary = text[normalizedCheck.length];
+      return boundary === undefined || /[^\p{L}\p{N}_]/u.test(boundary);
+    })) throw new Error(`PR body contradicts unrun check: ${check}`);
+  }
+  return {checks_not_run: normalizedChecks, limitations: normalizedLimitations};
+}
+
 function assertAuthorResult(authored) {
   if (!authored || typeof authored !== 'object') throw new Error('author returned no result');
   if (typeof authored.pr_title !== 'string' || !authored.pr_title.trim()) throw new Error('author omitted PR title');
@@ -187,6 +250,7 @@ function assertAuthorResult(authored) {
   if (forbidden.some((pattern) => pattern.test(body))) {
     throw new Error('PR text contains a prohibited overclaim');
   }
+  normalizeAuthorEvidence(authored);
 }
 
 function assertVerification(verification) {

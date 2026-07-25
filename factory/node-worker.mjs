@@ -62,6 +62,7 @@ export const AUTHOR_SCHEMA = Object.freeze({
   required: [
     'outcome', 'reason', 'pr_title', 'pr_body', 'summary', 'claim_type',
     'test_command', 'test_only_paths', 'base_failure_contains', 'checks',
+    'checks_not_run', 'limitations',
   ],
   properties: {
     outcome: {type: 'string', enum: ['PATCH', 'SKIP']},
@@ -74,6 +75,19 @@ export const AUTHOR_SCHEMA = Object.freeze({
     test_only_paths: {type: 'array', items: {type: 'string'}},
     base_failure_contains: {type: 'string'},
     checks: {type: 'array', items: {type: 'string'}},
+    checks_not_run: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['check', 'reason'],
+        properties: {
+          check: {type: 'string', minLength: 1},
+          reason: {type: 'string', minLength: 1},
+        },
+      },
+    },
+    limitations: {type: 'array', items: {type: 'string', minLength: 1}},
   },
 });
 
@@ -644,7 +658,10 @@ where requested, leave any unrun manual QA or UAT check unchecked, and do not in
 API-contract classification. The host clean verifier runs test_command after authoring and creates
 READY only when it passes. Mark checklist items for the exact automated required_checks as checked,
 but never say the command or one of its components was unrun, blocked, or unavailable because of
-limitations in this author sandbox. Report manual checks separately and leave them unchecked.
+limitations in this author sandbox. Report every unrun manual check in checks_not_run with its
+reason and summarize material verification limits in limitations. Never mark or describe an unrun
+check as passed, completed, verified, or successful. The factory appends the canonical unchecked
+manual-evidence section and the exact clean-verifier pass result.
 Accurately list the exact complete command in the PR body. If an honest, bounded patch is not
 possible, return SKIP. Write a factual PR title/body without claiming maintainer
 approval, production readiness, guaranteed correctness, or that checks beyond the reported commands
