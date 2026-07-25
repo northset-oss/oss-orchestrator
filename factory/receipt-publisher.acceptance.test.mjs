@@ -153,6 +153,29 @@ function recordingRunner(calls) {
   };
 }
 
+function concludedCi(state, observedAt) {
+  return {
+    state,
+    observed_at: observedAt,
+    required_runs: [{
+      name: 'required-test',
+      required: true,
+      status: 'COMPLETED',
+      conclusion: state,
+      started_at: '2026-07-19T12:01:00.000Z',
+      completed_at: '2026-07-19T12:03:00.000Z',
+    }],
+  };
+}
+
+function replaceClaim(entry, statement) {
+  const claim = {type: 'regression_fix', statement};
+  entry.receipt_claim = claim;
+  entry.manifest.receipt_claim = claim;
+  entry.manifest.proof.claim = claim;
+  return entry;
+}
+
 async function remoteBytes(bare, relativePath) {
   const result = await runBounded('git', ['--git-dir', bare, 'show', `receipts:${relativePath}`], {
     timeoutMs: 30_000, maxOutputBytes: 1024 * 1024,
@@ -355,7 +378,7 @@ test('stale rebases append a new commit-specific proof and approval digest is ma
   assert.equal(await git(['--git-dir', bare, 'rev-list', '--count', 'receipts']), '2');
 });
 
-test('receipt status reconciliation uses one non-force batch push, exact readback, and leaves proofs immutable', async (t) => {
+test('concluded receipt status publishes while an unknown CI field is omitted', async (t) => {
   const {root, bare} = await bareRepository(t);
   const first = item('M-1000', 'b');
   const second = item('M-1001', 'c');
@@ -382,9 +405,14 @@ test('receipt status reconciliation uses one non-force batch push, exact readbac
     pr_url: `https://github.com/upstream/project/pull/${100 + index}`,
     pr_state: index === 0 ? 'OPEN' : 'MERGED',
     merged: index === 1,
+    current_pr_state: index === 0 ? 'OPEN' : 'MERGED',
+    current_merged: index === 1,
     pr_head_oid: entry.commit_oid,
     merge_commit_oid: index === 1 ? 'd'.repeat(40) : null,
-    ci_state: 'SUCCESS',
+    ci_state: index === 0 ? 'SUCCESS' : null,
+    ...(index === 0 ? {
+      ci_observation: concludedCi('SUCCESS', '2026-07-19T12:04:00.000Z'),
+    } : {}),
     attestation_state: index === 0 ? 'ATTESTATION_PENDING' : 'RECEIPT_ATTESTED',
     attestation_url: index === 0 ? null : 'https://github.com/northset-oss/verification-pilot/attestations/1',
     observed_at: '2026-07-19T12:04:00.000Z',
@@ -407,7 +435,8 @@ test('receipt status reconciliation uses one non-force batch push, exact readbac
     assert.equal(status.pr_number, 100 + index);
     assert.equal(status.pr_state, index === 0 ? 'OPEN' : 'MERGED');
     assert.equal(status.merged, index === 1);
-    assert.equal(status.ci_state, 'SUCCESS');
+    if (index === 0) assert.equal(status.ci_state, 'SUCCESS');
+    else assert.equal(Object.hasOwn(status, 'ci_state'), false);
     assert.equal(status.attestation_state,
       index === 0 ? 'ATTESTATION_PENDING' : 'RECEIPT_ATTESTED');
     assert.equal(published[entry.mission_id].status_url,
@@ -420,7 +449,12 @@ test('receipt status reconciliation uses one non-force batch push, exact readbac
   assert.equal(calls.filter((call) => call.args.includes('push')).length, 1);
 
   const updatedStatuses = statuses.map((status) => status.mission_id === 'M-1000' ? {
-    ...status, pr_state: 'CLOSED', ci_state: 'FAILURE', observed_at: '2026-07-19T12:06:00.000Z',
+    ...status,
+    pr_state: 'CLOSED',
+    current_pr_state: 'CLOSED',
+    ci_state: 'FAILURE',
+    ci_observation: concludedCi('FAILURE', '2026-07-19T12:06:00.000Z'),
+    observed_at: '2026-07-19T12:06:00.000Z',
   } : status);
   const updated = await statusPublisher(updatedStatuses);
   assert.notEqual(updated['M-1000'].status_commit_oid, published['M-1000'].status_commit_oid);
@@ -435,6 +469,76 @@ test('receipt status reconciliation uses one non-force batch push, exact readbac
   assert.equal(await git(['--git-dir', bare, 'rev-list', '--count', 'receipts']), '3');
 });
 
+test('doc-kit CI success observed before required workflows concluded is refused before Git', async () => {
+  const calls = [];
+  const statusPublisher = createReceiptStatusPublisher({run: recordingRunner(calls)});
+  await assert.rejects(() => statusPublisher([{
+    mission_id: 'M-1000',
+    commit_oid: oid('b'),
+    pr_number: 901,
+    receipt_url: receiptUrlFor('M-1000', oid('b')),
+    pr_url: 'https://github.com/nodejs/doc-kit/pull/901',
+    pr_state: 'OPEN',
+    merged: false,
+    current_pr_state: 'OPEN',
+    current_merged: false,
+    ci_state: 'SUCCESS',
+    ci_observation: {
+      state: 'SUCCESS',
+      observed_at: '2026-07-19T21:55:58.000Z',
+      required_runs: [{
+        name: 'required Node.js workflows',
+        required: true,
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+        started_at: '2026-07-21T23:35:00.000Z',
+        completed_at: '2026-07-21T23:45:00.000Z',
+      }],
+    },
+    attestation_state: 'RECEIPT_ATTESTED',
+    attestation_url: 'https://github.com/northset-oss/verification-pilot/attestations/1',
+    observed_at: '2026-07-19T21:55:58.000Z',
+  }]), /required runs had not concluded when the status was observed/);
+  assert.equal(calls.length, 0);
+});
+
+test('receipt proof refuses external agreement or endorsement wording before Git', async () => {
+  const calls = [];
+  const publisher = createReceiptPublisher({run: recordingRunner(calls)});
+  const entry = replaceClaim(item('M-1000', 'b'), 'Upstream CI agreed with the receipt.');
+  await assert.rejects(() => publisher([entry]), /external agreement or endorsement language/);
+  assert.equal(calls.length, 0);
+});
+
+test('receipt status refuses a pr_state that contradicts the currently known state before Git', async () => {
+  const calls = [];
+  const statusPublisher = createReceiptStatusPublisher({run: recordingRunner(calls)});
+  await assert.rejects(() => statusPublisher([{
+    mission_id: 'M-1000',
+    commit_oid: oid('b'),
+    pr_number: 100,
+    receipt_url: receiptUrlFor('M-1000', oid('b')),
+    pr_url: 'https://github.com/upstream/project/pull/100',
+    pr_state: 'OPEN',
+    merged: false,
+    current_pr_state: 'CLOSED',
+    current_merged: false,
+    ci_state: null,
+    attestation_state: 'ATTESTATION_PENDING',
+    attestation_url: null,
+    observed_at: '2026-07-19T12:04:00.000Z',
+  }]), /pr_state contradicts the currently known PR state/);
+  assert.equal(calls.length, 0);
+});
+
+test('receipt proof refuses a repository-targeted call to action before Git', async () => {
+  const calls = [];
+  const publisher = createReceiptPublisher({run: recordingRunner(calls)});
+  const entry = replaceClaim(item('M-1000', 'b'), 'Maintain upstream/project? Contact us to request a run.');
+  await assert.rejects(() => publisher([entry]), /repository-targeted call to action/);
+  assert.equal(calls.length, 0);
+});
+
 test('receipt status refuses to publish without its immutable proof', async (t) => {
   const {root, bare} = await bareRepository(t);
   await createReceiptPublisher({remoteUrl: bare, tempRoot: root})([item('M-1001', 'c')]);
@@ -446,7 +550,8 @@ test('receipt status refuses to publish without its immutable proof', async (t) 
     mission_id: 'M-1000', commit_oid: oid('b'), pr_number: 100,
     receipt_url: receiptUrlFor('M-1000', oid('b')),
     pr_url: 'https://github.com/upstream/project/pull/100', pr_state: 'OPEN',
-    merged: false, ci_state: null, attestation_state: 'ATTESTATION_PENDING',
+    merged: false, current_pr_state: 'OPEN', current_merged: false,
+    ci_state: null, attestation_state: 'ATTESTATION_PENDING',
     attestation_url: null, observed_at: '2026-07-19T12:04:00.000Z',
   }]), (error) => error.code === 'RECEIPT_STATUS_WITHOUT_PROOF');
   assert.equal(calls.filter((call) => call.args.includes('push')).length, 0);

@@ -3,7 +3,10 @@ import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {assertPublicationManifest} from './publication-policy.mjs';
+import {
+  assertPublicationBoundaryInvariant,
+  assertPublicationManifest,
+} from './publication-policy.mjs';
 
 const RECEIPTS_BRANCH = 'receipts';
 const DEFAULT_REMOTE_URL = 'https://github.com/northset-oss/verification-pilot.git';
@@ -286,6 +289,11 @@ function proofFor(item) {
   };
   assertJson(proof, `${missionId} proof`);
   assertV2ProofEvidence(proof, missionId);
+  assertPublicationBoundaryInvariant(proof, {
+    currentPrState: item.current_pr_state,
+    currentMerged: item.current_merged,
+    externalStatusEvidence: item.external_status_evidence,
+  });
   const bytes = Buffer.from(`${canonical(proof)}\n`, 'utf8');
   return {missionId, commitOid, approvalDigest, proof, bytes, proofSha256: digest(bytes)};
 }
@@ -661,12 +669,21 @@ function statusFor(item) {
     pr_number: prNumber,
     pr_state: item.pr_state,
     merged,
-    ci_state: ciState,
+    ...(ciState === null ? {} : {ci_state: ciState}),
     attestation_state: item.attestation_state,
     attestation_url: attestationUrl,
     observed_at: item.observed_at,
   };
   assertJson(status, `${missionId} publication status`);
+  assertPublicationBoundaryInvariant(status, {
+    currentPrState: item.current_pr_state,
+    currentMerged: item.current_merged,
+    externalStatusEvidence: {
+      ...item.external_status_evidence,
+      ...(item.ci_observation === undefined ? {} : {ci: item.ci_observation}),
+    },
+    observedAt: item.observed_at,
+  });
   return {missionId, commitOid, status, bytes: Buffer.from(`${canonical(status)}\n`, 'utf8')};
 }
 

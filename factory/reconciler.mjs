@@ -189,8 +189,9 @@ async function saveFailure(db, missionId, code, error, now) {
   }, {now});
 }
 
-function statusItem(publication, observed, mergeCommitOid = null) {
+function statusItem(publication, observed, mergeCommitOid = null, commitStatus = null) {
   const commitOid = publication.pushed_oid ?? publication.pr_head_oid;
+  const hasConclusiveRecord = Array.isArray(commitStatus?.required_runs);
   return {
     mission_id: publication.mission_id,
     commit_oid: commitOid,
@@ -201,7 +202,14 @@ function statusItem(publication, observed, mergeCommitOid = null) {
     pr_url: publication.pr_url,
     pr_state: publication.pr_state,
     merged: publication.merged === true,
-    ci_state: publication.ci_state ?? null,
+    current_pr_state: publication.pr_state,
+    current_merged: publication.merged === true,
+    ci_state: hasConclusiveRecord ? publication.ci_state ?? null : null,
+    ...(hasConclusiveRecord ? {ci_observation: {
+      state: commitStatus.state,
+      observed_at: commitStatus.observed_at ?? observed,
+      required_runs: commitStatus.required_runs,
+    }} : {}),
     attestation_state: publication.attestation_state,
     attestation_url: publication.attestation_url ?? null,
     observed_at: observed,
@@ -457,7 +465,11 @@ export async function reconcilePublicationBatch({
 
       const factsChanged = statusFacts(publicationBefore) !== statusFacts(publication);
       if (publicationBefore.status_state !== 'PUBLISHED' || factsChanged) {
-        pendingStatuses.push({missionId, observed, item: statusItem(publication, observed, mergeCommitOid)});
+        pendingStatuses.push({
+          missionId,
+          observed,
+          item: statusItem(publication, observed, mergeCommitOid, commitStatus),
+        });
       }
       results.push({
         mission_id: missionId,

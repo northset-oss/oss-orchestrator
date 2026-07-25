@@ -15,6 +15,191 @@ const EXTERNAL_ENDORSEMENT =
   /\b(?:upstream(?:\s+CI)?|CI|continuous integration|maintainers?|reviewers?|the project|project checks?)\b[^.\n]{0,100}\b(?:agreed|disagreed|validated|endorsed|confirmed|ratified|approved)\b/iu;
 const REVERSE_EXTERNAL_ENDORSEMENT =
   /\b(?:agreed|disagreed|validated|endorsed|confirmed|ratified|approved)\b[^.\n]{0,100}\b(?:by|with)\s+(?:upstream(?:\s+CI)?|CI|continuous integration|maintainers?|reviewers?|the project|project checks?)\b/iu;
+const REPOSITORY_MAINTAIN_CTA =
+  /\bmaintain\s+[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\?/iu;
+const REPOSITORY_CTA_WORDS =
+  String.raw`\b(?:maintain|contact|email|request|offer|pitch|install|try|get started|learn more)\b`;
+// A PR body legitimately names its own target repository beside ordinary technical
+// verbs ("clone owner/repo and run npm install"). Solicitation there is already
+// covered by the contact/email/CTA patterns below, so the proximity check keeps
+// only the verbs that solicit rather than instruct.
+const PR_BODY_CTA_WORDS =
+  String.raw`\b(?:maintain|pitch|get started|learn more|sign up)\b`;
+const EXTERNAL_STATUS_FIELD = /^(ci|check|review)_(?:state|status|conclusion)$/u;
+const EXTERNAL_STATUS_TEXT =
+  /\b(upstream(?:\s+(?:CI|checks?))?|CI|continuous integration|project checks?|maintainer reviews?|reviewers?)\b[^.\n]{0,60}\b(SUCCESS|SUCCESSFUL|FAILURE|FAILED|PASSED|APPROVED|CHANGES_REQUESTED|DISMISSED|PENDING|UNKNOWN)\b/giu;
+const SUCCESS_CONCLUSIONS = new Set(['NEUTRAL', 'SKIPPED', 'SUCCESS']);
+const FAILURE_CONCLUSIONS = new Set([
+  'ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'STALE', 'STARTUP_FAILURE', 'TIMED_OUT',
+]);
+
+function externalState(value) {
+  const state = String(value ?? '').trim().toUpperCase().replaceAll(' ', '_');
+  if (['PASSED', 'SUCCESSFUL'].includes(state)) return 'SUCCESS';
+  if (['FAILED', 'ERROR'].includes(state)) return 'FAILURE';
+  return state;
+}
+
+function statusSubject(value) {
+  const subject = String(value).toLowerCase();
+  if (subject.includes('review')) return 'review';
+  if (subject.includes('check')) return 'check';
+  return 'ci';
+}
+
+function visitArtifact(value, visitor) {
+  if (typeof value === 'string') {
+    visitor(null, value);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const child of value) visitArtifact(child, visitor);
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    visitor(key, child);
+    visitArtifact(child, visitor);
+  }
+}
+
+function escaped(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+function repositoryTargetedCta(text, repositories, words = REPOSITORY_CTA_WORDS) {
+  return [...repositories].some((repository) => {
+    const target = escaped(repository);
+    return new RegExp(
+      `(?:${words}[^.\\n]{0,120}\\b${target}\\b|\\b${target}\\b[^.\\n]{0,120}${words})`,
+      'iu',
+    ).test(text);
+  });
+}
+
+function assertConcludedRuns(subject, claimedState, observation, observedAt) {
+  if (!observation || typeof observation !== 'object' || Array.isArray(observation)) {
+    throw new Error(`${subject} conclusion has no stored observation`);
+  }
+  const observationState = externalState(observation.state);
+  if (observationState !== claimedState) {
+    throw new Error(`${subject} conclusion contradicts its stored observation`);
+  }
+  if (!Number.isFinite(Date.parse(observation.observed_at)) ||
+      (observedAt !== null && observation.observed_at !== observedAt)) {
+    throw new Error(`${subject} conclusion is not bound to the publication observation time`);
+  }
+  const runs = observation.required_runs;
+  if (!Array.isArray(runs) || runs.length === 0) {
+    throw new Error(`${subject} conclusion does not prove any required runs`);
+  }
+  let failed = false;
+  for (const run of runs) {
+    if (!run || typeof run !== 'object' || Array.isArray(run) || run.required !== true ||
+        typeof run.name !== 'string' || !run.name.trim() ||
+        String(run.status ?? '').toUpperCase() !== 'COMPLETED') {
+      throw new Error(`${subject} conclusion includes an unproved or unfinished required run`);
+    }
+    const conclusion = externalState(run.conclusion);
+    if (!SUCCESS_CONCLUSIONS.has(conclusion) && !FAILURE_CONCLUSIONS.has(conclusion)) {
+      throw new Error(`${subject} conclusion includes a nonconclusive required run`);
+    }
+    const completed = Date.parse(run.completed_at);
+    const observed = Date.parse(observation.observed_at);
+    if (!Number.isFinite(completed) || completed > observed) {
+      throw new Error(`${subject} required runs had not concluded when the status was observed`);
+    }
+    if (run.started_at !== undefined &&
+        (!Number.isFinite(Date.parse(run.started_at)) ||
+         Date.parse(run.started_at) > completed)) {
+      throw new Error(`${subject} required run timestamps are inconsistent`);
+    }
+    failed ||= FAILURE_CONCLUSIONS.has(conclusion);
+  }
+  if (claimedState !== (failed ? 'FAILURE' : 'SUCCESS')) {
+    throw new Error(`${subject} conclusion does not match its required runs`);
+  }
+}
+
+function assertConcludedReview(claimedState, observation, observedAt) {
+  if (!observation || typeof observation !== 'object' || Array.isArray(observation) ||
+      externalState(observation.state) !== claimedState ||
+      !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(claimedState) ||
+      !Number.isFinite(Date.parse(observation.concluded_at)) ||
+      !Number.isFinite(Date.parse(observation.observed_at)) ||
+      Date.parse(observation.concluded_at) > Date.parse(observation.observed_at) ||
+      (observedAt !== null && observation.observed_at !== observedAt)) {
+    throw new Error('review conclusion is not proven concluded by its stored observation');
+  }
+}
+
+/**
+ * Final fail-closed policy check for exact public proof and status artifacts.
+ * Supporting observations are intentionally not rendered into the artifact.
+ */
+export function assertPublicationBoundaryInvariant(artifact, {
+  currentPrState = null,
+  currentMerged,
+  externalStatusEvidence = {},
+  observedAt = null,
+} = {}) {
+  const externalClaims = [];
+  const prStates = [];
+  const publicText = [];
+  const repositories = new Set();
+  visitArtifact(artifact, (key, value) => {
+    if (typeof value === 'string') {
+      publicText.push(value);
+      if (EXTERNAL_ENDORSEMENT.test(value) || REVERSE_EXTERNAL_ENDORSEMENT.test(value)) {
+        throw new Error('publication artifact contains external agreement or endorsement language');
+      }
+      if (REPOSITORY_MAINTAIN_CTA.test(value)) {
+        throw new Error('publication artifact contains a repository-targeted call to action');
+      }
+      for (const match of value.matchAll(EXTERNAL_STATUS_TEXT)) {
+        externalClaims.push({subject: statusSubject(match[1]), state: externalState(match[2])});
+      }
+    }
+    if (key === 'repository' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(String(value ?? ''))) {
+      repositories.add(value);
+    }
+    const statusMatch = EXTERNAL_STATUS_FIELD.exec(String(key ?? ''));
+    if (statusMatch && value !== null && value !== undefined) {
+      externalClaims.push({subject: statusMatch[1], state: externalState(value)});
+    }
+    if (key === 'pr_state' && value !== null && value !== undefined) {
+      prStates.push(externalState(value));
+    }
+  });
+  if (publicText.some((text) => repositoryTargetedCta(text, repositories))) {
+    throw new Error('publication artifact contains a repository-targeted call to action');
+  }
+
+  for (const {subject, state} of externalClaims) {
+    if (subject === 'review') {
+      assertConcludedReview(state, externalStatusEvidence.review, observedAt);
+    } else {
+      if (!['SUCCESS', 'FAILURE'].includes(state)) {
+        throw new Error(`${subject} status is not a concluded external outcome`);
+      }
+      assertConcludedRuns(subject, state, externalStatusEvidence[subject], observedAt);
+    }
+  }
+
+  if (prStates.length) {
+    const knownState = externalState(currentPrState);
+    if (!['OPEN', 'CLOSED', 'MERGED'].includes(knownState) ||
+        prStates.some((state) => state !== knownState)) {
+      throw new Error('publication artifact pr_state contradicts the currently known PR state');
+    }
+    if (typeof currentMerged !== 'boolean' ||
+        currentMerged !== (knownState === 'MERGED') ||
+        (typeof artifact?.merged === 'boolean' && artifact.merged !== currentMerged)) {
+      throw new Error('publication artifact pr_state is inconsistent with its merged flag');
+    }
+  }
+  return true;
+}
 
 function assertContributionOnlyBody(body, manifest) {
   let contributionBody = body.replace(PROMOTION_FREE_DISCLOSURE, '');
@@ -41,11 +226,12 @@ function assertContributionOnlyBody(body, manifest) {
     /\b(?:sample|demo)\s+receipt\b/iu,
     /\bpre-?filled\s+(?:email|request)\b/iu,
     /\b(?:learn more|contact us|email us|get started|sign up|install Northset)\b/iu,
-    /\bmaintain\s+[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\?/iu,
+    REPOSITORY_MAINTAIN_CTA,
     EXTERNAL_ENDORSEMENT,
     REVERSE_EXTERNAL_ENDORSEMENT,
   ];
-  if (forbidden.some((pattern) => pattern.test(contributionBody))) {
+  if (forbidden.some((pattern) => pattern.test(contributionBody)) ||
+      repositoryTargetedCta(contributionBody, [manifest.repository], PR_BODY_CTA_WORDS)) {
     throw new Error('PR body must remain contribution-only without product, CTA, or endorsement claims');
   }
 }
@@ -175,7 +361,7 @@ export function assertPublicationManifest(manifest, {allowLegacySubmitted = fals
     /<!--\s*northset-receipt:/iu,
     /reviewed by Northset/iu,
     /checkable (?:in .* )?without trusting us/iu,
-    /maintain [A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\?/iu,
+    REPOSITORY_MAINTAIN_CTA,
     /mailto:|oss@northset\.ai/iu,
     /northset-verify/iu,
     /upstream CI agreed/iu,
