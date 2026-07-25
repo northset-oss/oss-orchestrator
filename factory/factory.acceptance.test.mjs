@@ -453,6 +453,133 @@ test('PR text cannot deny that its exact clean verifier command ran and passed',
     },
   }), /PR body says the clean verifier command did not run/);
 
+  assert.throws(() => assertPublicVerificationClaims({
+    pr_body: [
+      '## Testing',
+      'The command and manual VoiceOver testing were not run because the sandbox blocked npm.',
+      '- [ ] `npm test` passes',
+      '- [ ] `npm run typecheck` passes',
+    ].join('\n'),
+  }, {
+    patched_observation: {
+      command: 'npm test -- --runTestsByPath nav.test.tsx && npm test && npm run typecheck',
+      result: 'PASS',
+      exit_code: 0,
+    },
+  }), /PR body says the clean verifier command did not run/);
+
+  assert.throws(() => assertPublicVerificationClaims({
+    pr_body: [
+      '## Testing',
+      'The exact command passed in the clean verifier.',
+      '- [ ] `npm test` passes',
+      '- [x] `npm run typecheck` passes',
+    ].join('\n'),
+  }, {
+    patched_observation: {
+      command: 'npm test -- --runTestsByPath nav.test.tsx && npm test && npm run typecheck',
+      result: 'PASS',
+      exit_code: 0,
+    },
+  }), /leaves a clean-verifier command unchecked/);
+
+  for (const prBody of [
+    '## Testing\nThe command did not complete.',
+    '## Testing\nThe command did not pass.',
+    '## Testing\nThe command did not succeed.',
+    '## Testing\nThe command did not run tests.',
+    '## Testing\nThe command did not run browser tests.',
+    '## Testing\nCould not complete the command.',
+    '## Testing\nThe command timed out.',
+    '## Testing\nCommand was not run.',
+    '## Testing\nTest command did not run.',
+    '## Testing\nVerification command was not run.',
+    '## Testing\nRequired command could not complete.',
+  ]) {
+    assert.throws(() => assertPublicVerificationClaims({
+      pr_body: prBody,
+    }, {
+      patched_observation: {
+        command: 'npm test && npm run typecheck',
+        result: 'PASS',
+        exit_code: 0,
+      },
+    }), /PR body says the clean verifier command did not run/);
+  }
+
+  for (const prBody of [
+    '## Testing\nThe command passed. It did not run manual VoiceOver checks; those remain unchecked.',
+    '## Testing\nThe command passed.\n- [ ] Verify Windows behavior after running `npm test`.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes on Windows.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes in CI.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes with Node 20.',
+    '## Testing\nThe command passed.\n- [ ] Tests pass (`npm test`) against PostgreSQL.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes in Windows.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes in GitHub Actions.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes on Ubuntu.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes with npm 10.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes against MongoDB.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes on Chrome.',
+    '## Testing\nThe command passed.\n- [ ] In GitHub Actions, `npm test` passes.',
+    '## Testing\nThe command passed.\n- [ ] On Ubuntu, `npm test` passes.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes for Node 20.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes inside Docker.',
+    '## Testing\nThe command passed.\n- [ ] `npm test` passes within the CI container.',
+    '## Testing\nThe command passed.\n- [ ] npm test:e2e passes.',
+    '## Testing\nThe command-line parser now preserves failed checks for reporting.',
+    '## Testing\nThe command handler returns unavailable when the input file is missing.',
+    '## Testing\nThe `command` property records failed child processes.',
+    '## Testing\nThe command and failed-input tests were added.',
+    '## Testing\nThe command and its failed output were stored for inspection.',
+    '## Testing\nThe command and unavailable-file cases were covered.',
+    '## Testing\nThe command failed before the fix but now passes.',
+    '## Testing\nThe command timed out on the first attempt, then passed.',
+    '## Testing\n- [x] `npm test`\n- [x] `npm run typecheck`\n- [ ] Manual QA was not run',
+    '## Testing\nExact command: `npm test && npm run typecheck`\n- [ ] Optional browser checks unavailable',
+  ]) {
+    assert.doesNotThrow(() => assertPublicVerificationClaims({
+      pr_body: prBody,
+    }, {
+      patched_observation: {
+        command: 'npm test && npm run typecheck',
+        result: 'PASS',
+        exit_code: 0,
+      },
+    }));
+  }
+
+  for (const checklist of [
+    '- [ ] `npm test` passes locally.',
+    '- [ ] `npm test` passed successfully.',
+    '- [ ] Tests pass (`npm test`).',
+    '- [ ] npm test and npm run typecheck pass.',
+    '- [ ] Please ensure `npm test` passes.',
+    '- [ ] Verify tests pass (`npm test`).',
+    '- [ ] `npm test` passes before submitting.',
+    '- [ ] Run `npm test` successfully.',
+    '- [ ] `npm test` passes for this PR.',
+    '- [ ] `npm test` passes with no failures.',
+    '- [ ] `npm test` passes on completion.',
+    '- [ ] `npm test` passes using the command above.',
+    '- [ ] `npm test` passes inside the verifier.',
+    '- [ ] `npm test` passes and optional manual QA completes.',
+    '- [ ] `npm test` passes on Windows and `npm run typecheck` passes.',
+    '- [ ] `npm test` passes with zero failures.',
+    '- [ ] `npm test` passes under normal conditions.',
+    '- [ ] `npm test` passes on Windows or `npm run typecheck` passes.',
+    '- [ ] Optional docs validation alongside `npm test` passes.',
+  ]) {
+    assert.throws(() => assertPublicVerificationClaims({
+      pr_body: `## Testing\nThe command passed.\n${checklist}`,
+    }, {
+      patched_observation: {
+        command: 'npm test && npm run typecheck',
+        result: 'PASS',
+        exit_code: 0,
+      },
+    }), /leaves a clean-verifier command unchecked/);
+  }
+
   for (const prBody of [
     '## Testing\nFull command attempted but blocked because dependencies were unavailable.',
     '## Testing\nThe complete command could not execute locally. Syntax checks passed.',
@@ -467,6 +594,25 @@ test('PR text cannot deny that its exact clean verifier command ran and passed',
     '## Testing\nThe full verification command could not run.',
     '## Testing\nThe complete command could not be executed.',
     '## Testing\nThe command was not run in full.',
+    '## Testing\nThe command itself did not run.',
+    '## Testing\nThe command still did not run.',
+    '## Testing\nThe command was never run.',
+    '## Testing\nCould not run this command.',
+    '## Testing\nCould not run that command.',
+    '## Testing\nUnable to run the command.',
+    '## Testing\nThe command did not run, while earlier lint failed but now passes.',
+    '## Testing\nThe command also did not run.',
+    '## Testing\nThe command was skipped.',
+    '## Testing\nThe command was unavailable.',
+    '## Testing\nThe command was blocked.',
+    "## Testing\nThe command hasn't run.",
+    '## Testing\nThe command was not able to run.',
+    '## Testing\nThe command cannot run in this sandbox.',
+    "## Testing\nThe command can't be run here.",
+    '## Testing\nThe command does not run in this sandbox.',
+    '## Testing\nThe command is unavailable in this sandbox.',
+    '## Testing\nThe command was\nnot run because the sandbox blocked it.',
+    '## Testing\nThe exact command\nwas unavailable in the sandbox.',
   ]) {
     assert.throws(() => assertPublicVerificationClaims({
       pr_body: prBody,

@@ -345,7 +345,9 @@ test('N1c author must bind every required repository check into the verifier com
   assert.match(invocation.prompt, /pr_title becomes the canonical commit subject/);
   assert.match(invocation.prompt, /read and follow any existing repository pull-request template/);
   assert.match(invocation.prompt, /Preserve its required fields and checklist items/);
-  assert.match(invocation.prompt, /leave any unrun QA or UAT check unchecked/);
+  assert.match(invocation.prompt, /leave any unrun manual QA or UAT check unchecked/);
+  assert.match(invocation.prompt, /Mark checklist items for the exact automated required_checks as checked/);
+  assert.match(invocation.prompt, /never say the command or one of its components was unrun/);
   assert.match(invocation.prompt, /do not invent evidence or an\s+API-contract classification/);
   assert.match(invocation.prompt, /exact\s+command the clean verifier and receipt will bind/);
   assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');

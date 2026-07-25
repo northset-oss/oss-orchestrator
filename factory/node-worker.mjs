@@ -635,9 +635,13 @@ command the clean verifier and receipt will bind. Follow repository-specific pul
 commit-subject conventions: pr_title becomes the canonical commit subject. Before writing pr_body,
 read and follow any existing repository pull-request template, including templates under .github.
 Preserve its required fields and checklist items. Fill them accurately for this patch, link the issue
-where requested, leave any unrun QA or UAT check unchecked, and do not invent evidence or an
-API-contract classification. Accurately list the exact complete command in the PR body. If an honest,
-bounded patch is not possible, return SKIP. Write a factual PR title/body without claiming maintainer
+where requested, leave any unrun manual QA or UAT check unchecked, and do not invent evidence or an
+API-contract classification. The host clean verifier runs test_command after authoring and creates
+READY only when it passes. Mark checklist items for the exact automated required_checks as checked,
+but never say the command or one of its components was unrun, blocked, or unavailable because of
+limitations in this author sandbox. Report manual checks separately and leave them unchecked.
+Accurately list the exact complete command in the PR body. If an honest, bounded patch is not
+possible, return SKIP. Write a factual PR title/body without claiming maintainer
 approval, production readiness, guaranteed correctness, or that checks beyond the reported commands
 passed. Keep the PR body contribution-only: do not mention or promote Northset, a product, ledger,
 receipt, verification service or offer, request-a-run flow, contact link, CTA, case study, or demo.

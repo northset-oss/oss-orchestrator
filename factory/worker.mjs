@@ -227,9 +227,9 @@ export function assertPublicVerificationClaims(authored, verification) {
   const verifiedTools = verifiedCommands.map((candidate) =>
     candidate.match(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*([^\s]+)/)?.[1]).filter(Boolean);
   const denial =
-    /\b(?:(?:could not|couldn't)\s+(?:be\s+)?(?:start(?:ed)?|run|execute(?:d)?)|(?:did not|didn't|was unable to|failed to)\s+(?:start|run|execute)|was not (?:run|executed|started)|wasn't (?:run|executed|started)|never (?:ran|executed|started)|not run|blocked|denied|unavailable|skipped|failed)\b/i;
+    /\b(?:(?:could not|couldn't|cannot|can't)\s+(?:be\s+)?(?:start(?:ed)?|run|execute(?:d)?|complete(?:d)?|finish(?:ed)?|pass|succeed)|(?:did not|didn't|does not|doesn't|was unable to|failed to)\s+(?:start|run|execute|complete|finish|pass|succeed)|(?:was|is) (?:(?:not|never) (?:run|executed|started|completed|finished|successful)|not able to (?:start|run|execute|complete|finish|pass|succeed)|unsuccessful|blocked|denied|unavailable|skipped|failed)|wasn't (?:run|executed|started|completed|finished|successful)|(?:(?:has|have) not|hasn't|haven't) (?:run|executed|started|completed|finished|passed|succeeded)|never (?:ran|executed|started|completed|finished|passed|succeeded)|not (?:run|completed|finished|successful)|timed out|errored|crashed|blocked|denied|unavailable|skipped|failed)\b/i;
   const reverseDenial =
-    /\b(?:(?:(?:could|did) not|couldn't|didn't|was unable to|failed to|blocked from)\s+(?:start|run|execute)|skipped|blocked|denied)\s+(?:the\s+)?$/i;
+    /\b(?:(?:(?:could|did) not|couldn't|didn't|was unable to|failed to|blocked from)\s+(?:start|run|execute|complete|finish|pass|succeed)|skipped|blocked|denied)\s+(?:the\s+)?$/i;
   const deniedLiteral = (candidate, literal, excludeProperty = false) => {
     let offset = 0;
     while (offset <= candidate.length - literal.length) {
@@ -249,6 +249,12 @@ export function assertPublicVerificationClaims(authored, verification) {
       const after = tail.match(denial);
       if (after) {
         const beforeDenial = tail.slice(0, after.index);
+        const recovery = tail.slice(after.index + after[0].length);
+        const deniesDifferentCheck =
+          /\b(?:run|execute|start)\b/i.test(after[0]) &&
+          /^\s+(?:manual|optional|uat|qa)\b[^.;\n]{0,60}\b(?:tests?|checks?)\b/i
+            .test(recovery);
+        if (deniesDifferentCheck) continue;
         const priorSuccess = [...beforeDenial.matchAll(
           /\b(?:passed|succeeded|exited\s+0|completed successfully)\b/ig,
         )].at(-1);
@@ -261,16 +267,9 @@ export function assertPublicVerificationClaims(authored, verification) {
             : between)
             .replace(/\b(?:previously|earlier|before|now|later)\b/ig, '')
             .replace(/[\s,()[\]`*_'-]+/g, '');
-          const recovery = tail.slice(after.index + after[0].length);
-          const deniesDifferentCheck =
-            /\b(?:run|execute|start)\b/i.test(after[0]) &&
-            /^\s+(?!(?:in|on|under|because|due|locally)\b)[^.;\n]{0,60}\b(?:tests?|checks?)\b/i
-              .test(recovery);
-          if ((!denialSubject || /^it$/i.test(denialSubject)) && deniesDifferentCheck) continue;
           if (denialSubject && !/^it$/i.test(denialSubject)) continue;
           return true;
         }
-        const recovery = tail.slice(after.index + after[0].length);
         const initialFailure = /\b(?:initially|at first|on the first attempt)\b/i
           .test(`${prefix} ${beforeDenial}`);
         const laterSuccess =
@@ -281,24 +280,117 @@ export function assertPublicVerificationClaims(authored, verification) {
     }
     return false;
   };
-  const wholeCommand = /\b(?:full|complete|entire|exact|same|above|following|declared)\s+(?:(?:test|verification)\s+)?command\b/i;
+  const wholeCommand =
+    /\b(?:full|complete|entire|exact|same|above|following|declared)\s+(?:(?:test|verification)\s+)?command\b/i;
+  const commandSubject =
+    /\b(?:(?:the|this|that)\s+|(?:test|verification|required|automated)\s+)?command\b[`*_]*/ig;
+  const directSubjectDenial = new RegExp(`^\\s+(?:(?:itself|still|also)\\s+)*${denial.source}`, 'i');
+  const coordinatedSubjectDenial =
+    /^\s+(?:and|along with)\b[^.;\n]{0,80}\s+(?:(?:was|were)\s+(?:not\s+(?:run|executed|started|completed|finished|successful)|unsuccessful|blocked|denied|unavailable|skipped|failed)|(?:wasn't|weren't)\s+(?:run|executed|started|completed|finished|successful)|(?:(?:did|could)\s+not|didn't|couldn't|was unable to|failed to)\s+(?:start|run|execute|complete|finish|pass|succeed)|never\s+(?:ran|executed|started|completed|finished|passed|succeeded))\b/i;
+  const sameCommandRecovery = (prefix, recovery) => {
+    const laterSuccess =
+      /^\s*[,;]?\s*(?:then|but(?:\s+now)?|now)\s+(?:it\s+)?(?:pass(?:es|ed)?|succeed(?:s|ed)?|exited\s+0|completed successfully)\b/i;
+    if (/\b(?:initially|at first)\s*,?\s*$/i.test(prefix) && laterSuccess.test(recovery)) return true;
+    const inlineHistory =
+      recovery.match(/^\s+(?:before the fix|on (?:the )?first attempt)\b/i);
+    return Boolean(inlineHistory && laterSuccess.test(recovery.slice(inlineHistory[0].length)));
+  };
+  const reverseCommandDenied =
+    /\b(?:(?:(?:could|did) not|couldn't|didn't|(?:was\s+)?unable to|failed to|blocked from)\s+(?:start|run|execute|complete|finish|pass|succeed)|skipped|blocked|denied)\s+(?:(?:the|this|that)\s+)?(?:(?:test|verification|required|automated)\s+)?command\b/i;
   const commandDeniedInFull =
     /\bcommand\b(?:(?![.;\n]).){0,60}\b(?:did not run|was not run|wasn't run|could not run|couldn't run)\b(?:(?![.;\n]).){0,30}\bin full\b/i;
   const deniesWholeCommand = (candidate) => {
-    if (commandDeniedInFull.test(candidate)) return true;
+    if (commandDeniedInFull.test(candidate) || reverseCommandDenied.test(candidate)) return true;
     const matches = candidate.matchAll(new RegExp(wholeCommand.source, 'ig'));
-    return [...matches].some((match) => deniedLiteral(candidate, match[0], true));
+    if ([...matches].some((match) => deniedLiteral(candidate, match[0], true))) return true;
+    return [...candidate.matchAll(commandSubject)].some((match) => {
+      const prefix = candidate.slice(0, match.index ?? 0);
+      if (/\b(?:full|complete|entire|exact|same|above|following|declared)\s+(?:(?:test|verification)\s+)?$/i
+        .test(prefix)) return false;
+      const tail = candidate.slice((match.index ?? 0) + match[0].length);
+      const denialMatch = tail.match(directSubjectDenial) ?? tail.match(coordinatedSubjectDenial);
+      if (!denialMatch) return false;
+      const recovery = tail.slice((denialMatch.index ?? 0) + denialMatch[0].length);
+      return !sameCommandRecovery(prefix, recovery);
+    });
   };
   const deniesFocusedCheck = (candidate) => [...candidate.matchAll(
     /\bfocused\b[^.\n]{0,120}\b(?:command|check|test(?:s|ing)?)\b/ig,
   )].some((match) => deniedLiteral(candidate, match[0]));
-  const line = String(authored?.pr_body ?? '').split(/\r?\n/)
+  const body = String(authored?.pr_body ?? '');
+  const bodyLines = body.split(/\r?\n/);
+  const proseParagraphs = [];
+  let proseBuffer = [];
+  const flushProse = () => {
+    if (proseBuffer.length) proseParagraphs.push(proseBuffer.join(' '));
+    proseBuffer = [];
+  };
+  for (const bodyLine of bodyLines) {
+    const trimmed = bodyLine.trim();
+    if (!trimmed) {
+      flushProse();
+    } else if (/^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```|~~~|>)/u.test(trimmed)) {
+      flushProse();
+      proseParagraphs.push(trimmed);
+    } else {
+      proseBuffer.push(trimmed);
+    }
+  }
+  flushProse();
+  const line = proseParagraphs
     .find((candidate) => deniesWholeCommand(candidate) ||
       deniesFocusedCheck(candidate) ||
       verifiedCommands.some((verifiedCommand) => deniedLiteral(candidate, verifiedCommand)) ||
       verifiedTools.some((tool) => deniedLiteral(candidate, `${tool} execution`)));
   if (line) {
     throw new Error('PR body says the clean verifier command did not run, but its patched observation passed');
+  }
+  const passAssertion =
+    /\b(?:pass(?:es|ed)?|succeed(?:s|ed)?|successful(?:ly)?|complete(?:d)?)\b/i;
+  const environmentScope =
+    /\b(?:in|on|under|with|against|using|via|for|inside|within)\s+(?:(?:the|a|an)\s+)?(?!(?:the|a|an|this|that|no|zero|normal|order|confidence|completion|command|verifier|pr|pull|current|same|above|below|reporting|submi(?:ssion|tting)|locally|local|machine|environment)\b)[A-Za-z0-9][A-Za-z0-9._-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._-]*)*/i;
+  const clauseBoundary = /[,;]|\b(?:and|or|alongside|while|but)\b/i;
+  const conjunctionBoundary = /;|\b(?:and|or|alongside|while|but)\b/i;
+  const hasBoundScope = (before, after) => {
+    const priorClause = before.split(conjunctionBoundary).at(-1) ?? '';
+    const followingClause = after.split(clauseBoundary)[0] ?? '';
+    const manualScope =
+      /\b(?:manual|optional|uat|qa)\b[^,;]{0,40}[`*()[\]\s-]*$/i.test(priorClause) ||
+      /^[`*()[\]\s-]*\b(?:manual|optional|uat|qa)\b/i.test(followingClause);
+    const prefixedEnvironment = [...priorClause.matchAll(
+      new RegExp(environmentScope.source, 'ig'),
+    )].some((match) => /^[\s,:`*()[\]-]*$/.test(
+      priorClause.slice((match.index ?? 0) + match[0].length),
+    ));
+    return manualScope || prefixedEnvironment || environmentScope.test(followingClause);
+  };
+  const unchecked = bodyLines.find((candidate) => {
+    if (!/^\s*[-*]\s+\[\s\]\s+/u.test(candidate)) return false;
+    const label = candidate.replace(/^\s*[-*]\s+\[\s\]\s+/u, '').trim();
+    const occurrences = [];
+    for (const verifiedCommand of [...new Set(verifiedCommands)]
+      .sort((left, right) => right.length - left.length)) {
+      const escaped = verifiedCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern =
+        new RegExp(`(^|[^A-Za-z0-9_:.-])(${escaped})(?=$|[^A-Za-z0-9_:.-])`, 'ig');
+      for (const match of label.matchAll(pattern)) {
+        const start = (match.index ?? 0) + match[1].length;
+        const end = start + verifiedCommand.length;
+        if (occurrences.some((entry) => start >= entry.start && end <= entry.end)) continue;
+        occurrences.push({start, end});
+      }
+    }
+    return occurrences.some(({start, end}) => {
+      const before = label.slice(0, start);
+      const after = label.slice(end);
+      const localBefore = before.split(clauseBoundary).at(-1) ?? '';
+      const localAfter = after.split(clauseBoundary)[0] ?? '';
+      if (!passAssertion.test(`${localBefore} ${localAfter}`)) return false;
+      return !hasBoundScope(before, after);
+    });
+  });
+  if (unchecked) {
+    throw new Error('PR body leaves a clean-verifier command unchecked after its patched observation passed');
   }
 }
 
