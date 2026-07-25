@@ -33,6 +33,7 @@ const INSTALL_TIMEOUT_MS = 15 * 60_000;
 const AUTHOR_TIMEOUT_MS = 10 * 60_000;
 const SCOUT_TIMEOUT_MS = 90_000;
 const VERIFY_TIMEOUT_MS = 10 * 60_000;
+const SELF_CLAIM_EVIDENCE_PATTERN = /\b(?:i(?:['’]m| am|['’]ll| will)?\s+(?:work(?:ing)?|tak(?:e|ing)|claim|implement|handl(?:e|ing))(?:\s+on)?\s+(?:this|it)|i(?:['’]d| would)\s+(?:like|love|be happy)\s+to\s+(?:(?:work|take)\s+(?:on\s+)?|claim|implement|investigate)(?:this(?:\s+one|\s+issue)?|it)?|(?:can\s+i|i\s+can)\s+work\s+on\s+(?:this|it)|could\s+i\s+be\s+assigned|(?:please\s+)?assign\s+(?:me|(?:this|it)(?:\s+issue)?\s+to\s+me))\b/i;
 
 export const SCOUT_SCHEMA = Object.freeze({
   type: 'object',
@@ -654,11 +655,21 @@ function assertScout(result, task = {}) {
   result.required_checks = [...new Set((result.required_checks ?? [])
     .map((check) => String(check).trim()).filter(Boolean))];
   const comments = Array.isArray(task.issue_snapshot?.comments) ? task.issue_snapshot.comments : [];
-  const evidencePresent = result.pre_work_evidence && comments.some((comment) => {
+  const normalizedEvidence = stripHtmlComments(result.pre_work_evidence)
+    .normalize('NFKC').replace(/[‘’]/g, "'").replace(/\s+/g, ' ').trim();
+  const qualifyingComment = normalizedEvidence && comments.find((comment) => {
     const author = typeof comment?.author === 'string' ? comment.author : comment?.author?.login;
+    const body = stripHtmlComments(comment?.body);
+    const normalizedBody = body.normalize('NFKC')
+      .replace(/[‘’]/g, "'").replace(/\s+/g, ' ').trim();
     return String(author ?? '').toLowerCase() === 'aysajane' &&
-      String(comment?.body ?? '').includes(result.pre_work_evidence);
+      SELF_CLAIM_EVIDENCE_PATTERN.test(normalizedEvidence) &&
+      normalizedBody.includes(normalizedEvidence);
   });
+  const evidencePresent = Boolean(qualifyingComment);
+  if (qualifyingComment) {
+    result.pre_work_evidence = stripHtmlComments(qualifyingComment.body).trim();
+  }
   if (result.decision === 'GO' && result.pre_work_rule && !evidencePresent) {
     result.decision = 'SKIP';
     result.reason = `required pre-work public communication was not completed: ${result.pre_work_rule}`;
