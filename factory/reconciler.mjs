@@ -77,28 +77,54 @@ function maintainerText(followUp) {
 export function reasonCodeFromFollowUp(followUp) {
   const text = maintainerText(followUp);
   if (!text) return 'unknown';
-  const ai = String.raw`(?:ai[- ]generated|artificial intelligence|llms?|chatgpt|claude|coding agents?)`;
+  const ai = String.raw`(?:ai(?:[- ](?:generated|assisted))?|generative ai|artificial intelligence|llms?|chatgpt|claude|coding agents?)`;
+  const strongPolicyObjection = new RegExp(
+    String.raw`\b${ai}\b[^.!?\n]{0,180}\b(?:ci policy|repository (?:policy|checks)|contribution policy)\b[^.!?\n]{0,100}\b(?:prohibit(?:s|ed)?|reject(?:s|ed)?|forbid(?:s|den)?|disallow(?:s|ed)?)\b`,
+    'i',
+  );
+  if (strongPolicyObjection.test(text)) return 'ai_policy_concern';
+  const policyText = text
+    .split(/\n|(?<=[.!?])\s+/u)
+    .filter((fragment) => {
+      const action = String.raw`(?:(?:cannot|can't|will not|won't)\s+|(?:do not|don't)\s+(?:want\s+to\s+)?)(?:accept|merge|take)`;
+      const quality = String.raw`(?:tests?|ci|checks?|lint|build|disclosure)`;
+      const condition = String.raw`(?:until|unless|while|because|before|due to|when|without)`;
+      const qualityCondition = new RegExp(
+        String.raw`(?:\b${action}\b[^.!?\n]{0,180}\b${condition}\b[^.!?\n]{0,120}\b${quality}\b|\b${quality}\b[^.!?\n]{0,120}\b${action}\b[^.!?\n]{0,120}\b(?:ai|llm|chatgpt|claude)\b)`,
+        'i',
+      );
+      const separatedQuality = new RegExp(
+        String.raw`\b${action}\b[^.!?\n]{0,160}\b${ai}\b[^.!?\n]{0,80}(?:;|\u2014|\s-\s)[^.!?\n]{0,100}\b${quality}\b`,
+        'i',
+      );
+      const temporaryReview = /\b(?:cannot|can't|will not|won't)\s+review\b[^.!?\n]{0,160}\b(?:until|before|after)\b[^.!?\n]{0,100}\b(?:week|time|date|available|back)\b/i;
+      return !qualityCondition.test(fragment) && !separatedQuality.test(fragment) &&
+        !temporaryReview.test(fragment);
+    })
+    .join('\n');
   const temporaryAiRejection = new RegExp(
     String.raw`(?:\b${ai}\b[^.\n]{0,120}\b(?:bandwidth|reached (?:its|my|the) end)|\b(?:bandwidth|reached (?:its|my|the) end)\b[^.\n]{0,120}\b${ai}\b)`,
     'i',
   );
   if (temporaryAiRejection.test(text)) return 'ai_rejection';
-  const rejectBefore = String.raw`(?:do not|don't|cannot|can't|will not|won't|no longer|prohibit(?:s|ed)?|ban(?:s|ned)?|reject(?:s|ed)?|refus(?:e|es|ed)|avoid)`;
-  const rejectAfter = String.raw`(?:not (?:allowed|accepted|welcome|permitted)|prohibited|banned|rejected|refused|unwelcome|policy concern)`;
+  const rejectAction = String.raw`(?:accept|allow|permit|welcome|merge|take)(?!\s+(?:the\s+)?(?:claim|idea|argument|notion)\b)`;
+  const rejectBefore = String.raw`(?:(?:do(?:es)? not|don't|doesn't|cannot|can't|not able to|unable to|will not|won't|no longer)\s+${rejectAction}|prohibit(?:s|ed)?|ban(?:s|ned)?|reject(?:s|ed)?(?!\s+(?:the\s+)?(?:claim|idea|argument|notion)\b)|refus(?:e|es|ed)|avoid)`;
+  const rejectAfter = String.raw`(?:not (?:allowed|accepted|welcome|permitted)|prohibited|forbidden|disallowed|banned|rejected|refused|unwelcome|policy concern|will be (?:closed|rejected))`;
+  const withoutContrast = String.raw`(?:(?!\bbut\b)[^.\n]){0,120}`;
   const aiPolicyConcern = new RegExp(
-    String.raw`(?:\b${rejectBefore}\b[^.\n]{0,120}\b${ai}\b|\b${ai}\b[^.\n]{0,120}\b${rejectAfter}\b)`,
+    String.raw`(?:\b${rejectBefore}\b${withoutContrast}\b${ai}\b|\b${ai}\b${withoutContrast}\b${rejectAfter}\b|(?:^|[.!?\n]\s*)no[- ]${ai}\s+(?:contributions?|submissions?|patches?|pull requests?|prs?|changes?)\b|\b(?:have|maintain|enforce|under)\s+(?:a\s+)?no[- ]ai\s+policy\b)`,
     'i',
   );
-  if (aiPolicyConcern.test(text)) {
+  if (aiPolicyConcern.test(policyText)) {
     return 'ai_policy_concern';
   }
   if (/\b(?:duplicate|already (?:fixed|implemented|covered)|another (?:pr|pull request))\b/i.test(text)) {
     return 'duplicate';
   }
-  if (/\b(?:not interested|do not want|don't want|not accepting|please (?:do not|don't) submit|won't accept|will not accept|no need for this)\b/i.test(text)) {
+  if (/\b(?:not interested|do not want|don't want|not accepting|please (?:do not|don't) submit|won't accept|will not accept|no need for this)\b/i.test(policyText)) {
     return 'not_wanted';
   }
-  if (/\b(?:incorrect|buggy|tests? (?:fail|failing|missing)|not (?:correct|working)|quality|regression|broken)\b/i.test(text)) {
+  if (/\b(?:incorrect|buggy|tests? (?:(?:are|is) )?(?:fail|failing|missing|pass|passing)|failing tests?|ci (?:is )?(?:fail(?:ing)?|red)|passing checks?|checks? (?:pass|passing|required)|not (?:correct|working)|quality|regression|broken)\b/i.test(text)) {
     return 'quality';
   }
   if (/\b(?:stale|outdated|no longer (?:applies|needed)|already resolved)\b/i.test(text)) return 'stale';
@@ -332,8 +358,10 @@ export async function reconcilePublicationBatch({
       const changesRequested = followUp?.review_decision === 'CHANGES_REQUESTED' ||
         (followUp?.latest_reviews_by_maintainer ?? []).some((review) => review.state === 'CHANGES_REQUESTED');
       const rejected = (prState === 'CLOSED' && publication.merged !== true) || changesRequested;
-      const reasonCode = rejected ? reasonCodeFromFollowUp(followUp) : null;
-      const interactionBlocked = ['ai_policy_concern', 'ai_rejection', 'not_wanted'].includes(reasonCode);
+      const classifiedReason = reasonCodeFromFollowUp(followUp);
+      const interactionBlocked = ['ai_policy_concern', 'ai_rejection', 'not_wanted']
+        .includes(classifiedReason);
+      const reasonCode = rejected || interactionBlocked ? classifiedReason : null;
       if (interactionBlocked) {
         const exactReason = maintainerText(followUp).trim() ||
           `Maintainer rejection classified as ${reasonCode}`;

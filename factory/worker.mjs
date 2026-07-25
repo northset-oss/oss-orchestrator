@@ -69,10 +69,11 @@ export function createStageSemaphores({
   };
 }
 
-async function oneInfrastructureRetry(operation) {
+async function oneInfrastructureRetry(operation, {retryTimeout = true} = {}) {
   try { return await operation(); }
   catch (error) {
-    if (error?.transient !== true || error?.providerUnavailable === true) throw error;
+    if (error?.transient !== true || error?.providerUnavailable === true ||
+        (!retryTimeout && /timed out/i.test(String(error?.message ?? '')))) throw error;
     return operation();
   }
 }
@@ -353,8 +354,13 @@ async function processClaim(claim, {
       return {task_id: task.task_id, state: 'SKIPPED', reason: initialBlockReason};
     }
     checkout = await semaphores.clone.run(() => oneInfrastructureRetry(() => driver.checkout(task, attempt)));
-    const scout = await semaphores.scout.run(() => oneInfrastructureRetry(() =>
-      driver.scout(task, checkout, {effort: 'medium', timeoutMs: 90_000})));
+    // A scout timeout already consumes the full bounded model window. Let the
+    // durable task retry on a later cycle instead of immediately spending the
+    // same 90 seconds again inside one attempt.
+    const scout = await semaphores.scout.run(() => oneInfrastructureRetry(
+      () => driver.scout(task, checkout, {effort: 'medium', timeoutMs: 90_000}),
+      {retryTimeout: false},
+    ));
     if (!scout || scout.decision === 'SKIP') {
       db.finishAttempt(attempt.attempt_id, {
         outcome: 'SKIPPED', failureClass: 'candidate',
@@ -446,7 +452,12 @@ async function processClaim(claim, {
         const board = createBoardIfDue(db, {...boardPolicy, now: now()});
         return {task_id: task.task_id, state: 'READY', mission_id: ready.mission_id, board};
       } catch (error) {
-        if (error?.transient === true || error?.infrastructure === true) throw error;
+        if (error?.transient === true || error?.infrastructure === true) {
+          if (feedback) {
+            error.message = `${error.message}; prior verifier feedback: ${feedback}`;
+          }
+          throw error;
+        }
         lastError = error;
         feedback = error.message;
         await driver.resetAfterFailure?.(task, checkout, {authorAttempt, error});
@@ -577,7 +588,7 @@ function runJsonCommand(command, args, payload, {
     child.stdout.on('data', (chunk) => { stdout = collect(stdout, chunk); });
     child.stderr.on('data', (chunk) => { stderr = collect(stderr, chunk); });
     child.on('error', (error) => { clearTimeout(timer); reject(error); });
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       clearTimeout(timer);
       if (terminalError) {
         terminalError.transient = /timed out/i.test(terminalError.message);
@@ -586,10 +597,12 @@ function runJsonCommand(command, args, payload, {
       }
       if (code !== 0) {
         const failureOutput = stderr || stdout;
-        const error = new Error(`worker command failed: ${failureOutput.trim() || `exit ${code}`}`);
+        const termination = signal ? `signal ${signal}` : `exit ${code}`;
+        const detail = failureOutput.trim();
+        const error = new Error(`worker command failed: ${termination}${detail ? `: ${detail}` : ''}`);
         error.providerUnavailable = /host Codex sandbox failed:[\s\S]*(?:you(?:'|’)ve hit your usage limit|usage[_ ]limit|model provider[^\n]*unavailable|unexpected status 401 unauthorized|http error: 401 unauthorized|auth error code: token_(?:invalidated|revoked)|authentication token has been invalidated|invalidated oauth token|invalid ['’]refresh_token['’]: empty string)/i
           .test(failureOutput);
-        error.infrastructure = error.providerUnavailable ||
+        error.infrastructure = error.providerUnavailable || Boolean(signal) ||
           /host Codex sandbox failed:[\s\S]*(?:agent identity JWT payload is not valid JSON|invalid_json_schema|model provider[^\n]*error)/i
             .test(failureOutput);
         error.transient = /temporar|timed out|connection reset|econnreset|etimedout|eai_again|network unreachable|registry[^\n]*(?:unavailable|timeout)|cannot connect to the docker daemon/i

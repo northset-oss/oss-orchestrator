@@ -11,10 +11,19 @@ const AMBER_CLASSES = new Set(['existing_test', 'build', 'configuration', 'writa
 export function classifyRisk(manifest) {
   const files = Array.isArray(manifest.changed_files) ? manifest.changed_files : [];
   const classes = new Set(files.map((file) => typeof file === 'string' ? 'production' : file.class));
+  const changesRenderedUi = files.some((file) => {
+    const changedPath = typeof file === 'string' ? file : String(file.path ?? '');
+    return /\.(?:css|scss|sass|less|html?|jsx|tsx|vue|svelte|svg|hbs|astro|mdx)$/i.test(changedPath) ||
+      /(?:^|\/)(?:components?|views?|pages?|ui)\/.+\.(?:[mc]?js)$/i.test(changedPath) ||
+      /(?:^|\/)[A-Z][A-Za-z0-9]*\.(?:[mc]?js)$/.test(changedPath) ||
+      /(?:^|\/)[^/]*(?:accordion|app|avatar|button|card|client|component|dialog|dropdown|footer|form|header|input|layout|list|menu|modal|nav|page|panel|render|route|router|screen|sidebar|table|tabs|toast|toolbar|ui|view|widget)[^/]*\.(?:[mc]?js)$/i
+        .test(changedPath);
+  });
   const lines = Number(manifest.changed_lines ?? files.reduce((total, file) => total + Number(file.lines ?? 0), 0));
   const warnings = Array.isArray(manifest.risk_warnings) ? manifest.risk_warnings : [];
   if (manifest.risk_tier === 'RED' || [...classes].some((value) => RED_CLASSES.has(value))) return 'RED';
-  if (manifest.risk_tier === 'AMBER' || files.length > 5 || lines > 300 || warnings.length ||
+  if (manifest.risk_tier === 'AMBER' || changesRenderedUi ||
+      files.length > 5 || lines > 300 || warnings.length ||
       [...classes].some((value) => AMBER_CLASSES.has(value))) return 'AMBER';
   return 'GREEN';
 }

@@ -305,6 +305,33 @@ function enqueueAndClaim(db, candidate = 'owner/repo#123') {
   return {task, claim: db.claimNextTask({now: '2026-07-19T12:01:00.000Z'})};
 }
 
+test('explicit task state changes clear stale worker ownership', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-task-state-'));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const db = openFactoryDb(path.join(root, 'factory.sqlite'));
+  t.after(() => db.close());
+  const {task, claim} = enqueueAndClaim(db);
+
+  assert.equal(db.getTask(task.task_id).worker_id, 'factory');
+  assert.throws(() => db.updateTaskState(task.task_id, 'SKIPPED', 'manual quality stop'), /WORKING task/);
+  assert.equal(db.getTask(task.task_id).state, 'WORKING');
+  assert.equal(db.getTask(task.task_id).worker_id, 'factory');
+  db.finishAttempt(claim.attempt.attempt_id, {
+    outcome: 'SKIPPED',
+    failureClass: 'candidate',
+    error: 'manual quality stop',
+    now: '2026-07-19T12:01:30.000Z',
+  });
+  db.connection.prepare('UPDATE tasks SET worker_id=? WHERE task_id=?')
+    .run('stale-worker', task.task_id);
+  const updated = db.updateTaskState(task.task_id, 'SKIPPED', 'manual quality stop', {
+    now: '2026-07-19T12:02:00.000Z',
+  });
+  assert.equal(updated.state, 'SKIPPED');
+  assert.equal(updated.worker_id, null);
+  assert.equal(updated.last_error, 'manual quality stop');
+});
+
 test('preflight skips retain their exact decision in the existing task snapshot', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'factory-db-preflight-decision-'));
   t.after(() => rm(root, {recursive: true, force: true}));

@@ -498,4 +498,114 @@ test('maintainer AI-policy rejection creates a repository interaction block', as
   assert.equal(reasonCodeFromFollowUp({latest_reviews_by_maintainer: [{
     body: 'AI-generated contributions are allowed if reviewed.',
   }]}), 'other');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: "Unfortunately I am not able to accept your contribution due to this project's policy on the use of AI and LLMs.",
+  }]}), 'ai_policy_concern');
+  for (const body of [
+    'We cannot accept contributions created with generative AI.',
+    'We cannot merge this contribution under our AI policy.',
+    'Our policy does not permit AI-assisted contributions.',
+    'No AI-generated contributions.',
+    'We have a no-AI policy.',
+    'AI-generated submissions will be closed.',
+    'AI contributions are forbidden.',
+    'AI-assisted code is disallowed.',
+    'Contributions made with AI are forbidden.',
+    'We do not take contributions involving AI.',
+  ]) {
+    assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{body}]}), 'ai_policy_concern');
+  }
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [
+    {body: 'Please fix the failing tests'},
+    {body: 'No AI-generated contributions.'},
+  ]}), 'ai_policy_concern');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: 'I am not able to accept the claim that LLM contributions are categorically unsafe; they are welcome.',
+  }]}), 'other');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: 'We cannot merge this yet because tests fail, but the AI disclosure is fine.',
+  }]}), 'quality');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: 'We cannot review the AI disclosure until next week.',
+  }]}), 'other');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: 'We cannot merge until the AI disclosure is added.',
+  }]}), 'other');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: 'We cannot merge AI-generated code until the failing tests are fixed.',
+  }]}), 'quality');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: "We don't want to merge this until CI passes.",
+  }]}), 'other');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: 'We cannot merge AI-generated code because the tests fail.',
+  }]}), 'quality');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: 'We cannot merge AI-generated code while CI is failing.',
+  }]}), 'quality');
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: "We don't want to merge this while CI is red.",
+  }]}), 'quality');
+  for (const body of [
+    'After reviewing this PR, we do not accept AI-generated contributions.',
+    'Once again, AI contributions are forbidden.',
+  ]) {
+    assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{body}]}), 'ai_policy_concern');
+  }
+  assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{
+    body: 'After reviewing the requested changes, we do not want this contribution.',
+  }]}), 'not_wanted');
+  for (const body of [
+    'We cannot accept AI contributions because policy review is pending.',
+    'We cannot accept AI contributions pending a policy review.',
+  ]) {
+    assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{body}]}), 'ai_policy_concern');
+  }
+  for (const body of [
+    'We cannot merge AI-generated code before tests pass.',
+    'We cannot merge AI-generated code due to failing tests.',
+    'We cannot merge AI-generated code when CI is red.',
+    'We cannot merge AI-generated code without passing checks.',
+  ]) {
+    assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{body}]}), 'quality');
+  }
+  for (const body of [
+    'We cannot accept AI-generated contributions because our CI policy prohibits them.',
+    'We cannot accept AI-generated contributions because repository checks reject them.',
+  ]) {
+    assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{body}]}), 'ai_policy_concern');
+  }
+  for (const body of [
+    'We cannot merge this AI-generated change; tests are failing.',
+    'We cannot merge this AI-generated change — tests are failing.',
+  ]) {
+    assert.equal(reasonCodeFromFollowUp({maintainer_comments: [{body}]}), 'quality');
+  }
+});
+
+test('open PR maintainer AI-policy objection creates an interaction block without a review decision', async () => {
+  const fixture = harness({
+    prState: 'open',
+    attestor: async () => ({found: false}),
+    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
+      status_url: `https://example.test/${item.mission_id}/publication.json`,
+    }])),
+  });
+  fixture.github.getPullRequestFollowUp = async () => ({
+    author_login: 'AysajanE',
+    review_decision: null,
+    comments: [{
+      author_login: 'maintainer', author_type: 'User', author_association: 'OWNER',
+      body: 'Our policy does not permit AI-assisted contributions.',
+      created_at: '2026-07-19T12:30:00Z',
+    }],
+    reviews: [],
+    threads: [],
+  });
+
+  const result = await reconcilePublicationBatch(fixture);
+  assert.equal(result.results[0].reason_code, 'ai_policy_concern');
+  assert.equal(result.results[0].interaction_blocked, true);
+  assert.equal(fixture.db.interactionBlocks.length, 1);
+  assert.equal(fixture.db.interactionBlocks[0].reasonCode, 'ai_policy_concern');
 });

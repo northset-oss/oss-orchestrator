@@ -229,7 +229,11 @@ test('discover routes every search through the current GitHub safety queue and t
   const calls = [];
   const interactionBlocks = [{scope: 'repository', subject: 'blocked/repo', block_authoring: true}];
   const db = fakeDb({
-    listTasks: async () => [{candidate: 'known/repo#7'}],
+    listTasks: async () => [{
+      candidate: 'known/repo#7',
+      issue_snapshot: {nodeId: 'I_known'},
+      live_state: {issue: {nodeId: 'I_known'}, candidate: {issueNodeId: 'I_known'}},
+    }],
     listInteractionBlocks: async (options) => {
       assert.deepEqual(options, {action: 'authoring'});
       return interactionBlocks;
@@ -253,6 +257,7 @@ test('discover routes every search through the current GitHub safety queue and t
       discoverCandidates: async (options) => {
         assert.equal(options.target, 32);
         assert.deepEqual(options.knownCandidates, ['known/repo#7']);
+        assert.deepEqual(options.knownIssueNodeIds, ['I_known', 'I_known', 'I_known']);
         assert.deepEqual(options.interactionBlocks, interactionBlocks);
         for (const [index, name] of [
           'good_first_issue:global', 'good_first_issue:JavaScript', 'good_first_issue:TypeScript',

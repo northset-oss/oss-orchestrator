@@ -79,6 +79,20 @@ function sha256(bytes) {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 }
 
+function isExplicitlyDocumentationOnly(task) {
+  const issue = task?.issue_snapshot ?? task?.live_state?.issue ?? {};
+  const title = String(issue.title ?? '')
+    .replace(/^(?:\[[^\]]+\]\s*|good first issue:\s*)+/i, '')
+    .trim();
+  const documentationLabel = (issue.labels ?? []).some((label) =>
+    /^(?:docs?|documentation)$/i.test(String(label).trim()));
+  if (/\b(?:bug|broken|crash(?:es|ed)?|error|fail(?:s|ed|ing)?|incorrect|incorrectly|does not|cannot|can't|hangs?|blank|duplicates?|emits?|truncates?|stale|generator|renderer|pipeline|preview|startup|times?\s+out|resolves?\s+incorrectly)\b/i
+    .test(title)) return false;
+  const explicitDocumentationPath = /(?:^|[\s`])(?:docs?\/\S+|readme(?:\.md)?\b|\S+\.md\b)/i.test(title);
+  return documentationLabel ||
+    explicitDocumentationPath && /\b(?:add|update|write|document|translate|improve|fix)\b/i.test(title);
+}
+
 function terminate(child, signal) {
   try {
     if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
@@ -188,8 +202,130 @@ async function isFile(file) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
-async function unsupportedNodeLayout(checkout) {
+function taskIssueText(task) {
+  const issue = task?.issue_snapshot ?? task?.live_state?.issue ?? {};
+  return `${String(issue.title ?? '')}\n${String(issue.body ?? '')}`;
+}
+
+function hasExplicitNodeTarget(task) {
+  const text = taskIssueText(task);
+  const changeIntent = /\b(?:add|change|edit|export|fix|implement|modify|refactor|remove|update)\b/gi;
+  const changes = [...text.matchAll(changeIntent)];
+  const runtimeTargets = new Set();
+  const pathPatterns = [
+    ['PHP', /(?:^|[\s`"'(])((?:\.\/)?[a-z0-9_@.-]+(?:\/[a-z0-9_@.-]+)*\.(?:php|phtml))\b/gi],
+    ['NODE', /(?:^|[\s`"'(])((?:\.\/)?[a-z0-9_@.-]+(?:\/[a-z0-9_@.-]+)*\.(?:[cm]?[jt]sx?|vue|svelte))\b/gi],
+  ];
+  const technologyPatterns = [
+    ['PHP', /\b(?:php|composer|laravel|blade|artisan)\b/gi],
+    ['NODE', /\b(?:javascript|typescript|node\.?js|package\.json|node_modules|npm|pnpm|yarn|bun|react|vue|svelte|vite|webpack|eslint|jest|vitest)\b/gi],
+  ];
+  const locatedTechnologyPatterns = [
+    ['PHP', /\b(?:in|inside|under|within|at)\s+(?:the\s+)?(?:[a-z-]+\s+){0,3}(?:php|composer|laravel|blade|artisan)\b/i],
+    ['NODE', /\b(?:in|inside|under|within|at)\s+(?:the\s+)?(?:[a-z-]+\s+){0,3}(?:javascript|typescript|node\.?js|react|vue|svelte|vite|webpack)\b/i],
+  ];
+  const verificationInstruction = /\b(?:(?:run|execute)\s+(?:npm|pnpm|yarn|bun|node)\b[^\r\n.;]*|(?:npm|pnpm|yarn|bun)\s+(?:test|lint|build|check|typecheck)\b|node\s+--test\b)[^\r\n.;]*/gi;
+  for (let index = 0; index < changes.length; index += 1) {
+    const start = changes[index].index + changes[index][0].length;
+    const end = changes[index + 1]?.index ?? text.length;
+    const clause = text.slice(start, end).replace(verificationInstruction, '');
+    const pathMarkers = pathPatterns.flatMap(([runtime, pattern]) =>
+      [...clause.matchAll(pattern)].map((match) => ({
+        runtime,
+        index: match.index + match[0].indexOf(match[1]),
+        end: match.index + match[0].indexOf(match[1]) + match[1].length,
+      }))).sort((left, right) => left.index - right.index);
+    if (pathMarkers[0]) {
+      runtimeTargets.add(pathMarkers[0].runtime);
+      for (let markerIndex = 1; markerIndex < pathMarkers.length; markerIndex += 1) {
+        const prior = pathMarkers[markerIndex - 1];
+        const marker = pathMarkers[markerIndex];
+        if (/^\s*(?:,|and|&)\s*$/i.test(clause.slice(prior.end, marker.index))) {
+          runtimeTargets.add(marker.runtime);
+        }
+      }
+      continue;
+    }
+    const locatedMarkers = locatedTechnologyPatterns
+      .map(([runtime, pattern]) => ({runtime, index: clause.search(pattern)}))
+      .filter((marker) => marker.index >= 0)
+      .sort((left, right) => left.index - right.index);
+    if (locatedMarkers[0]) {
+      runtimeTargets.add(locatedMarkers[0].runtime);
+    }
+    const technologyMarkers = technologyPatterns.flatMap(([runtime, pattern]) =>
+      [...clause.matchAll(pattern)].map((match) => ({
+        runtime,
+        index: match.index,
+        end: match.index + match[0].length,
+      }))).sort((left, right) => left.index - right.index);
+    if (!locatedMarkers[0] && technologyMarkers[0]) {
+      runtimeTargets.add(technologyMarkers[0].runtime);
+    }
+    for (let markerIndex = 1; markerIndex < technologyMarkers.length; markerIndex += 1) {
+      const prior = technologyMarkers[markerIndex - 1];
+      const marker = technologyMarkers[markerIndex];
+      if (/^\s*(?:[a-z-]+\s+){0,3}(?:,|and|&)\s*$/i.test(
+        clause.slice(prior.end, marker.index),
+      )) {
+        runtimeTargets.add(prior.runtime);
+        runtimeTargets.add(marker.runtime);
+      }
+    }
+  }
+  return runtimeTargets.has('NODE') && !runtimeTargets.has('PHP');
+}
+
+function verbTargetPaths(text, changeVerb) {
+  const token = '(@?[a-z0-9._-]+(?:/@?[a-z0-9._-]+)*)';
+  const modifiers = '(?:(?:the|a|an|existing|current|new|old|root|nested|relevant|corresponding|file)\\s+)*';
+  const directPattern = new RegExp(
+    `\\b${changeVerb}\\s+${modifiers}[\`\"']?${token}`,
+    'gi',
+  );
+  const paths = new Set();
+  for (const match of text.matchAll(directPattern)) {
+    const target = match[1].replace(/^(?:\.\/)+/, '').replace(/[.,;:]+$/, '');
+    if (target) paths.add(target);
+  }
+  const indirectPattern = new RegExp(
+    `\\b${changeVerb}\\s+${modifiers}[\`\"']?${token}[^\\r\\n]*?\\b(?:in|at|under|inside)\\s+[\`\"']?${token}`,
+    'gi',
+  );
+  for (const match of text.matchAll(indirectPattern)) {
+    const directTarget = match[1].replace(/^(?:\.\/)+/, '').replace(/[.,;:]+$/, '');
+    if (/[./]/.test(directTarget)) continue;
+    const target = match[2].replace(/^(?:\.\/)+/, '').replace(/[.,;:]+$/, '');
+    if (target) paths.add(target);
+  }
+  return [...paths];
+}
+
+function explicitTargetPaths(task) {
+  const text = taskIssueText(task);
+  const token = '(@?[a-z0-9._-]+(?:/@?[a-z0-9._-]+)*)';
+  const paths = new Set(verbTargetPaths(
+    text,
+    '(?:add|change|edit|export|fix|implement|modify|refactor|remove|run|test|update)',
+  ));
+  const patterns = [
+    new RegExp(`\\b(?:where\\s+to\\s+start|start|work)\\s*(?:(?:in|at)\\s*)?:?\\s*[\`\"']?${token}`, 'gi'),
+    new RegExp(`\\bcd\\s+[\`\"']?${token}`, 'gi'),
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const target = match[1].replace(/^(?:\.\/)+/, '').replace(/[.,;:]+$/, '');
+      if (target) paths.add(target);
+    }
+  }
+  return [...paths];
+}
+
+async function unsupportedNodeLayout(checkout, task = null) {
   if (!await isFile(path.join(checkout, 'package.json'))) return 'root package.json is missing';
+  if (await isFile(path.join(checkout, 'composer.json')) && !hasExplicitNodeTarget(task)) {
+    return 'mixed PHP/Node repositories require an explicit Node target for the single-package Node lane';
+  }
   let packageJson;
   try { packageJson = JSON.parse(await readFile(path.join(checkout, 'package.json'), 'utf8')); }
   catch (error) { throw new Error(`cannot parse package.json: ${error.message}`); }
@@ -219,6 +355,44 @@ async function unsupportedNodeLayout(checkout) {
   return null;
 }
 
+async function explicitNestedPackageTarget(task, checkout) {
+  const checkoutRoot = path.resolve(checkout);
+  for (const target of explicitTargetPaths(task)) {
+    const segments = target.split('/').filter(Boolean);
+    if (segments.some((segment) => segment === '.' || segment === '..')) continue;
+    for (let length = 1; length <= segments.length; length += 1) {
+      const directory = segments.slice(0, length).join('/');
+      const directoryPath = path.resolve(checkoutRoot, directory);
+      if (!directoryPath.startsWith(`${checkoutRoot}${path.sep}`)) continue;
+      let directoryInfo;
+      try { directoryInfo = await lstat(directoryPath); }
+      catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ENOTDIR') break;
+        throw error;
+      }
+      if (directoryInfo.isSymbolicLink()) {
+        return `nested package target ${directory}/ uses a symlink outside the single-package Node lane`;
+      }
+      if (!directoryInfo.isDirectory()) break;
+      for (const [manifest, kind] of [['package.json', 'package'], ['composer.json', 'Composer package']]) {
+        let manifestInfo;
+        try { manifestInfo = await lstat(path.join(directoryPath, manifest)); }
+        catch (error) {
+          if (error.code === 'ENOENT' || error.code === 'ENOTDIR') continue;
+          throw error;
+        }
+        if (manifestInfo.isSymbolicLink()) {
+          return `nested ${kind} ${directory}/ uses a symlinked manifest outside the single-package Node lane`;
+        }
+        if (manifestInfo.isFile()) {
+          return `nested ${kind} ${directory}/ is outside the single-package Node lane`;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 async function ensureDependencyMountpoint(checkout) {
   const target = path.join(checkout, 'node_modules');
   try {
@@ -233,14 +407,14 @@ async function ensureDependencyMountpoint(checkout) {
   return target;
 }
 
-async function resolveNodeCommands(checkout, scout = {}) {
+async function resolveNodeCommands(checkout, scout = {}, task = null) {
   if (!await isFile(path.join(checkout, 'package.json'))) {
     throw new Error('Node worker requires a root package.json');
   }
   let packageJson;
   try { packageJson = JSON.parse(await readFile(path.join(checkout, 'package.json'), 'utf8')); }
   catch (error) { throw new Error(`cannot parse package.json: ${error.message}`); }
-  const unsupportedLayout = await unsupportedNodeLayout(checkout);
+  const unsupportedLayout = await unsupportedNodeLayout(checkout, task);
   if (unsupportedLayout) throw new Error(unsupportedLayout);
   let installCommand = String(scout.install_command ?? '').trim();
   if (!installCommand) {
@@ -558,18 +732,29 @@ function asTransientBootstrapError(error) {
 export function bootstrapDockerArgs({checkout, volume, image, installCommand}) {
   return [
     'run', '--rm', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+    '--user', '1000:1000',
     '--pids-limit=512', '--memory=8g', '--cpus=4',
     '--mount', `type=bind,src=${checkout},dst=/source,readonly`,
     '--mount', `type=volume,src=${volume},dst=/workspace/node_modules`,
     '--workdir', '/workspace', '--env', 'HOME=/tmp', '--env', 'CI=true',
     '--env', 'npm_config_cache=/tmp/npm',
-    '--tmpfs', '/workspace:rw,exec,nosuid,nodev,size=2g',
+    '--tmpfs', '/workspace:rw,exec,nosuid,nodev,size=2g,mode=1777',
     '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=2g',
     image, 'sh', '-lc', [
-      "tar -C /source --exclude='./.git' --exclude='./node_modules' --exclude='*/node_modules' -cf - . | tar -C /workspace -xf -",
+      "tar -C /source --exclude='./.git' --exclude='./node_modules' --exclude='*/node_modules' -cf - . | tar -C /workspace --strip-components=1 --no-same-owner --no-same-permissions -m -xf -",
       installCommand,
       'touch /workspace/node_modules/.northset-ready',
     ].join(' && '),
+  ];
+}
+
+export function dependencyVolumeInitDockerArgs({volume, image}) {
+  return [
+    'run', '--rm', '--network=none', '--read-only',
+    '--cap-drop=ALL', '--cap-add=CHOWN', '--security-opt=no-new-privileges',
+    '--pids-limit=32', '--memory=128m', '--cpus=1',
+    '--mount', `type=volume,src=${volume},dst=/deps`,
+    image, 'chown', '-R', '1000:1000', '/deps',
   ];
 }
 
@@ -718,11 +903,38 @@ export function createNodeWorker({
   codexHomeSource,
 } = {}) {
   async function scout(payload) {
-    const unsupportedLayout = await unsupportedNodeLayout(payload.checkout);
+    if (isExplicitlyDocumentationOnly(payload.task)) {
+      return {
+        decision: 'SKIP',
+        reason: 'documentation-only work is outside the current claim and clean-verification lane',
+        test_command: '',
+        install_command: '',
+        target_files: [],
+        estimated_risk: 'GREEN',
+        pre_work_rule: '',
+        pre_work_evidence: '',
+        required_checks: [],
+      };
+    }
+    const unsupportedLayout = await unsupportedNodeLayout(payload.checkout, payload.task);
     if (unsupportedLayout) {
       return {
         decision: 'SKIP',
         reason: unsupportedLayout,
+        test_command: '',
+        install_command: '',
+        target_files: [],
+        estimated_risk: 'GREEN',
+        pre_work_rule: '',
+        pre_work_evidence: '',
+        required_checks: [],
+      };
+    }
+    const nestedTarget = await explicitNestedPackageTarget(payload.task, payload.checkout);
+    if (nestedTarget) {
+      return {
+        decision: 'SKIP',
+        reason: nestedTarget,
         test_command: '',
         install_command: '',
         target_files: [],
@@ -748,7 +960,7 @@ export function createNodeWorker({
 
   async function bootstrap(payload) {
     try {
-      const commands = await resolveNodeCommands(payload.checkout, payload.scout);
+      const commands = await resolveNodeCommands(payload.checkout, payload.scout, payload.task);
       const imageDigest = await resolveImage(run, image);
       const cacheKey = await dependencyCacheKey({
         repositoryNodeId: payload.task.live_state?.repository?.id ??
@@ -773,6 +985,10 @@ export function createNodeWorker({
         if (reused) return;
         await mustRun(run, 'docker', ['volume', 'create', volume], {timeoutMs: 30_000}, 'dependency volume creation');
         try {
+          await mustRun(run, 'docker', dependencyVolumeInitDockerArgs({
+            volume,
+            image: imageDigest,
+          }), {timeoutMs: 30_000, maxOutputBytes: OUTPUT_LIMIT}, 'dependency volume initialization');
           await mustRun(run, 'docker', bootstrapDockerArgs({
             checkout: payload.checkout,
             volume,

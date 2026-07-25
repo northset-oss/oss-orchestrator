@@ -1323,9 +1323,15 @@ export function openFactoryDb(databasePath, {missionStart = 1000} = {}) {
 
   function updateTaskState(taskId, state, detail = null, {now = new Date()} = {}) {
     assertState(state);
-    connection.prepare('UPDATE tasks SET state=?,last_error=?,updated_at=? WHERE task_id=?')
-      .run(state, detail, iso(now), taskId);
-    return getTask(taskId);
+    return transaction(() => {
+      const current = connection.prepare('SELECT state FROM tasks WHERE task_id=?').get(taskId);
+      if (current?.state === 'WORKING') {
+        throw new Error('cannot update a WORKING task directly; finish its open attempt');
+      }
+      connection.prepare('UPDATE tasks SET state=?,last_error=?,worker_id=NULL,updated_at=? WHERE task_id=?')
+        .run(state, detail, iso(now), taskId);
+      return getTask(taskId);
+    });
   }
 
   function getRepositoryState(repository) {

@@ -100,7 +100,9 @@ function evaluateNode(node, {cutoffMs}) {
   const candidate = candidateKey(repository?.nameWithOwner, node.number);
   const reasons = [];
   if (!candidate) reasons.push('candidate identity is unavailable');
+  if (!node.id) reasons.push('issue node ID is unavailable');
   if (!repository) reasons.push('repository is missing or inaccessible');
+  if (!repository?.id) reasons.push('repository node ID is unavailable');
   if (repository?.isPrivate) reasons.push('repository is private');
   if (repository?.isArchived) reasons.push('repository is archived');
   if (repository?.isFork) reasons.push('repository is a fork');
@@ -159,10 +161,10 @@ function activeAuthoringBlocks(blocks) {
 
 function assertLakeSchema(connection) {
   const tables = new Set(connection.prepare(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('repositories','issues')",
+    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('repositories','issues','repository_aliases')",
   ).all().map((row) => row.name));
-  if (!tables.has('repositories') || !tables.has('issues')) {
-    throw new Error('candidate lake must contain the existing repositories and issues tables');
+  if (!tables.has('repositories') || !tables.has('issues') || !tables.has('repository_aliases')) {
+    throw new Error('candidate lake must contain the existing repositories, issues, and repository_aliases tables');
   }
   const issueColumns = new Set(connection.prepare('PRAGMA table_info(issues)').all().map((row) => row.name));
   for (const column of ['candidate_key', 'candidate_display', 'repo_key', 'mechanical_reasons_json',
@@ -176,6 +178,31 @@ function persist(connection, records, {now}) {
   connection.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE');
   try {
     const existingIssue = connection.prepare('SELECT 1 FROM issues WHERE candidate_key=?');
+    const repositoryByNodeId = connection.prepare(
+      'SELECT repo_key FROM repositories WHERE repository_node_id=? LIMIT 1',
+    );
+    const repositoryByKey = connection.prepare(
+      'SELECT repository_node_id FROM repositories WHERE repo_key=? LIMIT 1',
+    );
+    const issueByNodeId = connection.prepare(
+      'SELECT candidate_key,candidate_display FROM issues WHERE issue_node_id=? LIMIT 1',
+    );
+    const issueByCandidate = connection.prepare(
+      'SELECT issue_node_id,candidate_display FROM issues WHERE candidate_key=? LIMIT 1',
+    );
+    const retireRepositoryIssues = connection.prepare(
+      `UPDATE issues SET state='RENAMED_UNKNOWN',updated_at=?
+       WHERE repo_key=? AND lower(candidate_display) GLOB ?`,
+    );
+    const retireCandidate = connection.prepare(
+      "UPDATE issues SET state='RENAMED_UNKNOWN',updated_at=? WHERE candidate_key=?",
+    );
+    const repositoryAliasStatement = connection.prepare(`INSERT INTO repository_aliases(
+      alias_key,repo_key,repository_node_id,observed_at
+    ) VALUES(?,?,?,?)
+    ON CONFLICT(alias_key) DO UPDATE SET
+      repo_key=excluded.repo_key,repository_node_id=excluded.repository_node_id,
+      observed_at=excluded.observed_at`);
     const repositoryStatement = connection.prepare(`INSERT INTO repositories(
       repo_key,repo_display,stars,default_branch,default_head,primary_language,pushed_at,archived,fork,
       test_profile,raw_json,provenance_json,updated_at,repository_node_id,owner_node_id,owner_login,
@@ -217,28 +244,49 @@ function persist(connection, records, {now}) {
       const issue = record.issue;
       const repoDisplay = repository.nameWithOwner;
       const repoKey = repoDisplay.toLowerCase();
+      const repositoryNodeId = repository.id ?? null;
+      const storedRepository = repositoryNodeId ? repositoryByNodeId.get(repositoryNodeId) : null;
+      const repoKeyOwner = repositoryByKey.get(repoKey);
+      const repoKeyCollision = Boolean(repositoryNodeId && repoKeyOwner &&
+        repoKeyOwner.repository_node_id !== repositoryNodeId);
+      const storageRepoKey = storedRepository?.repo_key ??
+        (repoKeyCollision ? `node:${repositoryNodeId}` : repoKey);
+      if (repoKeyCollision) retireRepositoryIssues.run(observedAt, repoKey, `${repoKey}#*`);
+      const issueNodeId = issue.id ?? null;
+      const storedIssue = issueNodeId ? issueByNodeId.get(issueNodeId) : null;
+      const candidateOwner = issueByCandidate.get(record.candidate);
+      const candidateCollision = Boolean(issueNodeId && candidateOwner &&
+        candidateOwner.issue_node_id !== issueNodeId);
+      const storageCandidateKey = storedIssue?.candidate_key ??
+        (candidateCollision ? `node:${issueNodeId}` : record.candidate);
       const candidateDisplay = `${repoDisplay}#${issue.number}`;
-      const alreadyExists = Boolean(existingIssue.get(record.candidate));
+      if (candidateCollision &&
+          String(candidateOwner.candidate_display ?? '').toLowerCase() === candidateDisplay.toLowerCase()) {
+        retireCandidate.run(observedAt, record.candidate);
+      }
+      const alreadyExists = Boolean(storedIssue ||
+        (!candidateCollision && existingIssue.get(record.candidate)));
       const provenance = JSON.stringify({source: 'factory_discover', version: 1,
         observed_at: observedAt, strata: [...record.strata].sort()});
       const repositoryRaw = JSON.stringify(repository);
       repositoryStatement.run(
-        repoKey, repoDisplay, Number(repository.stargazerCount ?? 0),
+        storageRepoKey, repoDisplay, Number(repository.stargazerCount ?? 0),
         repository.defaultBranchRef?.name ?? null, record.defaultOid,
         repository.primaryLanguage?.name ?? null, repository.pushedAt ?? null,
         repository.isArchived ? 1 : 0, repository.isFork ? 1 : 0, 'node', repositoryRaw,
-        provenance, observedAt, repository.id ?? null, repository.owner?.id ?? null,
+        provenance, observedAt, repositoryNodeId, repository.owner?.id ?? null,
         repository.owner?.login ?? null, observedAt, expiresAt,
       );
+      repositoryAliasStatement.run(repoKey, storageRepoKey, repositoryNodeId, observedAt);
       const raw = JSON.stringify({repository, issue, discovery: {strata: [...record.strata].sort()}});
       issueStatement.run(
-        record.candidate, candidateDisplay, repoKey, issue.number, issue.title ?? '',
+        storageCandidateKey, candidateDisplay, storageRepoKey, issue.number, issue.title ?? '',
         String(issue.bodyText ?? '').slice(0, 4_000),
         JSON.stringify((issue.labels?.nodes ?? []).map((item) => item.name)), 'OPEN',
         JSON.stringify(record.assignees), null, issue.updatedAt ?? observedAt,
         issue.updatedAt ?? observedAt, issue.authorAssociation ?? null, 'label', 'node',
         record.defaultOid, null, record.mechanicalScore, '[]', observedAt, raw, provenance,
-        issue.id ?? null, expiresAt,
+        issueNodeId, expiresAt,
       );
       if (alreadyExists) refreshed += 1;
       else inserted += 1;
@@ -255,6 +303,7 @@ export async function discoverCandidates({
   lakePath = 'candidate_lake.sqlite',
   target = DEFAULT_TARGET,
   knownCandidates = [],
+  knownIssueNodeIds = [],
   interactionBlocks = [],
   search,
   now = new Date(),
@@ -263,7 +312,9 @@ export async function discoverCandidates({
   validDate(now, 'now');
   if (typeof search !== 'function') throw new TypeError('search callback is required');
   if (!Array.isArray(interactionBlocks)) throw new TypeError('interactionBlocks must be an array');
+  if (!Array.isArray(knownIssueNodeIds)) throw new TypeError('knownIssueNodeIds must be an array');
   const known = new Set(knownCandidates.map((value) => String(value).toLowerCase()));
+  const knownIssues = new Set(knownIssueNodeIds.map((value) => String(value)).filter(Boolean));
   const authoringBlocks = activeAuthoringBlocks(interactionBlocks);
   const cutoffMs = now.getTime() - DISCOVERY_WINDOW_DAYS * DAY_MS;
   const unique = new Map();
@@ -319,6 +370,9 @@ export async function discoverCandidates({
         stratum: [...record.strata].sort().join(',')});
     } else if (known.has(record.candidate)) {
       skipped.push({candidate: record.candidate, reasons: ['candidate is already known to factory'],
+        stratum: [...record.strata].sort().join(',')});
+    } else if (knownIssues.has(String(record.issue.id ?? ''))) {
+      skipped.push({candidate: record.candidate, reasons: ['issue node is already known to factory'],
         stratum: [...record.strata].sort().join(',')});
     } else {
       available.push(record);

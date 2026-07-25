@@ -246,6 +246,13 @@ export function buildPreflightQuery(candidates, {northsetLogin = 'AysajanE'} = {
         nameWithOwner
         isArchived
         isFork
+        createdAt
+        stargazerCount
+        forkCount
+        diskUsage
+        licenseInfo { spdxId }
+        issues(first: 1) { totalCount }
+        pullRequests(first: 1) { totalCount }
         defaultBranchRef { name target { ... on Commit { oid } } }
         rootPackage: object(expression: "HEAD:package.json") {
           ... on Blob { byteSize text }
@@ -355,6 +362,13 @@ export function normalizePreflight(candidate, data) {
       nameWithOwner: repository.nameWithOwner ?? candidate.repository,
       archived: Boolean(repository.isArchived),
       fork: Boolean(repository.isFork),
+      createdAt: repository.createdAt ?? null,
+      stargazerCount: Number(repository.stargazerCount ?? 0),
+      forkCount: Number(repository.forkCount ?? 0),
+      diskUsageKb: Number(repository.diskUsage ?? 0),
+      licenseSpdxId: repository.licenseInfo?.spdxId ?? null,
+      issueCount: Number(repository.issues?.totalCount ?? 0),
+      pullRequestCount: Number(repository.pullRequests?.totalCount ?? 0),
       defaultBranch: repository.defaultBranchRef?.name ?? null,
       defaultOid: repository.defaultBranchRef?.target?.oid ?? null,
       hasRootPackageJson: Number(repository.rootPackage?.byteSize) > 0,
@@ -505,6 +519,13 @@ export function evaluatePreflight(live, {
   if (issue && isUnapproved(issue.labels)) reasons.push('issue is marked unapproved by the repository');
   if (issue && isAlreadyInDevelopment(issue.labels)) reasons.push('issue is already implemented in the development branch');
   if (repository?.archived || repository?.fork) reasons.push('repository is archived or forked');
+  const repositoryCreatedAt = Date.parse(repository?.createdAt ?? '');
+  if (repository && Number.isFinite(repositoryCreatedAt) &&
+      repositoryCreatedAt >= now.getTime() - 14 * DAY_MS &&
+      repository.stargazerCount === 0 && repository.forkCount === 0 &&
+      !repository.licenseSpdxId && repository.pullRequestCount === 0) {
+    reasons.push('new unlicensed zero-signal repository requires manual provenance review');
+  }
   if (repository && !repository.hasRootPackageJson) reasons.push('root package.json is missing');
   if (repository?.unsupportedNodeLayout) reasons.push(repository.unsupportedNodeLayout);
   if (repository?.prohibitedAiPolicyFile) {

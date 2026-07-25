@@ -496,6 +496,11 @@ export async function executeFactoryCli(argv, {
         lakePath: options.lake,
         target: options.target,
         knownCandidates: knownTasks.map((task) => task.candidate),
+        knownIssueNodeIds: knownTasks.flatMap((task) => [
+          task.issue_snapshot?.nodeId,
+          task.live_state?.issue?.nodeId,
+          task.live_state?.candidate?.issueNodeId,
+        ]).filter(Boolean),
         interactionBlocks,
         search: ({stratum, query, variables}) => safety.request({
           priority: 'discovery_top_up',

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {lstat, mkdtemp, readFile, rm, writeFile, mkdir} from 'node:fs/promises';
+import {lstat, mkdtemp, readFile, rm, symlink, writeFile, mkdir} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,6 +11,7 @@ import {
   codexHostArgs,
   codexProcessEnvironment,
   createNodeWorker,
+  dependencyVolumeInitDockerArgs,
   prepareCodexHome,
   runBounded,
   runtimeDockerArgs,
@@ -121,6 +122,95 @@ test('N1b scout skips when mandatory pre-work communication has no issue evidenc
   assert.deepEqual(result.required_checks, ['npm test', 'npm run typecheck']);
 });
 
+test('N1b2 scout skips explicit documentation-only issues without model or bootstrap work', async (t) => {
+  const root = await temporary(t, 'factory-node-worker-docs');
+  let modelCalls = 0;
+  const worker = createNodeWorker({
+    codexRunner: async () => {
+      modelCalls += 1;
+      throw new Error('documentation-only issue must not reach the model');
+    },
+  });
+
+  const result = await worker.handle({
+    action: 'scout',
+    task: {
+      issue_snapshot: {
+        title: 'Good First Issue: Document Implicit index Variable inside VirtualList Template Slots',
+        labels: ['documentation'],
+      },
+    },
+    checkout: root,
+  });
+
+  assert.equal(result.decision, 'SKIP');
+  assert.match(result.reason, /documentation-only/);
+  assert.equal(modelCalls, 0);
+
+  const labeled = await worker.handle({
+    action: 'scout',
+    task: {
+      issue_snapshot: {
+        title: 'Add docs/README.md index linking all docs files',
+        labels: ['documentation', 'good first issue'],
+      },
+    },
+    checkout: root,
+  });
+  assert.equal(labeled.decision, 'SKIP');
+  assert.equal(modelCalls, 0);
+
+  for (const title of [
+    'Documentation generator emits stale navigation',
+    'README renderer truncates code blocks',
+    'Translate command hangs on nested input',
+    'Documentation pipeline hangs on startup',
+    'README preview is blank',
+    'Documentation index duplicates entries',
+    'README links resolve incorrectly',
+    'Translate task times out on nested input',
+  ]) {
+    const codeResult = await worker.handle({
+      action: 'scout',
+      task: {issue_snapshot: {title}},
+      checkout: root,
+    });
+    assert.doesNotMatch(codeResult.reason, /documentation-only/, title);
+    assert.match(codeResult.reason, /root package\.json is missing/, title);
+  }
+
+  const explicitDocs = await worker.handle({
+    action: 'scout',
+    task: {issue_snapshot: {title: 'Document the build command'}},
+    checkout: root,
+  });
+  assert.doesNotMatch(explicitDocs.reason, /documentation-only/);
+  assert.match(explicitDocs.reason, /root package\.json is missing/);
+
+  let codeModelCalls = 0;
+  const codeWorker = createNodeWorker({
+    codexRunner: async () => {
+      codeModelCalls += 1;
+      return {
+        decision: 'SKIP', reason: 'model inspected a testable code defect',
+        test_command: '', install_command: '', target_files: [],
+        estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
+        required_checks: [],
+      };
+    },
+  });
+  for (const title of [
+    'Documentation build fails when schemas contain aliases',
+    'Translate command fails on nested input',
+  ]) {
+    const codeResult = await codeWorker.handle({
+      action: 'scout', task: {issue_snapshot: {title}}, checkout: root,
+    });
+    assert.equal(codeResult.reason, 'root package.json is missing');
+  }
+  assert.equal(codeModelCalls, 0);
+});
+
 test('N1c author must bind every required repository check into the verifier command', async (t) => {
   const {checkout, task} = await repository(t);
   let invocation;
@@ -175,6 +265,439 @@ test('N1d scout rejects workspace and PnP layouts before model or bootstrap work
   assert.equal(yarnRc.decision, 'SKIP');
   assert.match(yarnRc.reason, /Yarn Berry/);
 
+  await rm(path.join(checkout, '.yarnrc.yml'));
+  await writeFile(path.join(checkout, 'composer.json'), JSON.stringify({
+    name: 'fixture/mixed-php-node',
+  }));
+  const composer = await worker.handle({action: 'scout', task, checkout});
+  assert.equal(composer.decision, 'SKIP');
+  assert.match(composer.reason, /mixed PHP\/Node repositories require an explicit Node target/);
+
+  let mixedNodeCalls = 0;
+  const mixedNodeWorker = createNodeWorker({
+    image: IMAGE,
+    codexRunner: async () => {
+      mixedNodeCalls += 1;
+      return {
+        decision: 'SKIP', reason: 'model inspected an explicit Node target',
+        test_command: '', install_command: '', target_files: [],
+        estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
+        required_checks: [],
+      };
+    },
+  });
+  const explicitNode = await mixedNodeWorker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix the JavaScript value helper',
+        body: 'Update src/value.mjs and run node --test.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(explicitNode.reason, 'model inspected an explicit Node target');
+  assert.equal(mixedNodeCalls, 1);
+
+  const nodeWithPhpContext = await mixedNodeWorker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update the JavaScript client',
+        body: 'Update src/value.mjs to handle output documented in backend/Controller.php.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(nodeWithPhpContext.reason, 'model inspected an explicit Node target');
+  assert.equal(mixedNodeCalls, 2);
+
+  const nodeWithInspectedPhpContext = await mixedNodeWorker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update the JavaScript client',
+        body: 'Update src/value.mjs; inspect backend/Controller.php for the response format.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(nodeWithInspectedPhpContext.reason, 'model inspected an explicit Node target');
+  assert.equal(mixedNodeCalls, 3);
+
+  const nodeWithLaravelContext = await mixedNodeWorker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update the JavaScript client for Laravel responses',
+        body: 'Update src/value.mjs.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(nodeWithLaravelContext.reason, 'model inspected an explicit Node target');
+  assert.equal(mixedNodeCalls, 4);
+
+  const phpForReact = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix the PHP response consumed by the React client',
+        body: 'The Laravel controller returns the wrong status.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(phpForReact.decision, 'SKIP');
+  assert.match(phpForReact.reason, /mixed PHP\/Node repositories require an explicit Node target/);
+
+  const phpWithNodeVerification = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix the Laravel response',
+        body: 'Update the PHP controller.\nRun npm test after the change.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(phpWithNodeVerification.decision, 'SKIP');
+  assert.match(phpWithNodeVerification.reason, /mixed PHP\/Node repositories require an explicit Node target/);
+
+  const mixedMutationTargets = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update the response and client',
+        body: 'Modify the Laravel controller. Update src/value.mjs.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(mixedMutationTargets.decision, 'SKIP');
+  assert.match(mixedMutationTargets.reason, /mixed PHP\/Node repositories require an explicit Node target/);
+
+  const modifiedPhpPath = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update the response and client',
+        body: 'Update existing backend/Controller.php. Update src/value.mjs.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(modifiedPhpPath.decision, 'SKIP');
+  assert.match(modifiedPhpPath.reason, /mixed PHP\/Node repositories require an explicit Node target/);
+
+  const modifiedLegacyPhp = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update the response and client',
+        body: 'Refactor the legacy Laravel controller. Update src/value.mjs.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(modifiedLegacyPhp.decision, 'SKIP');
+  assert.match(modifiedLegacyPhp.reason, /mixed PHP\/Node repositories require an explicit Node target/);
+
+  const sameClauseMixedPaths = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update both clients',
+        body: 'Update src/value.mjs and backend/Controller.php.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(sameClauseMixedPaths.decision, 'SKIP');
+  assert.match(sameClauseMixedPaths.reason, /mixed PHP\/Node repositories require an explicit Node target/);
+
+  const phpLocationAfterReactContext = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix response handling',
+        body: 'Fix React handling in the Laravel controller.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(phpLocationAfterReactContext.decision, 'SKIP');
+  assert.match(phpLocationAfterReactContext.reason, /mixed PHP\/Node repositories require an explicit Node target/);
+
+  const sameClauseMixedTechnologies = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update both frontends',
+        body: 'Update the React frontend and Laravel controller.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(sameClauseMixedTechnologies.decision, 'SKIP');
+  assert.match(sameClauseMixedTechnologies.reason, /mixed PHP\/Node repositories require an explicit Node target/);
+  await rm(path.join(checkout, 'composer.json'));
+
+  await mkdir(path.join(checkout, 'backend'));
+  await writeFile(path.join(checkout, 'backend', 'composer.json'), JSON.stringify({
+    name: 'fixture/php-backend',
+  }));
+  const nestedComposer = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix backend response',
+        body: 'Start in backend/src/Controller.php',
+      },
+    },
+    checkout,
+  });
+  assert.equal(nestedComposer.decision, 'SKIP');
+  assert.match(nestedComposer.reason, /nested Composer package backend\//);
+
+  const directoryComposer = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix backend response',
+        body: 'Start in backend',
+      },
+    },
+    checkout,
+  });
+  assert.equal(directoryComposer.decision, 'SKIP');
+  assert.match(directoryComposer.reason, /nested Composer package backend\//);
+
+  const implementedInComposer = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Add validation',
+        body: 'Implement validation in backend',
+      },
+    },
+    checkout,
+  });
+  assert.equal(implementedInComposer.decision, 'SKIP');
+  assert.match(implementedInComposer.reason, /nested Composer package backend\//);
+
+  let nestedContextCalls = 0;
+  const nestedContextWorker = createNodeWorker({
+    image: IMAGE,
+    codexRunner: async () => {
+      nestedContextCalls += 1;
+      return {
+        decision: 'SKIP', reason: 'model inspected the explicit Node path',
+        test_command: '', install_command: '', target_files: [],
+        estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
+        required_checks: [],
+      };
+    },
+  });
+  const inspectedComposerContext = await nestedContextWorker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update the JavaScript client',
+        body: 'Update src/value.mjs; inspect backend/Controller.php for the response format.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(inspectedComposerContext.reason, 'model inspected the explicit Node path');
+  assert.equal(nestedContextCalls, 1);
+
+  const usedComposerContext = await nestedContextWorker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update the JavaScript client',
+        body: 'Update src/value.mjs; use backend/Controller.php as a reference.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(usedComposerContext.reason, 'model inspected the explicit Node path');
+  assert.equal(nestedContextCalls, 2);
+
+  for (const target of ['./backend', 'backend.']) {
+    const normalizedDirectoryComposer = await worker.handle({
+      action: 'scout',
+      task: {
+        ...task,
+        issue_snapshot: {
+          title: 'Fix backend response',
+          body: `Start in ${target}`,
+        },
+      },
+      checkout,
+    });
+    assert.equal(normalizedDirectoryComposer.decision, 'SKIP');
+    assert.match(normalizedDirectoryComposer.reason, /nested Composer package backend\//);
+  }
+
+  const nestedContext = await nestedContextWorker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Update the JavaScript client',
+        body: 'Update src/value.mjs so it handles data from backend/src/Controller.php.',
+      },
+    },
+    checkout,
+  });
+  assert.equal(nestedContext.reason, 'model inspected the explicit Node path');
+  assert.equal(nestedContextCalls, 3);
+
+  await mkdir(path.join(checkout, 'stellar-payment-platform'));
+  await writeFile(path.join(checkout, 'stellar-payment-platform', 'package.json'), JSON.stringify({
+    name: 'nested-backend', private: true,
+  }));
+  const nested = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix CORS configuration',
+        body: 'Where to Start: stellar-payment-platform/server.js',
+      },
+    },
+    checkout,
+  });
+  assert.equal(nested.decision, 'SKIP');
+  assert.match(nested.reason, /nested package stellar-payment-platform\//);
+
+  await mkdir(path.join(checkout, 'packages', 'api'), {recursive: true});
+  await writeFile(path.join(checkout, 'packages', 'api', 'package.json'), JSON.stringify({
+    name: 'nested-api', private: true,
+  }));
+  const deepNested = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix API response',
+        body: 'Start in packages/api/src/server.js',
+      },
+    },
+    checkout,
+  });
+  assert.equal(deepNested.decision, 'SKIP');
+  assert.match(deepNested.reason, /nested package packages\/api\//);
+
+  const directoryOnly = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix API response',
+        body: 'Start in packages/api',
+      },
+    },
+    checkout,
+  });
+  assert.equal(directoryOnly.decision, 'SKIP');
+  assert.match(directoryOnly.reason, /nested package packages\/api\//);
+
+  await mkdir(path.join(checkout, 'packages', '@scope', 'api'), {recursive: true});
+  await writeFile(path.join(checkout, 'packages', '@scope', 'api', 'package.json'), JSON.stringify({
+    name: '@scope/api', private: true,
+  }));
+  const scopedNested = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix scoped API response',
+        body: 'Start in packages/@scope/api/src/server.js',
+      },
+    },
+    checkout,
+  });
+  assert.equal(scopedNested.decision, 'SKIP');
+  assert.match(scopedNested.reason, /nested package packages\/@scope\/api\//);
+
+  await symlink(path.join('packages', 'api'), path.join(checkout, 'linked-api'));
+  const symlinkedNested = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix linked API response',
+        body: 'Start in linked-api/src/server.js',
+      },
+    },
+    checkout,
+  });
+  assert.equal(symlinkedNested.decision, 'SKIP');
+  assert.match(symlinkedNested.reason, /target linked-api\/ uses a symlink/);
+
+  await mkdir(path.join(checkout, 'manifest-link'));
+  await symlink(path.join('..', 'package.json'), path.join(checkout, 'manifest-link', 'package.json'));
+  const symlinkedManifest = await worker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix manifest-linked API response',
+        body: 'Start in manifest-link/src/server.js',
+      },
+    },
+    checkout,
+  });
+  assert.equal(symlinkedManifest.decision, 'SKIP');
+  assert.match(symlinkedManifest.reason, /nested package manifest-link\/ uses a symlinked manifest/);
+
+  let traversalModelCalls = 0;
+  const traversalWorker = createNodeWorker({
+    image: IMAGE,
+    codexRunner: async () => {
+      traversalModelCalls += 1;
+      return {
+        decision: 'SKIP', reason: 'model inspected the non-nested target',
+        test_command: '', install_command: '', target_files: [],
+        estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
+        required_checks: [],
+      };
+    },
+  });
+  const traversal = await traversalWorker.handle({
+    action: 'scout',
+    task: {
+      ...task,
+      issue_snapshot: {
+        title: 'Fix shared response',
+        body: 'Inspect src/../shared/file.js',
+      },
+    },
+    checkout,
+  });
+  assert.equal(traversal.reason, 'model inspected the non-nested target');
+  assert.equal(traversalModelCalls, 1);
+
   await rm(path.join(checkout, 'package.json'));
   const missingRoot = await worker.handle({action: 'scout', task, checkout});
   assert.equal(missingRoot.decision, 'SKIP');
@@ -221,11 +744,24 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
     installCommand: 'npm ci --no-audit --no-fund',
   }).join('\n');
   assert.match(bootstrap, /src=\/private\/factory\/repository,dst=\/source,readonly/);
-  assert.match(bootstrap, /\/workspace:rw,exec,nosuid,nodev,size=2g/);
+  assert.match(bootstrap, /--user\n1000:1000/);
+  assert.match(bootstrap, /\/workspace:rw,exec,nosuid,nodev,size=2g,mode=1777/);
   assert.match(bootstrap, /tar -C \/source/);
+  assert.match(bootstrap, /--strip-components=1 --no-same-owner --no-same-permissions -m/);
   assert.match(bootstrap, /src=northset-deps-abc,dst=\/workspace\/node_modules$/m);
   assert.doesNotMatch(bootstrap, /dst=\/workspace\/node_modules,readonly/);
   assert.doesNotMatch(bootstrap, /auth\.json|CODEX_HOME|GITHUB_TOKEN|GH_TOKEN/);
+
+  const volumeInit = dependencyVolumeInitDockerArgs({
+    volume: 'northset-deps-abc', image: IMAGE,
+  }).join('\n');
+  assert.match(volumeInit, /--network=none/);
+  assert.match(volumeInit, /--read-only/);
+  assert.match(volumeInit, /--cap-drop=ALL/);
+  assert.match(volumeInit, /--cap-add=CHOWN/);
+  assert.match(volumeInit, /src=northset-deps-abc,dst=\/deps/);
+  assert.match(volumeInit, /chown\n-R\n1000:1000\n\/deps$/);
+  assert.doesNotMatch(volumeInit, /\/source|CODEX_HOME|GITHUB_TOKEN|GH_TOKEN/);
 
   const runtime = runtimeDockerArgs({
     checkout, volume: 'northset-deps-abc', image: IMAGE, command: 'node --test',

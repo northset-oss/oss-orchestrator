@@ -3,7 +3,7 @@ import {mkdtemp, rm} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import {approveBoard} from './board.mjs';
+import {approveBoard, classifyRisk} from './board.mjs';
 import {openFactoryDb} from './db.mjs';
 import {
   assertDeclaredTestsExecuted,
@@ -23,6 +23,26 @@ async function makeFactory(t, {missionStart = 1000} = {}) {
   t.after(() => db.close());
   return {root, db};
 }
+
+test('rendered UI changes are at least AMBER risk', () => {
+  for (const changedPath of [
+    'src/ControlPanel.jsx', 'src/view.mjs', 'src/icon.svg', 'src/page.astro', 'src/content.mdx',
+    'addon/content/components/conversation/conversationHeader.mjs',
+    'src/Header.mjs', 'src/Button.js', 'src/render.mjs', 'src/router.js',
+    'src/components/conversation/subject.mjs', 'src/dialog.mjs', 'src/layout.js',
+    'src/modal.mjs', 'src/menu.js', 'src/screen.mjs', 'src/widget.js',
+    'src/accordion.js', 'src/tabs.mjs', 'src/avatar.js',
+  ]) {
+    assert.equal(classifyRisk({
+      changed_files: [{path: changedPath, class: 'production', lines: 20}],
+      changed_lines: 20,
+    }), 'AMBER', changedPath);
+  }
+  assert.equal(classifyRisk({
+    changed_files: [{path: 'src/parser.mjs', class: 'production', lines: 20}],
+    changed_lines: 20,
+  }), 'GREEN');
+});
 
 function candidates(count) {
   return Array.from({length: count}, (_, index) => ({
@@ -177,6 +197,27 @@ test('a late repository authoring block skips a queued task before checkout or m
   assert.equal(scoutCalls, 0);
   assert.equal(db.listTasks({limit: 10})[0].state, 'SKIPPED');
   assert.equal(db.listTasks({limit: 10})[0].last_error, reason);
+});
+
+test('a scout timeout defers retry to a later durable attempt', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  const driver = verifiedDriver({verified: 1});
+  let scoutCalls = 0;
+  driver.scout = async () => {
+    scoutCalls += 1;
+    const error = new Error('worker command timed out after 90000ms');
+    error.transient = true;
+    throw error;
+  };
+
+  const result = await runFactoryCycle({db, workers: 1, driver});
+
+  assert.equal(scoutCalls, 1);
+  assert.equal(result.results[0].state, 'FAILED');
+  const [task] = db.listTasks({limit: 10});
+  assert.equal(task.state, 'FAILED');
+  assert.equal(task.last_failure_class, 'infrastructure');
 });
 
 test('a late maintainer-user authoring block skips carried work before checkout', async (t) => {
@@ -799,6 +840,21 @@ test('command driver recognizes narrow Codex control-plane failures', async (t) 
       error.infrastructure === true && error.transient === transient &&
         error.providerUnavailable === providerUnavailable);
   }
+
+  const signaled = createCommandDriver({
+    command: process.execPath,
+    args: ['-e', "process.kill(process.pid, 'SIGTERM');"],
+    workRoot: root,
+  });
+  await assert.rejects(() => signaled.scout(candidates(1)[0], root, {}), (error) =>
+    error.infrastructure === true && /signal SIGTERM/.test(error.message));
+  const noisySignal = createCommandDriver({
+    command: process.execPath,
+    args: ['-e', "process.stderr.write('cleanup failed'); process.kill(process.pid, 'SIGTERM');"],
+    workRoot: root,
+  });
+  await assert.rejects(() => noisySignal.scout(candidates(1)[0], root, {}), (error) =>
+    error.infrastructure === true && /signal SIGTERM: cleanup failed/.test(error.message));
 });
 
 test('one verifier failure is passed to exactly one second author attempt', async (t) => {
@@ -823,6 +879,33 @@ test('one verifier failure is passed to exactly one second author attempt', asyn
   assert.equal(verifications, 2);
   assert.equal(db.stats().attempts, 1);
   assert.equal(db.stats().ready_items, 1);
+});
+
+test('an interrupted second author preserves the first verifier failure', async (t) => {
+  const {db} = await makeFactory(t);
+  db.enqueueTasks(candidates(1));
+  const driver = verifiedDriver({verified: 1});
+  const originalAuthor = driver.author;
+  let authors = 0;
+  driver.author = async (...args) => {
+    authors += 1;
+    if (authors === 2) {
+      const error = new Error('worker command failed: signal SIGTERM');
+      error.infrastructure = true;
+      throw error;
+    }
+    return originalAuthor(...args);
+  };
+  driver.verify = async () => {
+    throw new Error('focused assertion failed');
+  };
+
+  await runFactoryCycle({db, workers: 1, driver});
+
+  const [task] = db.listTasks({state: 'FAILED', limit: 1});
+  assert.equal(task.last_failure_class, 'infrastructure');
+  assert.match(task.last_error, /signal SIGTERM/);
+  assert.match(task.last_error, /prior verifier feedback: focused assertion failed/);
 });
 
 test('one transient verifier startup retry does not consume the second author attempt', async (t) => {

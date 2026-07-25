@@ -54,6 +54,13 @@ function graphRepository(number = 1, overrides = {}) {
     nameWithOwner: `Owner/Repo${number}`,
     isArchived: false,
     isFork: false,
+    createdAt: '2025-01-01T00:00:00Z',
+    stargazerCount: 10,
+    forkCount: 2,
+    diskUsage: 1_024,
+    licenseInfo: {spdxId: 'MIT'},
+    issues: {totalCount: 4},
+    pullRequests: {totalCount: 2},
     defaultBranchRef: {name: 'main', target: {oid: OID}},
     rootPackage: {byteSize: 1_024, text: '{"scripts":{"test":"node --test"}}'},
     issue: {
@@ -79,6 +86,8 @@ function normalizedLive(overrides = {}) {
     candidate: candidate(),
     repository: {
       nodeId: 'R_1', nameWithOwner: 'Owner/Repo1', archived: false, fork: false,
+      createdAt: '2025-01-01T00:00:00Z', stargazerCount: 10, forkCount: 2,
+      diskUsageKb: 1_024, licenseSpdxId: 'MIT', issueCount: 4, pullRequestCount: 2,
       defaultBranch: 'main', defaultOid: OID, hasRootPackageJson: true,
       unsupportedNodeLayout: null, prohibitedAiPolicyFile: null, northsetOpenPrs: 0,
     },
@@ -240,6 +249,7 @@ test('source excludes repository and owner interaction blocks before live prefli
 test('preflight query consolidates all live fields and repository-wide Northset PR search', () => {
   const query = buildPreflightQuery([candidate()]);
   for (const expected of ['isArchived', 'isFork', 'defaultBranchRef', 'rootPackage', 'rootReadme',
+    'createdAt', 'stargazerCount', 'forkCount', 'diskUsage', 'licenseInfo', 'pullRequests',
     'rootContributing', 'githubContributing', 'rootAgents', 'githubAgents', 'rootClaude',
     'rootAiPolicy', 'githubAiPolicy', 'rootPullRequestTemplate', 'githubPullRequestTemplate',
     'rootPullRequestTemplateLower', 'githubPullRequestTemplateLower',
@@ -382,6 +392,10 @@ test('each hard live-preflight violation returns SKIP', async (t) => {
     ['unapproved issue', normalizedLive({issue: {labels: ['good first issue', 'unapproved']}}), /marked unapproved/],
     ['already in development', normalizedLive({issue: {labels: ['good first issue', 'in-develop']}}), /development branch/],
     ['archived repository', normalizedLive({repository: {archived: true}}), /archived/],
+    ['new unlicensed zero-signal repository', normalizedLive({repository: {
+      createdAt: '2026-07-24T00:00:00Z', stargazerCount: 0, forkCount: 0,
+      licenseSpdxId: null, pullRequestCount: 0,
+    }}), /manual provenance review/],
     ['missing root package', normalizedLive({repository: {hasRootPackageJson: false}}), /root package\.json/],
     ['unsupported workspace', normalizedLive({repository: {
       unsupportedNodeLayout: 'multi-package workspaces are outside the single-package Node lane',
@@ -419,6 +433,18 @@ test('recent common claim and collaborator-offer phrases block while stale inter
     'assign me pls.',
     'kindly merge PR #270',
     'This one is yours if you want it.',
+    '@baling-1 has applied to work on this issue.',
+    "I'd be happy to take this issue on.",
+    "I'm applying to work on this issue.",
+    'I have applied to work on this issue.',
+    `@${'a'.repeat(39)} has applied to work on this issue.`,
+    'I can take this issue.',
+    'I can implement this issue.',
+    'I will handle this issue.',
+    'Let me take this one.',
+    "I'll handle this issue.",
+    'I am taking this issue.',
+    'Let me handle this one.',
   ];
   for (const body of phrases) {
     const live = normalizedLive({issue: {comments: [{
