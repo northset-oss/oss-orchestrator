@@ -33,7 +33,8 @@ const INSTALL_TIMEOUT_MS = 15 * 60_000;
 const AUTHOR_TIMEOUT_MS = 10 * 60_000;
 const SCOUT_TIMEOUT_MS = 90_000;
 const VERIFY_TIMEOUT_MS = 10 * 60_000;
-const SELF_CLAIM_EVIDENCE_PATTERN = /\b(?:i(?:['’]m| am|['’]ll| will)?\s+(?:work(?:ing)?|tak(?:e|ing)|claim|implement|handl(?:e|ing))(?:\s+on)?\s+(?:this|it)|i(?:['’]d| would)\s+(?:like|love|be happy)\s+to\s+(?:(?:work|take)\s+(?:on\s+)?|claim|implement|investigate)(?:this(?:\s+one|\s+issue)?|it)?|(?:can\s+i|i\s+can)\s+work\s+on\s+(?:this|it)|could\s+i\s+be\s+assigned|(?:please\s+)?assign\s+(?:me|(?:this|it)(?:\s+issue)?\s+to\s+me))\b/i;
+const SELF_CLAIM_EVIDENCE_PATTERN = /\b(?:i(?:['’]m| am)\s+(?:working|taking|claiming|implementing|handling)(?:\s+on)?\s+(?:this|it)|i(?:['’]ll| will)\s+(?:work|take|claim|implement|handle)(?:\s+on)?\s+(?:this|it)|i(?:['’]d| would)\s+(?:like|love|be happy)\s+to\s+(?:(?:work|take)\s+(?:on\s+)?|claim|implement|investigate)(?:this(?:\s+one|\s+issue)?|it)?|(?:can\s+i|i\s+can)\s+work\s+on\s+(?:this|it)|could\s+i\s+be\s+assigned|(?:please\s+)?assign\s+(?:me|(?:this|it)(?:\s+issue)?\s+to\s+me))\b/i;
+const SELF_CLAIM_RETRACTION_PATTERN = /\b(?:i\s+(?:cannot|can't|will not|won't|am no longer)\s+(?:work|take|handle)|i(?:['’]m| am)\s+withdrawing|never\s*mind|please\s+unassign\s+me|unclaim(?:ing)?\s+this)\b/i;
 
 export const SCOUT_SCHEMA = Object.freeze({
   type: 'object',
@@ -655,17 +656,25 @@ function assertScout(result, task = {}) {
   result.required_checks = [...new Set((result.required_checks ?? [])
     .map((check) => String(check).trim()).filter(Boolean))];
   const comments = Array.isArray(task.issue_snapshot?.comments) ? task.issue_snapshot.comments : [];
-  const normalizedEvidence = stripHtmlComments(result.pre_work_evidence)
-    .normalize('NFKC').replace(/[‘’]/g, "'").replace(/\s+/g, ' ').trim();
-  const qualifyingComment = normalizedEvidence && comments.find((comment) => {
+  const contributorComments = comments.map((comment, index) => ({
+    comment,
+    index,
+    observedAt: Date.parse(comment?.createdAt ?? ''),
+  })).filter(({comment}) => {
     const author = typeof comment?.author === 'string' ? comment.author : comment?.author?.login;
-    const body = stripHtmlComments(comment?.body);
-    const normalizedBody = body.normalize('NFKC')
-      .replace(/[‘’]/g, "'").replace(/\s+/g, ' ').trim();
-    return String(author ?? '').toLowerCase() === 'aysajane' &&
-      SELF_CLAIM_EVIDENCE_PATTERN.test(normalizedEvidence) &&
-      normalizedBody.includes(normalizedEvidence);
+    return String(author ?? '').toLowerCase() === 'aysajane';
+  }).sort((left, right) => {
+    if (Number.isFinite(left.observedAt) && Number.isFinite(right.observedAt)) {
+      return left.observedAt - right.observedAt || left.index - right.index;
+    }
+    return left.index - right.index;
   });
+  let qualifyingComment = null;
+  for (const {comment} of contributorComments) {
+    const body = stripHtmlComments(comment?.body);
+    if (SELF_CLAIM_RETRACTION_PATTERN.test(body)) qualifyingComment = null;
+    else if (SELF_CLAIM_EVIDENCE_PATTERN.test(body)) qualifyingComment = comment;
+  }
   const evidencePresent = Boolean(qualifyingComment);
   if (qualifyingComment) {
     result.pre_work_evidence = stripHtmlComments(qualifyingComment.body).trim();

@@ -122,7 +122,7 @@ test('N1b scout skips when mandatory pre-work communication has no issue evidenc
   assert.deepEqual(result.required_checks, ['npm test', 'npm run typecheck']);
 });
 
-test('N1b scout recognizes the contributor claim deterministically despite quote normalization', async (t) => {
+test('N1b scout recognizes the stored contributor claim without relying on the model quote', async (t) => {
   const {checkout, task} = await repository(t);
   task.issue_snapshot.comments = [{
     author: 'AysajanE',
@@ -134,7 +134,7 @@ test('N1b scout recognizes the contributor claim deterministically despite quote
     install_command: '', target_files: ['src/value.mjs', 'test/value.test.mjs'],
     estimated_risk: 'GREEN',
     pre_work_rule: 'Comment on the issue to claim it before starting.',
-    pre_work_evidence: "I'd like to work on this issue.",
+    pre_work_evidence: '',
     required_checks: ['npm test', 'npm run typecheck'],
   })});
 
@@ -165,6 +165,32 @@ test('N1b scout does not treat a contributor-authored offer to someone else as a
   assert.match(result.reason, /required pre-work public communication was not completed/);
 });
 
+test('N1b scout treats a later contributor retraction as clearing an earlier claim', async (t) => {
+  const {checkout, task} = await repository(t);
+  task.issue_snapshot.comments = [{
+    author: 'AysajanE',
+    createdAt: '2026-07-25T14:00:00Z',
+    body: 'I’d like to work on this issue.',
+  }, {
+    author: 'AysajanE',
+    createdAt: '2026-07-25T15:00:00Z',
+    body: 'I can no longer work on this issue. Please unassign me.',
+  }];
+  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => ({
+    decision: 'GO', reason: 'the patch is bounded',
+    test_command: 'node --test test/value.test.mjs && npm test && npm run typecheck',
+    install_command: '', target_files: ['src/value.mjs', 'test/value.test.mjs'],
+    estimated_risk: 'GREEN',
+    pre_work_rule: 'Comment on the issue to claim it before starting.',
+    pre_work_evidence: 'I’d like to work on this issue.',
+    required_checks: ['npm test', 'npm run typecheck'],
+  })});
+
+  const result = await worker.handle({action: 'scout', task, checkout});
+  assert.equal(result.decision, 'SKIP');
+  assert.match(result.reason, /required pre-work public communication was not completed/);
+});
+
 test('N1b scout does not treat assigning the issue to someone else as a self-claim', async (t) => {
   const {checkout, task} = await repository(t);
   task.issue_snapshot.comments = [{
@@ -178,6 +204,27 @@ test('N1b scout does not treat assigning the issue to someone else as a self-cla
     estimated_risk: 'GREEN',
     pre_work_rule: 'Comment on the issue to claim it before starting.',
     pre_work_evidence: 'Please assign this to @other.',
+    required_checks: ['npm test', 'npm run typecheck'],
+  })});
+
+  const result = await worker.handle({action: 'scout', task, checkout});
+  assert.equal(result.decision, 'SKIP');
+  assert.match(result.reason, /required pre-work public communication was not completed/);
+});
+
+test('N1b scout does not treat first-person issue discussion as a self-claim', async (t) => {
+  const {checkout, task} = await repository(t);
+  task.issue_snapshot.comments = [{
+    author: 'AysajanE',
+    body: 'I claim this is incorrect; I am not claiming the issue.',
+  }];
+  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => ({
+    decision: 'GO', reason: 'the patch is bounded',
+    test_command: 'node --test test/value.test.mjs && npm test && npm run typecheck',
+    install_command: '', target_files: ['src/value.mjs', 'test/value.test.mjs'],
+    estimated_risk: 'GREEN',
+    pre_work_rule: 'Comment on the issue to claim it before starting.',
+    pre_work_evidence: '',
     required_checks: ['npm test', 'npm run typecheck'],
   })});
 
