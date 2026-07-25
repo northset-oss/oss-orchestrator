@@ -817,6 +817,27 @@ test('N1d scout rejects workspace and PnP layouts before model or bootstrap work
   assert.match(missingRoot.reason, /root package\.json/);
 });
 
+test('N1e scout accepts a package.json with a UTF-8 BOM', async (t) => {
+  const {checkout, task} = await repository(t);
+  let modelCalls = 0;
+  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => {
+    modelCalls += 1;
+    return {
+      decision: 'SKIP', reason: 'model inspected the candidate',
+      test_command: '', install_command: '', target_files: [],
+      estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
+      required_checks: [],
+    };
+  }});
+  await writeFile(path.join(checkout, 'package.json'),
+    `\uFEFF${JSON.stringify({name: 'worker-fixture', private: true})}`);
+
+  const result = await worker.handle({action: 'scout', task, checkout});
+
+  assert.equal(result.reason, 'model inspected the candidate');
+  assert.equal(modelCalls, 1);
+});
+
 test('N2 the authenticated model client stays host-side and Docker plans remain credential-free', async (t) => {
   const checkout = '/private/factory/repository';
   const codexHome = '/private/factory/codex-home';

@@ -204,6 +204,15 @@ async function isFile(file) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
+async function readPackageJson(checkout) {
+  try {
+    const contents = await readFile(path.join(checkout, 'package.json'), 'utf8');
+    return JSON.parse(contents.replace(/^\uFEFF/u, ''));
+  } catch (error) {
+    throw new Error(`cannot parse package.json: ${error.message}`);
+  }
+}
+
 function taskIssueText(task) {
   const issue = task?.issue_snapshot ?? task?.live_state?.issue ?? {};
   return `${String(issue.title ?? '')}\n${String(issue.body ?? '')}`;
@@ -328,9 +337,7 @@ async function unsupportedNodeLayout(checkout, task = null) {
   if (await isFile(path.join(checkout, 'composer.json')) && !hasExplicitNodeTarget(task)) {
     return 'mixed PHP/Node repositories require an explicit Node target for the single-package Node lane';
   }
-  let packageJson;
-  try { packageJson = JSON.parse(await readFile(path.join(checkout, 'package.json'), 'utf8')); }
-  catch (error) { throw new Error(`cannot parse package.json: ${error.message}`); }
+  const packageJson = await readPackageJson(checkout);
   const workspaces = packageJson.workspaces;
   if ((Array.isArray(workspaces) && workspaces.length) ||
       (workspaces && typeof workspaces === 'object' && Object.keys(workspaces).length)) {
@@ -413,9 +420,7 @@ async function resolveNodeCommands(checkout, scout = {}, task = null) {
   if (!await isFile(path.join(checkout, 'package.json'))) {
     throw new Error('Node worker requires a root package.json');
   }
-  let packageJson;
-  try { packageJson = JSON.parse(await readFile(path.join(checkout, 'package.json'), 'utf8')); }
-  catch (error) { throw new Error(`cannot parse package.json: ${error.message}`); }
+  const packageJson = await readPackageJson(checkout);
   const unsupportedLayout = await unsupportedNodeLayout(checkout, task);
   if (unsupportedLayout) throw new Error(unsupportedLayout);
   let installCommand = String(scout.install_command ?? '').trim();
