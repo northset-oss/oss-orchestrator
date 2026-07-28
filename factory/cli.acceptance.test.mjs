@@ -207,37 +207,12 @@ test('parser provides stable paths and strictly validates command-specific argum
   assert.equal(parseFactoryCliArgs([
     'github-resume', '--reason', 'reviewed', '--acknowledge-forbidden',
   ], {env: {}}).acknowledgeForbidden, true);
-  assert.deepEqual(parseFactoryCliArgs([
-    'publication-limits',
-    '--repository-open', '1',
-    '--owner-rolling-7d', '3',
-    '--per-hour', '2',
-    '--per-day', '5',
-    '--reason', 'first twenty reviewed',
-  ], {env: {}}).limits, {
-    repositoryOpen: 1,
-    ownerRolling7d: 3,
-    perHour: 2,
-    perDay: 5,
-  });
-  assert.throws(() => parseFactoryCliArgs([
-    'publication-limits', '--repository-open', '1',
-  ], {env: {}}), /--reason is required|positive integer/);
 });
 
 test('discover routes every search through the current GitHub safety queue and transport', async () => {
   const calls = [];
-  const interactionBlocks = [{scope: 'repository', subject: 'blocked/repo', block_authoring: true}];
   const db = fakeDb({
-    listTasks: async () => [{
-      candidate: 'known/repo#7',
-      issue_snapshot: {nodeId: 'I_known'},
-      live_state: {issue: {nodeId: 'I_known'}, candidate: {issueNodeId: 'I_known'}},
-    }],
-    listInteractionBlocks: async (options) => {
-      assert.deepEqual(options, {action: 'authoring'});
-      return interactionBlocks;
-    },
+    listTasks: async () => [{candidate: 'known/repo#7'}],
   });
   const transport = async () => assert.fail('discover must use the GraphQL transport surface');
   transport.graphql = async (request) => {
@@ -257,8 +232,6 @@ test('discover routes every search through the current GitHub safety queue and t
       discoverCandidates: async (options) => {
         assert.equal(options.target, 32);
         assert.deepEqual(options.knownCandidates, ['known/repo#7']);
-        assert.deepEqual(options.knownIssueNodeIds, ['I_known', 'I_known', 'I_known']);
-        assert.deepEqual(options.interactionBlocks, interactionBlocks);
         for (const [index, name] of [
           'good_first_issue:global', 'good_first_issue:JavaScript', 'good_first_issue:TypeScript',
           'help_wanted:global', 'help_wanted:JavaScript', 'help_wanted:TypeScript',
@@ -513,9 +486,8 @@ test('a transient preflight failure still drains queued work and retries on the 
   const db = fakeDb({stats: () => ({ready_items: 1})});
   let fills = 0;
   let cycles = 0;
-  const transient = new Error('gh api graphql failed: error connecting to api.github.com');
-  transient.code = 'GH_COMMAND_FAILED';
-  transient.stderr = 'check your internet connection or https://githubstatus.com';
+  const transient = new Error('temporary GitHub preflight timeout');
+  transient.code = 'ETIMEDOUT';
   const result = await executeFactoryCli(['run', '--poll-ms', '0'], {
     env: {},
     signal: controller.signal,
@@ -540,7 +512,7 @@ test('a transient preflight failure still drains queued work and retries on the 
   assert.equal(cycles, 2);
   assert.equal(result.claimed, 1);
   assert.equal(result.source_failures, 1);
-  assert.match(result.last_source_error, /error connecting to api\.github\.com/);
+  assert.match(result.last_source_error, /temporary GitHub preflight timeout/);
 });
 
 test('run performs one bounded asynchronous reconciliation pass without blocking local work', async () => {
@@ -844,11 +816,6 @@ test('github-status is read-only and github-resume performs one injected probe p
     env: {},
     stdout: statusOutput.stream,
     dependencies: {
-      openDb: () => fakeDb({
-        getPolicyState: () => ({
-          public_limits: {repositoryOpen: 1, ownerRolling7d: 3, perHour: 2, perDay: 5},
-        }),
-      }),
       transport: async () => assert.fail('status must not call transport'),
       createSafety: (options) => {
         safetyOptions = options;
@@ -858,8 +825,6 @@ test('github-status is read-only and github-resume performs one injected probe p
   });
   assert.equal(statusResult, status);
   assert.equal(safetyOptions.pauseFile, FACTORY_DEFAULTS.pauseFile);
-  assert.deepEqual(safetyOptions.publicLimits,
-    {repositoryOpen: 1, ownerRolling7d: 3, perHour: 2, perDay: 5});
   assert.equal(JSON.parse(statusOutput.read()).paused, true);
 
   const resumeOutput = output();
@@ -904,63 +869,6 @@ test('github-status is read-only and github-resume performs one injected probe p
   assert.equal(repositoryResult.cooldown_cleared, true);
   assert.equal(repositoryResult.repository_state.cooldown_reason, null);
   assert.equal(repositoryDb.closed, true);
-});
-
-test('publication status and owner resume use only persisted policy state', async () => {
-  const calls = [];
-  const fakeDb = {
-    getPolicyState: () => ({policy_version: 2, publication_paused: true}),
-    resumePublication: (input) => {
-      if (!String(input.releasedBy).startsWith('internal-user:')) {
-        throw new Error('publication release requires an internal owner identity');
-      }
-      calls.push(input);
-      return {policy_version: 2, publication_paused: false};
-    },
-    setPublicLimits: (input) => {
-      calls.push(input);
-      return {policy_version: 2, public_limits: input.limits};
-    },
-    close() {},
-  };
-  const dependencies = {
-    openDb: () => fakeDb,
-    createTransport: () => { throw new Error('publication policy commands must not construct GitHub transport'); },
-  };
-  const status = await executeFactoryCli(['publication-status'], {
-    dependencies, stdout: {write() {}},
-  });
-  assert.equal(status.publication_paused, true);
-  await assert.rejects(
-    executeFactoryCli(['publication-resume', '--reason', 'review complete', '--cleared-by', 'worker'], {
-      dependencies, stdout: {write() {}},
-    }),
-    /internal owner identity/,
-  );
-  const resumed = await executeFactoryCli([
-    'publication-resume', '--reason', 'review complete', '--cleared-by', 'internal-user:aeziz',
-  ], {dependencies, stdout: {write() {}}});
-  assert.equal(resumed.publication_paused, false);
-  assert.deepEqual(calls.at(-1), {
-    releasedBy: 'internal-user:aeziz',
-    reason: 'review complete',
-  });
-  const limits = await executeFactoryCli([
-    'publication-limits',
-    '--repository-open', '1',
-    '--owner-rolling-7d', '3',
-    '--per-hour', '2',
-    '--per-day', '5',
-    '--reason', 'first twenty reviewed',
-    '--changed-by', 'internal-user:aeziz',
-  ], {dependencies, stdout: {write() {}}});
-  assert.deepEqual(limits.public_limits,
-    {repositoryOpen: 1, ownerRolling7d: 3, perHour: 2, perDay: 5});
-  assert.deepEqual(calls.at(-1), {
-    limits: {repositoryOpen: 1, ownerRolling7d: 3, perHour: 2, perDay: 5},
-    changedBy: 'internal-user:aeziz',
-    reason: 'first twenty reviewed',
-  });
 });
 
 test('environment paths and command adapters are resolved without shell parsing', () => {

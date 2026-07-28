@@ -132,10 +132,6 @@ test('durable READY artifacts bind a commit-pinned PR evidence asset', async (t)
   assert.match(board, new RegExp(withEvidence.evidence_asset.commit_oid));
   assert.match(board, new RegExp(withEvidence.evidence_asset.path.replaceAll('.', '\\.')));
   assert.match(board, new RegExp(withEvidence.evidence_asset.sha256));
-  assert.match(board, /contribution_invitation: absent/);
-  assert.match(board, /verification_execution_consent: absent/);
-  assert.match(board, /receipt_publication_consent: absent/);
-  assert.match(board, /marketing_reference_consent: absent/);
   assert.match(board, /public actions/);
   assert.throws(() => verifyReadyArtifacts({
     ...withEvidence,

@@ -6,7 +6,6 @@ import {isClaimText} from './claim-detection.mjs';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DISCOVERY_TTL_MS = 14 * DAY_MS;
 const DEFAULT_EXPECTED_MINUTES = 12;
-const MAINTAINER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 const CLEARLY_NON_NODE_PRIMARY_LANGUAGES = new Set([
   'C', 'C++', 'C#', 'Clojure', 'ClojureScript', 'Dart', 'Dockerfile', 'Elixir',
   'GDScript', 'Go', 'Java',
@@ -101,6 +100,24 @@ export function readyPerMinutePriority(mechanicalScore, stats = {}) {
   return probability / expectedMinutes;
 }
 
+function relationshipHas(values, key) {
+  if (!key) return false;
+  const normalized = String(key).toLowerCase();
+  if (values instanceof Set || values instanceof Map) return values.has(normalized) || values.has(key);
+  if (Array.isArray(values)) return values.some((value) => String(value).toLowerCase() === normalized);
+  return Boolean(values?.[normalized] ?? values?.[key]);
+}
+
+function mergedRelationships(...sources) {
+  const repositories = new Set();
+  const owners = new Set();
+  for (const source of sources) {
+    for (const repository of source?.repositories ?? []) repositories.add(String(repository).toLowerCase());
+    for (const owner of source?.owners ?? []) owners.add(String(owner).toLowerCase());
+  }
+  return {repositories, owners};
+}
+
 function ownerTypeFromNodeId(value) {
   const nodeId = String(value ?? '');
   if (nodeId.startsWith('O_') || nodeId.startsWith('MDEyOk9yZ2Fu')) return 'Organization';
@@ -108,11 +125,14 @@ function ownerTypeFromNodeId(value) {
   return null;
 }
 
-export function convertibilityMultiplier(row, now = new Date()) {
+export function convertibilityMultiplier(row, relationships = {}, now = new Date()) {
   let multiplier = 1;
   const raw = parseJson(row.raw_json ?? row.raw, {});
   const ownerNodeId = row.owner_node_id ?? raw.repository?.owner?.node_id ??
     raw.repository?.owner?.nodeId ?? null;
+  const ownerLogin = row.owner_login ?? raw.repository?.owner?.login ??
+    (String(row.repo_display ?? raw.repository?.name_with_owner ?? '').split('/')[0] || null);
+  const repository = row.repo_display ?? raw.repository?.name_with_owner ?? null;
   const starsValue = row.stars ?? raw.repository?.stars ?? raw.repository?.stargazer_count;
   const stars = starsValue === null || starsValue === undefined || starsValue === ''
     ? Number.NaN : Number(starsValue);
@@ -135,6 +155,8 @@ export function convertibilityMultiplier(row, now = new Date()) {
     else if (ageDays <= 365) multiplier += 0.05;
     else if (ageDays > 730) multiplier -= 0.05;
   }
+  if (relationshipHas(relationships.repositories, repository)) multiplier += 0.25;
+  else if (relationshipHas(relationships.owners, ownerLogin)) multiplier += 0.15;
   return clamp(multiplier, 0.5, 1.6);
 }
 
@@ -160,11 +182,11 @@ function invitationDetails(row, raw) {
   };
 }
 
-function normalizeLakeRow(row, attemptStats, now) {
+function normalizeLakeRow(row, attemptStats, relationships, now) {
   const parts = candidateParts(row.candidate_display ?? row.candidate ?? row.candidate_key);
   const raw = parseJson(row.raw_json ?? row.raw, {});
   const priority = readyPerMinutePriority(row.mechanical_score, statsFor(parts.candidate, attemptStats)) *
-    convertibilityMultiplier(row, now);
+    convertibilityMultiplier(row, relationships, now);
   return {
     candidate: parts.candidate,
     repository: String(row.repo_display ?? raw.repository?.name_with_owner ?? `${parts.owner}/${parts.repo}`),
@@ -193,7 +215,7 @@ export async function selectCandidates({
   limit,
   excludeCandidates = [],
   attemptStats = {},
-  interactionBlocks = [],
+  relationships = {},
   now = new Date(),
 } = {}) {
   const selectedLimit = boundedLimit(workers, limit);
@@ -227,9 +249,8 @@ export async function selectCandidates({
         ['OPEN', 'open', 'REVIEWED', null, undefined].includes(row.state);
     })
     .filter((row) => !clearlyNonNodePrimaryLanguage(row))
-    .map((row) => normalizeLakeRow(row, attemptStats, now))
+    .map((row) => normalizeLakeRow(row, attemptStats, relationships, now))
     .filter((candidate) => !excluded.has(candidate.candidate))
-    .filter((candidate) => !authoringBlockFor(candidate.repository, interactionBlocks))
     .sort((left, right) => right.priority - left.priority ||
       right.mechanicalScore - left.mechanicalScore || left.candidate.localeCompare(right.candidate))
     .slice(0, selectedLimit);
@@ -246,13 +267,6 @@ export function buildPreflightQuery(candidates, {northsetLogin = 'AysajanE'} = {
         nameWithOwner
         isArchived
         isFork
-        createdAt
-        stargazerCount
-        forkCount
-        diskUsage
-        licenseInfo { spdxId }
-        issues(first: 1) { totalCount }
-        pullRequests(first: 1) { totalCount }
         defaultBranchRef { name target { ... on Commit { oid } } }
         rootPackage: object(expression: "HEAD:package.json") {
           ... on Blob { byteSize text }
@@ -270,8 +284,7 @@ export function buildPreflightQuery(candidates, {northsetLogin = 'AysajanE'} = {
           ... on Blob { byteSize }
         }
         issue(number: ${issueNumber}) {
-          id number title body url state locked updatedAt authorAssociation
-          author { login }
+          id number title bodyText url state locked updatedAt
           assignees(first: 20) { nodes { login } }
           labels(first: 50) { nodes { name } }
           comments(last: 10) {
@@ -328,10 +341,6 @@ export function normalizePreflight(candidate, data) {
     .map(([alias, file]) => ({file, text: String(repository?.[alias]?.text ?? '')}))
     .filter((policy) => policy.text.trim().length > 0);
   const prohibitedAiPolicyFile = aiContributionProhibition(contributionPolicies)?.file ?? null;
-  const policyMessageSources = contributionPolicies.map((policy) => ({
-    file: policy.file,
-    flags: scanMessageCanaries(policy.text),
-  })).filter((policy) => policy.flags.length > 0);
   const crossReferencedPrs = (issue?.timelineItems?.nodes ?? [])
     .map((event) => event?.source)
     .filter((source) => source?.__typename === 'PullRequest')
@@ -347,28 +356,13 @@ export function normalizePreflight(candidate, data) {
         String(closed?.repository?.nameWithOwner ?? '').toLowerCase() ===
           String(repository?.nameWithOwner ?? candidate.repository).toLowerCase()),
     }));
-  const comments = (issue?.comments?.nodes ?? []).map(normalizeComment);
-  const interactionUsers = [...new Set([
-    ...(MAINTAINER_ASSOCIATIONS.has(issue?.authorAssociation) &&
-      issue?.author?.login ? [issue.author.login] : []),
-    ...comments.filter((comment) => MAINTAINER_ASSOCIATIONS.has(comment.authorAssociation))
-      .map((comment) => comment.author).filter(Boolean),
-  ].map((login) => String(login).toLowerCase()))];
   return {
     candidate,
-    interactionUsers,
     repository: repository ? {
       nodeId: repository.id ?? null,
       nameWithOwner: repository.nameWithOwner ?? candidate.repository,
       archived: Boolean(repository.isArchived),
       fork: Boolean(repository.isFork),
-      createdAt: repository.createdAt ?? null,
-      stargazerCount: Number(repository.stargazerCount ?? 0),
-      forkCount: Number(repository.forkCount ?? 0),
-      diskUsageKb: Number(repository.diskUsage ?? 0),
-      licenseSpdxId: repository.licenseInfo?.spdxId ?? null,
-      issueCount: Number(repository.issues?.totalCount ?? 0),
-      pullRequestCount: Number(repository.pullRequests?.totalCount ?? 0),
       defaultBranch: repository.defaultBranchRef?.name ?? null,
       defaultOid: repository.defaultBranchRef?.target?.oid ?? null,
       hasRootPackageJson: Number(repository.rootPackage?.byteSize) > 0,
@@ -376,23 +370,20 @@ export function normalizePreflight(candidate, data) {
         ? 'multi-package workspaces are outside the single-package Node lane'
         : yarnBerryLayout ? 'Yarn Berry is outside the node_modules dependency lane' : null,
       prohibitedAiPolicyFile,
-      policyMessageSources,
       northsetOpenPrs: Number(data?.northsetOpenPrCount ?? data?.northset?.issueCount ?? 0),
     } : null,
     issue: issue ? {
       nodeId: issue.id ?? null,
       number: issue.number,
       title: issue.title ?? '',
-      body: issue.body ?? issue.bodyText ?? '',
+      body: issue.bodyText ?? '',
       url: issue.url ?? null,
       state: issue.state,
       locked: Boolean(issue.locked),
       updatedAt: issue.updatedAt ?? null,
       assignees: (issue.assignees?.nodes ?? []).map((item) => item.login),
       labels: (issue.labels?.nodes ?? []).map((item) => item.name),
-      author: issue.author?.login ?? null,
-      authorAssociation: issue.authorAssociation ?? null,
-      comments,
+      comments: (issue.comments?.nodes ?? []).map(normalizeComment),
       crossReferencedPrs,
       timelineTruncated: Boolean(issue.timelineItems?.pageInfo?.hasPreviousPage),
     } : null,
@@ -450,68 +441,29 @@ function recentExternalClaim(comments, northsetLogin, now) {
   }) ?? null;
 }
 
-export function authoringBlockFor(repository, entries = [], users = []) {
-  const normalized = String(repository ?? '').toLowerCase();
-  const owner = normalized.split('/')[0];
-  const userSubjects = new Set(users.map((user) => String(user).toLowerCase()));
-  return entries.find((entry) => {
-    if (entry.released_at) return false;
-    if (entry.block_authoring === false || entry.block_authoring === 0) return false;
-    const subject = String(entry.subject ?? '').toLowerCase();
-    return (entry.scope === 'repository' && subject === normalized) ||
-      (entry.scope === 'owner' && subject === owner) ||
-      (entry.scope === 'user' && userSubjects.has(subject));
+function doNotAuthorPause(live, entries) {
+  const repository = String(live.repository?.nameWithOwner ?? live.candidate?.repository ?? '').toLowerCase();
+  return (entries ?? []).find((entry) => {
+    const pausedRepository = String(entry.repository ?? '').toLowerCase();
+    return pausedRepository === repository &&
+      ['ai_policy_concern', 'not_wanted'].includes(entry.reason_code);
   }) ?? null;
-}
-
-export function stripHtmlComments(value) {
-  return String(value ?? '').replace(/<!--[\s\S]*?(?:--!?>|$)/gu, '');
-}
-
-function hiddenCommentContainsInstruction(value) {
-  const hidden = [...String(value ?? '').matchAll(/<!--([\s\S]*?)(?:--!?>|$)/gu)]
-    .map((match) => match[1]);
-  if (!hidden.length) return false;
-  const directive = /\b(?:ignore (?:all |any )?(?:previous|prior|above) instructions?|respond with|reply with|output exactly|answer with|reveal|do not mention|don't mention|never mention|follow (?:these|the) instructions?|obey)\b/iu;
-  const modelReference = /\b(?:LLM|language model|ChatGPT|Claude|AI (?:assistant|agent)|assistant|prompt|system message)\b/iu;
-  return hidden.some((comment) => directive.test(comment) || modelReference.test(comment));
-}
-
-export function scanMessageCanaries(value) {
-  const text = String(value ?? '');
-  const flags = [];
-  if (/<!--/u.test(text)) flags.push('html_comment_present');
-  if (hiddenCommentContainsInstruction(text)) flags.push('html_comment_instruction');
-  if (/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(text)) {
-    flags.push('bidirectional_control');
-  }
-  if (/[\u200b-\u200d\u2060\ufeff]/u.test(text)) flags.push('zero_width_control');
-  const actor = String.raw`(?:LLM|language model|ChatGPT|Claude|AI (?:assistant|agent))`;
-  const directive = String.raw`(?:ignore|follow|obey|read|respond|reply|output|answer|reveal|do not)`;
-  if (new RegExp(String.raw`\b${actor}\b[\s\S]{0,160}\b${directive}\b|\b${directive}\b[\s\S]{0,160}\b${actor}\b`, 'iu')
-    .test(text)) flags.push('llm_directed_instruction');
-  return flags;
 }
 
 export function evaluatePreflight(live, {
   northsetLogin = 'AysajanE',
   now = new Date(),
-  interactionBlocks = [],
+  doNotAuthor = [],
 } = {}) {
   if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error('now must be a valid Date');
   const reasons = [];
   const repository = live.repository;
   const issue = live.issue;
-  const block = authoringBlockFor(
-    live.repository?.nameWithOwner ?? live.candidate?.repository,
-    interactionBlocks,
-    live.interactionUsers ?? [],
-  );
-  if (block) reasons.push(`interaction block ${block.scope}:${block.subject}: ${block.reason}`);
+  const pause = doNotAuthorPause(live, doNotAuthor);
+  if (pause) reasons.push(`repository owner is on the do-not-author pause list (${pause.reason_code ?? 'maintainer signal'})`);
   if (!repository) reasons.push('repository is missing or inaccessible');
   if (!issue) reasons.push('issue is missing or inaccessible');
   if (issue && issue.state !== 'OPEN') reasons.push(`issue is ${String(issue.state).toLowerCase()}`);
-  if (issue?.locked) reasons.push('issue is locked');
   const externalAssignees = (issue?.assignees ?? [])
     .filter((login) => login.toLowerCase() !== northsetLogin.toLowerCase());
   if (externalAssignees.length) reasons.push(`issue is assigned to ${externalAssignees.join(', ')}`);
@@ -519,10 +471,6 @@ export function evaluatePreflight(live, {
   if (issue && isUnapproved(issue.labels)) reasons.push('issue is marked unapproved by the repository');
   if (issue && isAlreadyInDevelopment(issue.labels)) reasons.push('issue is already implemented in the development branch');
   if (repository?.archived || repository?.fork) reasons.push('repository is archived or forked');
-  if (repository && (!repository.licenseSpdxId ||
-      repository.licenseSpdxId.toUpperCase() === 'NOASSERTION')) {
-    reasons.push('repository license is unavailable or unrecognized');
-  }
   if (repository && !repository.hasRootPackageJson) reasons.push('root package.json is missing');
   if (repository?.unsupportedNodeLayout) reasons.push(repository.unsupportedNodeLayout);
   if (repository?.prohibitedAiPolicyFile) {
@@ -538,24 +486,6 @@ export function evaluatePreflight(live, {
   }
   const claim = issue ? recentExternalClaim(issue.comments, northsetLogin, now) : null;
   if (claim) reasons.push(`recent external claimant: ${claim.author}`);
-  const messageFlags = [...new Set([
-    ...(issue ? [
-      ...scanMessageCanaries(issue.title),
-      ...scanMessageCanaries(issue.body),
-      ...issue.comments.flatMap((comment) => scanMessageCanaries(comment.body)),
-    ] : []),
-    ...(repository?.policyMessageSources ?? []).flatMap((policy) => policy.flags),
-  ])];
-  if (messageFlags.length) {
-    live.messageFlags = messageFlags;
-  }
-  const blockingMessageFlags = messageFlags.filter((flag) => flag !== 'html_comment_present');
-  if (blockingMessageFlags.length) {
-    const policyFiles = (repository?.policyMessageSources ?? []).map((policy) => policy.file);
-    reasons.push(`human review required: untrusted message marker (${blockingMessageFlags.join(', ')})${
-      policyFiles.length ? ` in repository prose (${policyFiles.join(', ')})` : ''
-    }`);
-  }
   if (repository && !/^[0-9a-f]{40}$/i.test(repository.defaultOid ?? '')) reasons.push('current default-branch OID is unavailable');
 
   if (reasons.length) return {outcome: 'SKIP', reasons, liveState: live};
@@ -574,7 +504,7 @@ export async function preflightCandidates(candidates, {
   limit,
   northsetLogin = 'AysajanE',
   now = new Date(),
-  interactionBlocks = [],
+  doNotAuthor = [],
 } = {}) {
   if (!github || typeof github.graphql !== 'function') throw new Error('github.graphql is required');
   const selected = candidates.slice(0, boundedLimit(workers, limit));
@@ -588,7 +518,7 @@ export async function preflightCandidates(candidates, {
       repository: data[`c${index}`] ?? null,
       northset: data[`n${index}`] ?? null,
     });
-    return {...evaluatePreflight(live, {northsetLogin, now, interactionBlocks}), candidate};
+    return {...evaluatePreflight(live, {northsetLogin, now, doNotAuthor}), candidate};
   });
   if (typeof github.deepOverlap === 'function') {
     for (let index = 0; index < results.length; index += 1) {
@@ -631,6 +561,7 @@ export function createSource({
   db,
   github,
   northsetLogin = 'AysajanE',
+  relationships = {},
 } = {}) {
   const lakeQuery = query ?? ((sql) => sqliteQuery(lakePath, sql));
   return {
@@ -639,13 +570,13 @@ export function createSource({
       lakePath,
       query: lakeQuery,
       attemptStats: options?.attemptStats ?? db?.candidateAttemptStats?.() ?? {},
-      interactionBlocks: options?.interactionBlocks ??
-        db?.listInteractionBlocks?.({action: 'authoring'}) ?? [],
+      relationships: options?.relationships ?? mergedRelationships(
+        db?.priorMergeRelationships?.() ?? {}, relationships,
+      ),
     }),
     preflight: (candidates, options) => preflightCandidates(candidates, {
       ...options, github, northsetLogin: options?.northsetLogin ?? northsetLogin,
-      interactionBlocks: options?.interactionBlocks ??
-        db?.listInteractionBlocks?.({action: 'authoring'}) ?? [],
+      doNotAuthor: options?.doNotAuthor ?? db?.listDoNotAuthor?.() ?? [],
     }),
     enqueue: (results) => enqueueCandidates(results, {db}),
     async fill(options) {

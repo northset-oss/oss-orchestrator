@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {lstat, mkdtemp, readFile, rm, symlink, writeFile, mkdir} from 'node:fs/promises';
+import {lstat, mkdtemp, readFile, rm, writeFile, mkdir} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,13 +11,10 @@ import {
   codexHostArgs,
   codexProcessEnvironment,
   createNodeWorker,
-  dependencyVolumeInitDockerArgs,
   prepareCodexHome,
   runBounded,
   runtimeDockerArgs,
 } from './node-worker.mjs';
-import {createCommandDriver} from './worker.mjs';
-import {SOURCE_MUTATION_MARKER} from './verifier.mjs';
 
 const IMAGE = 'northset-oss-author:test';
 const IMAGE_DIGEST = `sha256:${'a'.repeat(64)}`;
@@ -66,11 +63,7 @@ function ok(stdout = '') {
 test('N1 scout uses the bounded structured read-only contract', async (t) => {
   const {checkout, task} = await repository(t);
   task.issue_snapshot.labels = ['good first issue'];
-  task.issue_snapshot.body = '<!-- ordinary template guidance -->Please add a regression and fix value().';
-  task.issue_snapshot.comments = [{
-    author: 'AysajanE',
-    body: '<!-- do not send this hidden text to the model --!>I would like to work on this.',
-  }];
+  task.issue_snapshot.comments = [{author: 'AysajanE', body: 'I would like to work on this.'}];
   let invocation;
   const worker = createNodeWorker({image: IMAGE, codexRunner: async (options) => {
     invocation = options;
@@ -93,7 +86,6 @@ test('N1 scout uses the bounded structured read-only contract', async (t) => {
   assert.match(invocation.prompt, /future\s+pull-request number/);
   assert.match(invocation.prompt, /Existing issue comments/);
   assert.match(invocation.prompt, /I would like to work on this/);
-  assert.doesNotMatch(invocation.prompt, /ordinary template guidance|do not send this hidden text/);
   assert.match(invocation.prompt, /pre_work_rule/);
   assert.match(invocation.prompt, /current maintainer-authored issue already satisfies it/);
   assert.match(invocation.prompt, /required_checks/);
@@ -122,206 +114,6 @@ test('N1b scout skips when mandatory pre-work communication has no issue evidenc
   assert.deepEqual(result.required_checks, ['npm test', 'npm run typecheck']);
 });
 
-test('N1b scout recognizes the stored contributor claim without relying on the model quote', async (t) => {
-  const {checkout, task} = await repository(t);
-  task.issue_snapshot.comments = [{
-    author: 'AysajanE',
-    body: 'Hi, I’d like to work on this issue. Could you assign it to me?',
-  }];
-  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => ({
-    decision: 'GO', reason: 'the patch is bounded',
-    test_command: 'node --test test/value.test.mjs && npm test && npm run typecheck',
-    install_command: '', target_files: ['src/value.mjs', 'test/value.test.mjs'],
-    estimated_risk: 'GREEN',
-    pre_work_rule: 'Comment on the issue to claim it before starting.',
-    pre_work_evidence: '',
-    required_checks: ['npm test', 'npm run typecheck'],
-  })});
-
-  const result = await worker.handle({action: 'scout', task, checkout});
-  assert.equal(result.decision, 'GO');
-  assert.equal(result.pre_work_evidence,
-    'Hi, I’d like to work on this issue. Could you assign it to me?');
-});
-
-test('N1b scout does not treat a contributor-authored offer to someone else as a self-claim', async (t) => {
-  const {checkout, task} = await repository(t);
-  task.issue_snapshot.comments = [{
-    author: 'AysajanE',
-    body: 'This one is yours if you want it.',
-  }];
-  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => ({
-    decision: 'GO', reason: 'the patch is bounded',
-    test_command: 'node --test test/value.test.mjs && npm test && npm run typecheck',
-    install_command: '', target_files: ['src/value.mjs', 'test/value.test.mjs'],
-    estimated_risk: 'GREEN',
-    pre_work_rule: 'Comment on the issue to claim it before starting.',
-    pre_work_evidence: 'This one is yours if you want it.',
-    required_checks: ['npm test', 'npm run typecheck'],
-  })});
-
-  const result = await worker.handle({action: 'scout', task, checkout});
-  assert.equal(result.decision, 'SKIP');
-  assert.match(result.reason, /required pre-work public communication was not completed/);
-});
-
-test('N1b scout treats a later contributor retraction as clearing an earlier claim', async (t) => {
-  const {checkout, task} = await repository(t);
-  task.issue_snapshot.comments = [{
-    author: 'AysajanE',
-    createdAt: '2026-07-25T14:00:00Z',
-    body: 'I’d like to work on this issue.',
-  }, {
-    author: 'AysajanE',
-    createdAt: '2026-07-25T15:00:00Z',
-    body: 'I can no longer work on this issue. Please unassign me.',
-  }];
-  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => ({
-    decision: 'GO', reason: 'the patch is bounded',
-    test_command: 'node --test test/value.test.mjs && npm test && npm run typecheck',
-    install_command: '', target_files: ['src/value.mjs', 'test/value.test.mjs'],
-    estimated_risk: 'GREEN',
-    pre_work_rule: 'Comment on the issue to claim it before starting.',
-    pre_work_evidence: 'I’d like to work on this issue.',
-    required_checks: ['npm test', 'npm run typecheck'],
-  })});
-
-  const result = await worker.handle({action: 'scout', task, checkout});
-  assert.equal(result.decision, 'SKIP');
-  assert.match(result.reason, /required pre-work public communication was not completed/);
-});
-
-test('N1b scout does not treat assigning the issue to someone else as a self-claim', async (t) => {
-  const {checkout, task} = await repository(t);
-  task.issue_snapshot.comments = [{
-    author: 'AysajanE',
-    body: 'Please assign this to @other.',
-  }];
-  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => ({
-    decision: 'GO', reason: 'the patch is bounded',
-    test_command: 'node --test test/value.test.mjs && npm test && npm run typecheck',
-    install_command: '', target_files: ['src/value.mjs', 'test/value.test.mjs'],
-    estimated_risk: 'GREEN',
-    pre_work_rule: 'Comment on the issue to claim it before starting.',
-    pre_work_evidence: 'Please assign this to @other.',
-    required_checks: ['npm test', 'npm run typecheck'],
-  })});
-
-  const result = await worker.handle({action: 'scout', task, checkout});
-  assert.equal(result.decision, 'SKIP');
-  assert.match(result.reason, /required pre-work public communication was not completed/);
-});
-
-test('N1b scout does not treat first-person issue discussion as a self-claim', async (t) => {
-  const {checkout, task} = await repository(t);
-  task.issue_snapshot.comments = [{
-    author: 'AysajanE',
-    body: 'I claim this is incorrect; I am not claiming the issue.',
-  }];
-  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => ({
-    decision: 'GO', reason: 'the patch is bounded',
-    test_command: 'node --test test/value.test.mjs && npm test && npm run typecheck',
-    install_command: '', target_files: ['src/value.mjs', 'test/value.test.mjs'],
-    estimated_risk: 'GREEN',
-    pre_work_rule: 'Comment on the issue to claim it before starting.',
-    pre_work_evidence: '',
-    required_checks: ['npm test', 'npm run typecheck'],
-  })});
-
-  const result = await worker.handle({action: 'scout', task, checkout});
-  assert.equal(result.decision, 'SKIP');
-  assert.match(result.reason, /required pre-work public communication was not completed/);
-});
-
-test('N1b2 scout skips explicit documentation-only issues without model or bootstrap work', async (t) => {
-  const root = await temporary(t, 'factory-node-worker-docs');
-  let modelCalls = 0;
-  const worker = createNodeWorker({
-    codexRunner: async () => {
-      modelCalls += 1;
-      throw new Error('documentation-only issue must not reach the model');
-    },
-  });
-
-  const result = await worker.handle({
-    action: 'scout',
-    task: {
-      issue_snapshot: {
-        title: 'Good First Issue: Document Implicit index Variable inside VirtualList Template Slots',
-        labels: ['documentation'],
-      },
-    },
-    checkout: root,
-  });
-
-  assert.equal(result.decision, 'SKIP');
-  assert.match(result.reason, /documentation-only/);
-  assert.equal(modelCalls, 0);
-
-  const labeled = await worker.handle({
-    action: 'scout',
-    task: {
-      issue_snapshot: {
-        title: 'Add docs/README.md index linking all docs files',
-        labels: ['documentation', 'good first issue'],
-      },
-    },
-    checkout: root,
-  });
-  assert.equal(labeled.decision, 'SKIP');
-  assert.equal(modelCalls, 0);
-
-  for (const title of [
-    'Documentation generator emits stale navigation',
-    'README renderer truncates code blocks',
-    'Translate command hangs on nested input',
-    'Documentation pipeline hangs on startup',
-    'README preview is blank',
-    'Documentation index duplicates entries',
-    'README links resolve incorrectly',
-    'Translate task times out on nested input',
-  ]) {
-    const codeResult = await worker.handle({
-      action: 'scout',
-      task: {issue_snapshot: {title}},
-      checkout: root,
-    });
-    assert.doesNotMatch(codeResult.reason, /documentation-only/, title);
-    assert.match(codeResult.reason, /root package\.json is missing/, title);
-  }
-
-  const explicitDocs = await worker.handle({
-    action: 'scout',
-    task: {issue_snapshot: {title: 'Document the build command'}},
-    checkout: root,
-  });
-  assert.doesNotMatch(explicitDocs.reason, /documentation-only/);
-  assert.match(explicitDocs.reason, /root package\.json is missing/);
-
-  let codeModelCalls = 0;
-  const codeWorker = createNodeWorker({
-    codexRunner: async () => {
-      codeModelCalls += 1;
-      return {
-        decision: 'SKIP', reason: 'model inspected a testable code defect',
-        test_command: '', install_command: '', target_files: [],
-        estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
-        required_checks: [],
-      };
-    },
-  });
-  for (const title of [
-    'Documentation build fails when schemas contain aliases',
-    'Translate command fails on nested input',
-  ]) {
-    const codeResult = await codeWorker.handle({
-      action: 'scout', task: {issue_snapshot: {title}}, checkout: root,
-    });
-    assert.equal(codeResult.reason, 'root package.json is missing');
-  }
-  assert.equal(codeModelCalls, 0);
-});
-
 test('N1c author must bind every required repository check into the verifier command', async (t) => {
   const {checkout, task} = await repository(t);
   let invocation;
@@ -335,7 +127,6 @@ test('N1c author must bind every required repository check into the verifier com
       test_command: 'npm test -- test/value.test.mjs && npm run typecheck',
       test_only_paths: ['test/value.test.mjs'], base_failure_contains: 'EXPECTED_TWO',
       checks: ['npm test -- test/value.test.mjs && npm run typecheck'],
-      checks_not_run: [], limitations: [],
     };
   }});
 
@@ -344,12 +135,6 @@ test('N1c author must bind every required repository check into the verifier com
     scout: {required_checks: ['npm test', 'npm run typecheck'], estimated_risk: 'GREEN'},
   }), /author test_command omits required repository checks: npm test/);
   assert.match(invocation.prompt, /pr_title becomes the canonical commit subject/);
-  assert.match(invocation.prompt, /read and follow any existing repository pull-request template/);
-  assert.match(invocation.prompt, /Preserve its required fields and checklist items/);
-  assert.match(invocation.prompt, /leave any unrun manual QA or UAT check unchecked/);
-  assert.match(invocation.prompt, /Mark checklist items for the exact automated required_checks as checked/);
-  assert.match(invocation.prompt, /never say the command or one of its components was unrun/);
-  assert.match(invocation.prompt, /do not invent evidence or an\s+API-contract classification/);
   assert.match(invocation.prompt, /exact\s+command the clean verifier and receipt will bind/);
   assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');
 });
@@ -379,464 +164,10 @@ test('N1d scout rejects workspace and PnP layouts before model or bootstrap work
   assert.equal(yarnRc.decision, 'SKIP');
   assert.match(yarnRc.reason, /Yarn Berry/);
 
-  await rm(path.join(checkout, '.yarnrc.yml'));
-  await writeFile(path.join(checkout, 'composer.json'), JSON.stringify({
-    name: 'fixture/mixed-php-node',
-  }));
-  const composer = await worker.handle({action: 'scout', task, checkout});
-  assert.equal(composer.decision, 'SKIP');
-  assert.match(composer.reason, /mixed PHP\/Node repositories require an explicit Node target/);
-
-  let mixedNodeCalls = 0;
-  const mixedNodeWorker = createNodeWorker({
-    image: IMAGE,
-    codexRunner: async () => {
-      mixedNodeCalls += 1;
-      return {
-        decision: 'SKIP', reason: 'model inspected an explicit Node target',
-        test_command: '', install_command: '', target_files: [],
-        estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
-        required_checks: [],
-      };
-    },
-  });
-  const explicitNode = await mixedNodeWorker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix the JavaScript value helper',
-        body: 'Update src/value.mjs and run node --test.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(explicitNode.reason, 'model inspected an explicit Node target');
-  assert.equal(mixedNodeCalls, 1);
-
-  const nodeWithPhpContext = await mixedNodeWorker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update the JavaScript client',
-        body: 'Update src/value.mjs to handle output documented in backend/Controller.php.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(nodeWithPhpContext.reason, 'model inspected an explicit Node target');
-  assert.equal(mixedNodeCalls, 2);
-
-  const nodeWithInspectedPhpContext = await mixedNodeWorker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update the JavaScript client',
-        body: 'Update src/value.mjs; inspect backend/Controller.php for the response format.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(nodeWithInspectedPhpContext.reason, 'model inspected an explicit Node target');
-  assert.equal(mixedNodeCalls, 3);
-
-  const nodeWithLaravelContext = await mixedNodeWorker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update the JavaScript client for Laravel responses',
-        body: 'Update src/value.mjs.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(nodeWithLaravelContext.reason, 'model inspected an explicit Node target');
-  assert.equal(mixedNodeCalls, 4);
-
-  const phpForReact = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix the PHP response consumed by the React client',
-        body: 'The Laravel controller returns the wrong status.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(phpForReact.decision, 'SKIP');
-  assert.match(phpForReact.reason, /mixed PHP\/Node repositories require an explicit Node target/);
-
-  const phpWithNodeVerification = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix the Laravel response',
-        body: 'Update the PHP controller.\nRun npm test after the change.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(phpWithNodeVerification.decision, 'SKIP');
-  assert.match(phpWithNodeVerification.reason, /mixed PHP\/Node repositories require an explicit Node target/);
-
-  const mixedMutationTargets = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update the response and client',
-        body: 'Modify the Laravel controller. Update src/value.mjs.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(mixedMutationTargets.decision, 'SKIP');
-  assert.match(mixedMutationTargets.reason, /mixed PHP\/Node repositories require an explicit Node target/);
-
-  const modifiedPhpPath = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update the response and client',
-        body: 'Update existing backend/Controller.php. Update src/value.mjs.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(modifiedPhpPath.decision, 'SKIP');
-  assert.match(modifiedPhpPath.reason, /mixed PHP\/Node repositories require an explicit Node target/);
-
-  const modifiedLegacyPhp = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update the response and client',
-        body: 'Refactor the legacy Laravel controller. Update src/value.mjs.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(modifiedLegacyPhp.decision, 'SKIP');
-  assert.match(modifiedLegacyPhp.reason, /mixed PHP\/Node repositories require an explicit Node target/);
-
-  const sameClauseMixedPaths = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update both clients',
-        body: 'Update src/value.mjs and backend/Controller.php.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(sameClauseMixedPaths.decision, 'SKIP');
-  assert.match(sameClauseMixedPaths.reason, /mixed PHP\/Node repositories require an explicit Node target/);
-
-  const phpLocationAfterReactContext = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix response handling',
-        body: 'Fix React handling in the Laravel controller.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(phpLocationAfterReactContext.decision, 'SKIP');
-  assert.match(phpLocationAfterReactContext.reason, /mixed PHP\/Node repositories require an explicit Node target/);
-
-  const sameClauseMixedTechnologies = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update both frontends',
-        body: 'Update the React frontend and Laravel controller.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(sameClauseMixedTechnologies.decision, 'SKIP');
-  assert.match(sameClauseMixedTechnologies.reason, /mixed PHP\/Node repositories require an explicit Node target/);
-  await rm(path.join(checkout, 'composer.json'));
-
-  await mkdir(path.join(checkout, 'backend'));
-  await writeFile(path.join(checkout, 'backend', 'composer.json'), JSON.stringify({
-    name: 'fixture/php-backend',
-  }));
-  const nestedComposer = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix backend response',
-        body: 'Start in backend/src/Controller.php',
-      },
-    },
-    checkout,
-  });
-  assert.equal(nestedComposer.decision, 'SKIP');
-  assert.match(nestedComposer.reason, /nested Composer package backend\//);
-
-  const directoryComposer = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix backend response',
-        body: 'Start in backend',
-      },
-    },
-    checkout,
-  });
-  assert.equal(directoryComposer.decision, 'SKIP');
-  assert.match(directoryComposer.reason, /nested Composer package backend\//);
-
-  const implementedInComposer = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Add validation',
-        body: 'Implement validation in backend',
-      },
-    },
-    checkout,
-  });
-  assert.equal(implementedInComposer.decision, 'SKIP');
-  assert.match(implementedInComposer.reason, /nested Composer package backend\//);
-
-  let nestedContextCalls = 0;
-  const nestedContextWorker = createNodeWorker({
-    image: IMAGE,
-    codexRunner: async () => {
-      nestedContextCalls += 1;
-      return {
-        decision: 'SKIP', reason: 'model inspected the explicit Node path',
-        test_command: '', install_command: '', target_files: [],
-        estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
-        required_checks: [],
-      };
-    },
-  });
-  const inspectedComposerContext = await nestedContextWorker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update the JavaScript client',
-        body: 'Update src/value.mjs; inspect backend/Controller.php for the response format.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(inspectedComposerContext.reason, 'model inspected the explicit Node path');
-  assert.equal(nestedContextCalls, 1);
-
-  const usedComposerContext = await nestedContextWorker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update the JavaScript client',
-        body: 'Update src/value.mjs; use backend/Controller.php as a reference.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(usedComposerContext.reason, 'model inspected the explicit Node path');
-  assert.equal(nestedContextCalls, 2);
-
-  for (const target of ['./backend', 'backend.']) {
-    const normalizedDirectoryComposer = await worker.handle({
-      action: 'scout',
-      task: {
-        ...task,
-        issue_snapshot: {
-          title: 'Fix backend response',
-          body: `Start in ${target}`,
-        },
-      },
-      checkout,
-    });
-    assert.equal(normalizedDirectoryComposer.decision, 'SKIP');
-    assert.match(normalizedDirectoryComposer.reason, /nested Composer package backend\//);
-  }
-
-  const nestedContext = await nestedContextWorker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Update the JavaScript client',
-        body: 'Update src/value.mjs so it handles data from backend/src/Controller.php.',
-      },
-    },
-    checkout,
-  });
-  assert.equal(nestedContext.reason, 'model inspected the explicit Node path');
-  assert.equal(nestedContextCalls, 3);
-
-  await mkdir(path.join(checkout, 'stellar-payment-platform'));
-  await writeFile(path.join(checkout, 'stellar-payment-platform', 'package.json'), JSON.stringify({
-    name: 'nested-backend', private: true,
-  }));
-  const nested = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix CORS configuration',
-        body: 'Where to Start: stellar-payment-platform/server.js',
-      },
-    },
-    checkout,
-  });
-  assert.equal(nested.decision, 'SKIP');
-  assert.match(nested.reason, /nested package stellar-payment-platform\//);
-
-  await mkdir(path.join(checkout, 'packages', 'api'), {recursive: true});
-  await writeFile(path.join(checkout, 'packages', 'api', 'package.json'), JSON.stringify({
-    name: 'nested-api', private: true,
-  }));
-  const deepNested = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix API response',
-        body: 'Start in packages/api/src/server.js',
-      },
-    },
-    checkout,
-  });
-  assert.equal(deepNested.decision, 'SKIP');
-  assert.match(deepNested.reason, /nested package packages\/api\//);
-
-  const directoryOnly = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix API response',
-        body: 'Start in packages/api',
-      },
-    },
-    checkout,
-  });
-  assert.equal(directoryOnly.decision, 'SKIP');
-  assert.match(directoryOnly.reason, /nested package packages\/api\//);
-
-  await mkdir(path.join(checkout, 'packages', '@scope', 'api'), {recursive: true});
-  await writeFile(path.join(checkout, 'packages', '@scope', 'api', 'package.json'), JSON.stringify({
-    name: '@scope/api', private: true,
-  }));
-  const scopedNested = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix scoped API response',
-        body: 'Start in packages/@scope/api/src/server.js',
-      },
-    },
-    checkout,
-  });
-  assert.equal(scopedNested.decision, 'SKIP');
-  assert.match(scopedNested.reason, /nested package packages\/@scope\/api\//);
-
-  await symlink(path.join('packages', 'api'), path.join(checkout, 'linked-api'));
-  const symlinkedNested = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix linked API response',
-        body: 'Start in linked-api/src/server.js',
-      },
-    },
-    checkout,
-  });
-  assert.equal(symlinkedNested.decision, 'SKIP');
-  assert.match(symlinkedNested.reason, /target linked-api\/ uses a symlink/);
-
-  await mkdir(path.join(checkout, 'manifest-link'));
-  await symlink(path.join('..', 'package.json'), path.join(checkout, 'manifest-link', 'package.json'));
-  const symlinkedManifest = await worker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix manifest-linked API response',
-        body: 'Start in manifest-link/src/server.js',
-      },
-    },
-    checkout,
-  });
-  assert.equal(symlinkedManifest.decision, 'SKIP');
-  assert.match(symlinkedManifest.reason, /nested package manifest-link\/ uses a symlinked manifest/);
-
-  let traversalModelCalls = 0;
-  const traversalWorker = createNodeWorker({
-    image: IMAGE,
-    codexRunner: async () => {
-      traversalModelCalls += 1;
-      return {
-        decision: 'SKIP', reason: 'model inspected the non-nested target',
-        test_command: '', install_command: '', target_files: [],
-        estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
-        required_checks: [],
-      };
-    },
-  });
-  const traversal = await traversalWorker.handle({
-    action: 'scout',
-    task: {
-      ...task,
-      issue_snapshot: {
-        title: 'Fix shared response',
-        body: 'Inspect src/../shared/file.js',
-      },
-    },
-    checkout,
-  });
-  assert.equal(traversal.reason, 'model inspected the non-nested target');
-  assert.equal(traversalModelCalls, 1);
-
   await rm(path.join(checkout, 'package.json'));
   const missingRoot = await worker.handle({action: 'scout', task, checkout});
   assert.equal(missingRoot.decision, 'SKIP');
   assert.match(missingRoot.reason, /root package\.json/);
-});
-
-test('N1e scout accepts a package.json with a UTF-8 BOM', async (t) => {
-  const {checkout, task} = await repository(t);
-  let modelCalls = 0;
-  const worker = createNodeWorker({image: IMAGE, codexRunner: async () => {
-    modelCalls += 1;
-    return {
-      decision: 'SKIP', reason: 'model inspected the candidate',
-      test_command: '', install_command: '', target_files: [],
-      estimated_risk: 'GREEN', pre_work_rule: '', pre_work_evidence: '',
-      required_checks: [],
-    };
-  }});
-  await writeFile(path.join(checkout, 'package.json'),
-    `\uFEFF${JSON.stringify({name: 'worker-fixture', private: true})}`);
-
-  const result = await worker.handle({action: 'scout', task, checkout});
-
-  assert.equal(result.reason, 'model inspected the candidate');
-  assert.equal(modelCalls, 1);
 });
 
 test('N2 the authenticated model client stays host-side and Docker plans remain credential-free', async (t) => {
@@ -879,24 +210,11 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
     installCommand: 'npm ci --no-audit --no-fund',
   }).join('\n');
   assert.match(bootstrap, /src=\/private\/factory\/repository,dst=\/source,readonly/);
-  assert.match(bootstrap, /--user\n1000:1000/);
-  assert.match(bootstrap, /\/workspace:rw,exec,nosuid,nodev,size=2g,mode=1777/);
+  assert.match(bootstrap, /\/workspace:rw,exec,nosuid,nodev,size=2g/);
   assert.match(bootstrap, /tar -C \/source/);
-  assert.match(bootstrap, /--strip-components=1 --no-same-owner --no-same-permissions -m/);
   assert.match(bootstrap, /src=northset-deps-abc,dst=\/workspace\/node_modules$/m);
   assert.doesNotMatch(bootstrap, /dst=\/workspace\/node_modules,readonly/);
   assert.doesNotMatch(bootstrap, /auth\.json|CODEX_HOME|GITHUB_TOKEN|GH_TOKEN/);
-
-  const volumeInit = dependencyVolumeInitDockerArgs({
-    volume: 'northset-deps-abc', image: IMAGE,
-  }).join('\n');
-  assert.match(volumeInit, /--network=none/);
-  assert.match(volumeInit, /--read-only/);
-  assert.match(volumeInit, /--cap-drop=ALL/);
-  assert.match(volumeInit, /--cap-add=CHOWN/);
-  assert.match(volumeInit, /src=northset-deps-abc,dst=\/deps/);
-  assert.match(volumeInit, /chown\n-R\n1000:1000\n\/deps$/);
-  assert.doesNotMatch(volumeInit, /\/source|CODEX_HOME|GITHUB_TOKEN|GH_TOKEN/);
 
   const runtime = runtimeDockerArgs({
     checkout, volume: 'northset-deps-abc', image: IMAGE, command: 'node --test',
@@ -906,12 +224,6 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
   assert.match(runtime, /src=\/private\/factory\/repository,dst=\/source,readonly/);
   assert.match(runtime, /\/workspace:rw,exec,nosuid,nodev,size=2g/);
   assert.match(runtime, /tar -C \/source/);
-  assert.match(runtime, /NORTHSET_VERIFY_COMMAND=node --test/);
-  assert.match(runtime, /northset_snapshot \/source \/tmp\/northset-source-before\.tar/);
-  assert.match(runtime, /northset_snapshot \/workspace \/tmp\/northset-source-after\.tar/);
-  assert.match(runtime, /tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner/);
-  assert.doesNotMatch(runtime, /git diff|exclude-standard/);
-  assert.match(runtime, new RegExp(SOURCE_MUTATION_MARKER));
 
   const authRoot = await temporary(t, 'factory-codex-auth');
   const sourceHome = path.join(authRoot, 'source-home');
@@ -942,97 +254,6 @@ test('N2 the authenticated model client stays host-side and Docker plans remain 
   assert.match(isolatedConfig, /\[permissions\.factory_workspace\.filesystem\]/);
   assert.match(isolatedConfig, new RegExp(`${sourceHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" = "deny"`));
   assert.match(isolatedConfig, new RegExp(`${isolatedHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" = "deny"`));
-});
-
-test('N2b runtime detects tracked and untracked mutations inside the real container copy', async (t) => {
-  const image = process.env.OSS_AUTHOR_IMAGE ?? 'northset-oss-author:0.144.1';
-  let available;
-  try {
-    available = await runBounded('docker', ['image', 'inspect', image], {timeoutMs: 30_000});
-  } catch {
-    t.skip('Docker is unavailable');
-    return;
-  }
-  if (available.code !== 0) {
-    t.skip(`verifier image ${image} is unavailable`);
-    return;
-  }
-
-  const {root, checkout} = await repository(t);
-  await writeFile(path.join(checkout, '.gitignore'), 'ignored-output.txt\n');
-  await git(['-C', checkout, 'add', '.gitignore']);
-  await git(['-C', checkout, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
-    'commit', '-q', '-m', 'ignore generated output']);
-  const volume = `northset-verifier-test-${path.basename(root).replace(/[^a-zA-Z0-9_.-]/g, '-')}`;
-  const created = await runBounded('docker', ['volume', 'create', volume], {timeoutMs: 30_000});
-  assert.equal(created.code, 0, created.stderr || created.stdout);
-  t.after(() => runBounded('docker', ['volume', 'rm', '-f', volume], {timeoutMs: 30_000}));
-
-  const runVerification = (command) => runBounded('docker', runtimeDockerArgs({
-    checkout, volume, image, command,
-  }), {timeoutMs: 30_000});
-
-  const cleanPass = await runVerification('node -e "process.exit(0)"');
-  assert.equal(cleanPass.code, 0, cleanPass.stderr || cleanPass.stdout);
-  assert.doesNotMatch(cleanPass.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const metadataOnlyTouch = await runVerification('touch src/value.mjs');
-  assert.equal(metadataOnlyTouch.code, 0, metadataOnlyTouch.stderr || metadataOnlyTouch.stdout);
-  assert.doesNotMatch(metadataOnlyTouch.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const cleanFailure = await runVerification('node -e "process.exit(7)"');
-  assert.equal(cleanFailure.code, 7, cleanFailure.stderr || cleanFailure.stdout);
-  assert.doesNotMatch(cleanFailure.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const spoofedMarker = await runVerification(
-    `node -e "console.error('${SOURCE_MUTATION_MARKER}'); process.exit(0)"`,
-  );
-  assert.equal(spoofedMarker.code, 0, spoofedMarker.stderr || spoofedMarker.stdout);
-  assert.match(spoofedMarker.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const spoofedMarkerFailure = await runVerification(
-    `node -e "console.error('${SOURCE_MUTATION_MARKER}'); process.exit(7)"`,
-  );
-  assert.equal(spoofedMarkerFailure.code, 7,
-    spoofedMarkerFailure.stderr || spoofedMarkerFailure.stdout);
-  assert.match(spoofedMarkerFailure.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const trackedMutation = await runVerification(
-    'node -e "require(\'node:fs\').writeFileSync(\'src/value.mjs\', \'formatted\\n\')"',
-  );
-  assert.equal(trackedMutation.code, 86, trackedMutation.stderr || trackedMutation.stdout);
-  assert.match(trackedMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const normalizedTrackedMutation = await runVerification(
-    'node -e "require(\'node:fs\').writeFileSync(\'src/value.mjs\', \'export function value() { return 1; }\\r\\n\')"',
-  );
-  assert.equal(normalizedTrackedMutation.code, 86,
-    normalizedTrackedMutation.stderr || normalizedTrackedMutation.stdout);
-  assert.match(normalizedTrackedMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const untrackedMutationAfterFailure = await runVerification(
-    'node -e "require(\'node:fs\').writeFileSync(\'generated-source.mjs\', \'generated\\n\'); process.exit(7)"',
-  );
-  assert.equal(untrackedMutationAfterFailure.code, 86,
-    untrackedMutationAfterFailure.stderr || untrackedMutationAfterFailure.stdout);
-  assert.match(untrackedMutationAfterFailure.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const ignoredMutation = await runVerification(
-    'node -e "require(\'node:fs\').writeFileSync(\'ignored-output.txt\', \'ignored\\n\')"',
-  );
-  assert.equal(ignoredMutation.code, 86, ignoredMutation.stderr || ignoredMutation.stdout);
-  assert.match(ignoredMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const modeMutation = await runVerification('chmod +x src/value.mjs');
-  assert.equal(modeMutation.code, 86, modeMutation.stderr || modeMutation.stdout);
-  assert.match(modeMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
-
-  const typeAndSymlinkMutation = await runVerification(
-    'rm src/value.mjs && ln -s ../package.json src/value.mjs',
-  );
-  assert.equal(typeAndSymlinkMutation.code, 86,
-    typeAndSymlinkMutation.stderr || typeAndSymlinkMutation.stdout);
-  assert.match(typeAndSymlinkMutation.stderr, new RegExp(SOURCE_MUTATION_MARKER));
 });
 
 test('N3 bootstrap creates one content-keyed volume and then reuses its frozen marker', async (t) => {
@@ -1114,8 +335,7 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
     const source = checkoutMount.slice('type=bind,src='.length).split(',dst=/source,readonly')[0];
     const cleanEnvironment = Object.fromEntries(Object.entries(process.env)
       .filter(([name]) => !name.startsWith('NODE_TEST')));
-    const commandInWorkspace = args.find((arg) => typeof arg === 'string' &&
-      arg.startsWith('NORTHSET_VERIFY_COMMAND=')).slice('NORTHSET_VERIFY_COMMAND='.length);
+    const commandInWorkspace = args.at(-1).split(' && ').slice(1).join(' && ');
     const result = await runBounded('sh', ['-lc', commandInWorkspace], {
       cwd: source, env: cleanEnvironment,
       timeoutMs: options.timeoutMs, maxOutputBytes: options.maxOutputBytes,
@@ -1158,7 +378,6 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
       test_command: 'node --test test/value.test.mjs',
       test_only_paths: ['test/value.test.mjs'], base_failure_contains: 'BASE_MARKER_EXPECTED_TWO',
       checks: ['node --test test/value.test.mjs'],
-      checks_not_run: [], limitations: [],
     };
     },
   });
@@ -1172,7 +391,6 @@ test('N5 direct author produces a host DCO commit and clean verifier proves base
   assert.equal(authorInvocation.dependencyMaterial, dependencyMaterial);
   assert.equal(authorInvocation.image, IMAGE_DIGEST);
   assert.match(authorInvocation.prompt, /feature_implementation/);
-  assert.match(authorInvocation.prompt, /every unrun manual check in checks_not_run/);
   assert.ok(AUTHOR_SCHEMA.properties.claim_type.enum.includes('feature_implementation'));
   assert.equal(await git(['-C', checkout, 'rev-parse', 'HEAD^']), baseOid);
   assert.equal(await git(['-C', checkout, 'status', '--porcelain', '--untracked-files=all']), '');
@@ -1226,54 +444,4 @@ test('N6 subprocess execution is bounded by both wall time and aggregate output'
   await assert.rejects(() => runBounded(process.execPath, ['-e', "process.stdout.write('x'.repeat(4096))"], {
     timeoutMs: 2_000, maxOutputBytes: 128,
   }), (error) => error.code === 'EOUTPUTLIMIT');
-});
-
-test('N6b outer worker timeout relays termination to nested bounded work', async (t) => {
-  const root = await temporary(t, 'factory-node-worker-group');
-  const started = path.join(root, 'started');
-  const orphaned = path.join(root, 'orphaned');
-  const nested = [
-    "const fs = require('node:fs');",
-    `fs.writeFileSync(${JSON.stringify(started)}, 'started');`,
-    `setTimeout(() => fs.writeFileSync(${JSON.stringify(orphaned)}, 'orphaned'), 1200);`,
-  ].join('\n');
-  const wrapper = [
-    `import {runBounded} from ${JSON.stringify(new URL('./node-worker.mjs', import.meta.url).href)};`,
-    `await runBounded(process.execPath, ['-e', ${JSON.stringify(nested)}], {timeoutMs: 10_000});`,
-  ].join('\n');
-  const driver = createCommandDriver({
-    command: process.execPath,
-    args: ['--input-type=module', '-e', wrapper],
-  });
-
-  await assert.rejects(
-    driver.scout({}, root, {timeoutMs: 500}),
-    /worker command timed out after 500ms/,
-  );
-  assert.equal(await readFile(started, 'utf8'), 'started');
-  await new Promise((resolve) => setTimeout(resolve, 1_000));
-  await assert.rejects(readFile(orphaned, 'utf8'), (error) => error.code === 'ENOENT');
-});
-
-test('N6c bounded command timeout terminates its spawned grandchild', async (t) => {
-  const root = await temporary(t, 'factory-node-worker-subtree');
-  const started = path.join(root, 'started');
-  const orphaned = path.join(root, 'orphaned');
-  const grandchild = [
-    "const fs = require('node:fs');",
-    `setTimeout(() => fs.writeFileSync(${JSON.stringify(orphaned)}, 'orphaned'), 1200);`,
-  ].join('\n');
-  const child = [
-    "const {spawn} = require('node:child_process');",
-    "const fs = require('node:fs');",
-    `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], {stdio: 'ignore'});`,
-    `fs.writeFileSync(${JSON.stringify(started)}, 'started');`,
-    'setTimeout(() => {}, 10_000);',
-  ].join('\n');
-
-  await assert.rejects(runBounded(process.execPath, ['-e', child], {timeoutMs: 500}),
-    (error) => error.code === 'ETIMEDOUT');
-  assert.equal(await readFile(started, 'utf8'), 'started');
-  await new Promise((resolve) => setTimeout(resolve, 1_000));
-  await assert.rejects(readFile(orphaned, 'utf8'), (error) => error.code === 'ENOENT');
 });

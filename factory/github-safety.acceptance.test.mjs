@@ -293,7 +293,7 @@ test('G6 a paused GitHub publisher does not govern local worker execution', asyn
   assert.equal((await github.status()).paused, true);
 });
 
-test('public governor applies owner rolling-seven-day cap across successful PR creations', async (t) => {
+test('public governor applies owner/day cap across successful PR creations', async (t) => {
   const clock = await fixture(t, 'factory-github-owner-cap');
   const calls = [];
   const github = createGitHubSafety({
@@ -305,17 +305,15 @@ test('public governor applies owner rolling-seven-day cap across successful PR c
     },
   });
   await github.request({priority: 'final_submission', kind: 'pr_create', operation: 'create', repository: 'org/one'});
-  clock.advance(61 * 60_000);
   await github.request({priority: 'final_submission', kind: 'pr_create', operation: 'create', repository: 'org/two'});
-  clock.advance(61 * 60_000);
   await assert.rejects(
     () => github.request({priority: 'final_submission', kind: 'pr_create', operation: 'create', repository: 'org/three'}),
-    (error) => error instanceof GitHubPublicLimitError && /owner\/rolling-7-day/.test(error.reason),
+    (error) => error instanceof GitHubPublicLimitError && /owner\/day/.test(error.reason),
   );
   assert.deepEqual(calls, ['org/one', 'org/two']);
 });
 
-test('public governor permits one PR per hour and refuses the second before transport', async (t) => {
+test('public governor permits six PRs per hour and refuses the seventh before transport', async (t) => {
   const clock = await fixture(t, 'factory-github-hourly-cap');
   const calls = [];
   const github = createGitHubSafety({
@@ -326,58 +324,26 @@ test('public governor permits one PR per hour and refuses the second before tran
       return {status: 201, body: {url: `https://github.com/${request.repository}/pull/1`}};
     },
   });
-  await github.request({
-    priority: 'final_submission', kind: 'pr_create', operation: 'create',
-    repository: 'owner-1/repo-1',
-  });
+  for (let index = 1; index <= 6; index += 1) {
+    await github.request({
+      priority: 'final_submission', kind: 'pr_create', operation: 'create',
+      repository: `owner-${index}/repo-${index}`,
+    });
+  }
   await assert.rejects(() => github.request({
     priority: 'final_submission', kind: 'pr_create', operation: 'create',
-    repository: 'owner-2/repo-2',
+    repository: 'owner-7/repo-7',
   }), (error) => error instanceof GitHubPublicLimitError && /hourly PR cap/.test(error.reason));
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 6);
   assert.deepEqual((await github.status()).limits, {
     repositoryOpen: 1,
-    ownerRolling7d: 2,
-    perHour: 1,
-    perDay: 3,
+    ownerPerDay: 2,
+    perHour: 6,
+    perDay: 30,
   });
 });
 
-test('public governor enforces the injected post-cohort profile', async (t) => {
-  const clock = await fixture(t, 'factory-github-configured-cap');
-  const calls = [];
-  const publicLimits = {
-    repositoryOpen: 1,
-    ownerRolling7d: 3,
-    perHour: 2,
-    perDay: 5,
-  };
-  const github = createGitHubSafety({
-    ...clock,
-    publicLimits,
-    repositoryState: () => ({}),
-    transport: async (request) => {
-      calls.push(request.repository);
-      return {status: 201, body: {url: `https://github.com/${request.repository}/pull/1`}};
-    },
-  });
-  await github.request({
-    priority: 'final_submission', kind: 'pr_create', operation: 'create',
-    repository: 'owner-1/repo-1',
-  });
-  await github.request({
-    priority: 'final_submission', kind: 'pr_create', operation: 'create',
-    repository: 'owner-2/repo-2',
-  });
-  await assert.rejects(() => github.request({
-    priority: 'final_submission', kind: 'pr_create', operation: 'create',
-    repository: 'owner-3/repo-3',
-  }), (error) => error instanceof GitHubPublicLimitError && /hourly PR cap/.test(error.reason));
-  assert.deepEqual(calls, ['owner-1/repo-1', 'owner-2/repo-2']);
-  assert.deepEqual((await github.status()).limits, publicLimits);
-});
-
-test('independent CLI governors share pacing, open-repository reservations, and hourly caps', async (t) => {
+test('independent CLI governors share pacing, open-repository reservations, and owner caps', async (t) => {
   const clock = await fixture(t, 'factory-github-cross-process');
   const starts = [];
   const make = () => createGitHubSafety({
@@ -394,10 +360,11 @@ test('independent CLI governors share pacing, open-repository reservations, and 
     priority: 'final_submission', kind: 'pr_create', operation: 'create',
     repository: `shared/repo-${index + 1}`,
   })));
-  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 2);
   assert.equal(results.filter((result) => result.status === 'rejected' &&
-    result.reason instanceof GitHubPublicLimitError && /hourly PR cap/.test(result.reason.reason)).length, 2);
-  assert.equal(starts.length, 1);
+    result.reason instanceof GitHubPublicLimitError && /owner\/day/.test(result.reason.reason)).length, 1);
+  assert.equal(starts.length, 2);
+  assert.ok(starts[1].at - starts[0].at >= 25);
 
   const firstRepository = starts[0].repository;
   await assert.rejects(() => make().request({

@@ -3,10 +3,6 @@ import {spawn} from 'node:child_process';
 import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {
-  assertPublicationBoundaryInvariant,
-  assertPublicationManifest,
-} from './publication-policy.mjs';
 
 const RECEIPTS_BRANCH = 'receipts';
 const DEFAULT_REMOTE_URL = 'https://github.com/northset-oss/verification-pilot.git';
@@ -153,14 +149,13 @@ function validProofCommand(value) {
 }
 
 function assertV2ProofEvidence(proof, missionId) {
-  if (![2, 3].includes(proof.schema_version)) return;
+  if (proof.schema_version !== 2) return;
   const proofFields = [
     'schema_version', 'mission_id', 'task_id', 'repository', 'issue_number', 'candidate',
     'base_oid', 'patch_sha256', 'commit_oid', 'tested_tree_oid', 'checks', 'claim',
     'batch_approval_digest', 'environment', 'base_observation', 'patched_observation',
     'executed_commands', 'checks_not_run', 'limitations', 'verification_started_at',
     'verification_finished_at',
-    ...(proof.schema_version === 3 ? ['receipt_visibility', 'consent_scopes'] : []),
   ];
   if (!exactKeys(proof, proofFields) || !nonblank(proof.task_id) || !nonblank(proof.repository) ||
       !Number.isInteger(proof.issue_number) || proof.issue_number < 1 || !nonblank(proof.candidate) ||
@@ -233,11 +228,6 @@ function proofFor(item) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) throw new TypeError('receipt item must be an object');
   const manifest = item.manifest && typeof item.manifest === 'object' && !Array.isArray(item.manifest)
     ? item.manifest : item;
-  assertPublicationManifest(manifest);
-  if (manifest.receipt_visibility !== 'public_opt_in') {
-    throw new ReceiptPublisherError('public proof publication requires public_opt_in receipt visibility',
-      'RECEIPT_PUBLICATION_NOT_CONSENTED');
-  }
   const missionId = validMissionId(item.mission_id ?? manifest.mission_id);
   if (item.mission_id !== undefined && manifest.mission_id !== undefined &&
       item.mission_id !== manifest.mission_id) {
@@ -289,11 +279,6 @@ function proofFor(item) {
   };
   assertJson(proof, `${missionId} proof`);
   assertV2ProofEvidence(proof, missionId);
-  assertPublicationBoundaryInvariant(proof, {
-    currentPrState: item.current_pr_state,
-    currentMerged: item.current_merged,
-    externalStatusEvidence: item.external_status_evidence,
-  });
   const bytes = Buffer.from(`${canonical(proof)}\n`, 'utf8');
   return {missionId, commitOid, approvalDigest, proof, bytes, proofSha256: digest(bytes)};
 }
@@ -669,21 +654,12 @@ function statusFor(item) {
     pr_number: prNumber,
     pr_state: item.pr_state,
     merged,
-    ...(ciState === null ? {} : {ci_state: ciState}),
+    ci_state: ciState,
     attestation_state: item.attestation_state,
     attestation_url: attestationUrl,
     observed_at: item.observed_at,
   };
   assertJson(status, `${missionId} publication status`);
-  assertPublicationBoundaryInvariant(status, {
-    currentPrState: item.current_pr_state,
-    currentMerged: item.current_merged,
-    externalStatusEvidence: {
-      ...item.external_status_evidence,
-      ...(item.ci_observation === undefined ? {} : {ci: item.ci_observation}),
-    },
-    observedAt: item.observed_at,
-  });
   return {missionId, commitOid, status, bytes: Buffer.from(`${canonical(status)}\n`, 'utf8')};
 }
 

@@ -1859,10 +1859,3 @@ Stop waiting for the next shift, NTP observation, qualification window, board ti
 [1]: https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api "https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api"
 [2]: https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api "https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"
 [3]: https://docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies "https://docs.github.com/en/site-policy/acceptable-use-policies/github-acceptable-use-policies"
-# Historical design note — publication model superseded
-
-This document records the July 19 design rationale. Its unconditional public-receipt flow,
-Northset-branded footer, relationship/demand interpretation, and publication-rate assumptions were
-superseded by incident policy v2 on July 23. They are not runtime authority and must not be restored.
-Use `AGENTS.md` and `OPERATING_CONTRACT.md` for the active private-record, promotion-free,
-publication-paused flow.

@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {createNodeWorker, runBounded} from './node-worker.mjs';
+import {receiptUrlFor} from './receipt-publisher.mjs';
 import {createStaleRefresher} from './stale-refresh.mjs';
 import {finalizePrBody} from './worker.mjs';
 
@@ -129,8 +130,7 @@ function localDockerRun(calls) {
     const checkout = mount.slice('type=bind,src='.length).split(',dst=/source,readonly')[0];
     const cleanEnvironment = Object.fromEntries(Object.entries(process.env)
       .filter(([name]) => !name.startsWith('NODE_TEST')));
-    const commandInWorkspace = args.find((argument) => typeof argument === 'string' &&
-      argument.startsWith('NORTHSET_VERIFY_COMMAND=')).slice('NORTHSET_VERIFY_COMMAND='.length);
+    const commandInWorkspace = args.at(-1).split(' && ').slice(1).join(' && ');
     return runBounded('sh', ['-lc', commandInWorkspace], {
       cwd: checkout, env: cleanEnvironment,
       timeoutMs: options.timeoutMs, maxOutputBytes: options.maxOutputBytes,
@@ -178,14 +178,12 @@ test('S1 clean moved-base refresh keeps the mission and approved artifact while 
   assert.equal(next.verification_path, path.join(path.dirname(next.repository_path), 'verification.json'));
   assert.deepEqual(JSON.parse(await readFile(next.verification_path, 'utf8')), next.verification);
   assert.equal(next.changed_lines, next.verification.changed_lines);
-  assert.equal(next.receipt_visibility, 'private_internal');
-  assert.equal(next.receipt_url, null);
-  assert.match(next.pr_body, /- `node --test test\/value\.test\.mjs` — passed/);
-  assert.doesNotMatch(next.pr_body, /northset-receipt|M-1200|without trusting us/iu);
+  assert.equal(next.receipt_url, receiptUrlFor('M-1200', next.commit_oid));
+  assert.ok(next.pr_body.includes(`on this exact head (\`${next.commit_oid.slice(0, 7)}\`)`));
+  assert.ok(!next.pr_body.includes(`on this exact head (\`${fixture.oldCommit.slice(0, 7)}\`)`));
+  assert.equal(next.pr_body.match(/northset-receipt:M-1200:start/g)?.length, 1);
   assert.notEqual(next.branch, fixture.manifest.branch);
-  assert.match(next.branch, /^refresh\/fix-return-expected-value-[a-f0-9]{12}$/);
-  assert.equal(next.consent_scopes.scopes.receipt_publication_consent.status, 'absent');
-  assert.equal(next.proof.schema_version, 3);
+  assert.match(next.branch, /^northset\/m-1200-r-[a-f0-9]{12}$/);
   assert.equal(next.proof.base_oid, fixture.cleanBase);
   assert.equal(next.proof.commit_oid, next.commit_oid);
   assert.equal(next.proof.batch_approval_digest, null);

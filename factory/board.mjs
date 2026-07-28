@@ -1,6 +1,5 @@
 import {canonical, sha256} from './db.mjs';
 import {verifyReadyArtifacts} from './artifact-integrity.mjs';
-import {assertPublicationManifest} from './publication-policy.mjs';
 
 const RED_CLASSES = new Set([
   'dependency', 'lockfile', 'ci', 'security', 'migration', 'release',
@@ -11,19 +10,10 @@ const AMBER_CLASSES = new Set(['existing_test', 'build', 'configuration', 'writa
 export function classifyRisk(manifest) {
   const files = Array.isArray(manifest.changed_files) ? manifest.changed_files : [];
   const classes = new Set(files.map((file) => typeof file === 'string' ? 'production' : file.class));
-  const changesRenderedUi = files.some((file) => {
-    const changedPath = typeof file === 'string' ? file : String(file.path ?? '');
-    return /\.(?:css|scss|sass|less|html?|jsx|tsx|vue|svelte|svg|hbs|astro|mdx)$/i.test(changedPath) ||
-      /(?:^|\/)(?:components?|views?|pages?|ui)\/.+\.(?:[mc]?js)$/i.test(changedPath) ||
-      /(?:^|\/)[A-Z][A-Za-z0-9]*\.(?:[mc]?js)$/.test(changedPath) ||
-      /(?:^|\/)[^/]*(?:accordion|app|avatar|button|card|client|component|dialog|dropdown|footer|form|header|input|layout|list|menu|modal|nav|page|panel|render|route|router|screen|sidebar|table|tabs|toast|toolbar|ui|view|widget)[^/]*\.(?:[mc]?js)$/i
-        .test(changedPath);
-  });
   const lines = Number(manifest.changed_lines ?? files.reduce((total, file) => total + Number(file.lines ?? 0), 0));
   const warnings = Array.isArray(manifest.risk_warnings) ? manifest.risk_warnings : [];
   if (manifest.risk_tier === 'RED' || [...classes].some((value) => RED_CLASSES.has(value))) return 'RED';
-  if (manifest.risk_tier === 'AMBER' || changesRenderedUi ||
-      files.length > 5 || lines > 300 || warnings.length ||
+  if (manifest.risk_tier === 'AMBER' || files.length > 5 || lines > 300 || warnings.length ||
       [...classes].some((value) => AMBER_CLASSES.has(value))) return 'AMBER';
   return 'GREEN';
 }
@@ -52,15 +42,6 @@ function ageMs(readyAt, now) {
   return Math.max(0, now.getTime() - value);
 }
 
-function consentSummary(manifest, scopeName) {
-  const scope = manifest.consent_scopes?.scopes?.[scopeName] ?? {status: 'absent'};
-  const parts = [scope.status ?? 'absent'];
-  if (scope.evidence) parts.push(`${scope.evidence.kind}: ${scope.evidence.value}`);
-  if (scope.granted_at) parts.push(`granted_at: ${scope.granted_at}`);
-  if (scope.granted_by) parts.push(`granted_by: ${scope.granted_by}`);
-  return parts.map(inline).join(' | ');
-}
-
 export function createBoardIfDue(db, {
   minSize = 10,
   maxAgeMinutes = 30,
@@ -75,7 +56,6 @@ export function createBoardIfDue(db, {
   if (current) return current;
   const ready = db.listReady({unboarded: true, states: ['PENDING'], limit: maximum});
   if (!ready.length) return null;
-  for (const item of ready) assertPublicationManifest(item.manifest);
   const dueByAge = ageMs(ready[0].ready_at, now) >= maxAgeMinutes * 60_000;
   if (!force && ready.length < minSize && !dueByAge && ready.length < maximum) return null;
   const digest = boardDigest(ready);
@@ -204,17 +184,7 @@ export function renderBoard(board) {
       '',
       `Receipt claim: ${inline(manifest.receipt_claim?.statement ?? manifest.receipt_claim)}`,
       '',
-      `receipt_visibility: ${manifest.receipt_visibility ?? 'private_internal'}`,
-      '',
-      `contribution_invitation: ${consentSummary(manifest, 'contribution_invitation')}`,
-      '',
-      `verification_execution_consent: ${consentSummary(manifest, 'verification_execution_consent')}`,
-      '',
-      `receipt_publication_consent: ${consentSummary(manifest, 'receipt_publication_consent')}`,
-      '',
-      `marketing_reference_consent: ${consentSummary(manifest, 'marketing_reference_consent')}`,
-      '',
-      `Receipt: ${manifest.receipt_url ?? 'private internal artifact'}`,
+      `Receipt: ${manifest.receipt_url}`,
       '',
       `Issue: ${manifest.issue_url}`,
     );

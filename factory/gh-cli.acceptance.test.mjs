@@ -145,53 +145,12 @@ test('H3b git clone binds an absolute checkout to the requested base OID', async
   assert.equal(result.head_oid, oid);
   const calls = (await readFile(log, 'utf8')).trim().split('\n').map(JSON.parse);
   assert.deepEqual(calls[0], ['init', '--quiet', destination]);
-  assert.deepEqual(calls[1], ['-C', destination, 'config', '--local', '--replace-all', 'remote.origin.url',
+  assert.deepEqual(calls[1], ['-C', destination, 'remote', 'add', 'origin',
     'https://github.com/upstream/project.git']);
-  assert.deepEqual(calls[2], ['-C', destination, 'config', '--local', '--replace-all', 'remote.origin.fetch',
-    '+refs/heads/*:refs/remotes/origin/*']);
-  assert.deepEqual(calls[3], ['-C', destination, 'fetch', '--no-tags', '--depth=1', '--', 'origin', oid]);
-  assert.deepEqual(calls[4], ['-C', destination, 'rev-parse', '--verify', `${oid}^{commit}`]);
-  assert.deepEqual(calls[5], ['-C', destination, 'checkout', '--detach', oid]);
-  assert.deepEqual(calls[6], ['-C', destination, 'rev-parse', '--verify', 'HEAD^{commit}']);
-});
-
-test('H3b exact-base clone can resume in a destination that already has origin', async (t) => {
-  const directory = await temporary(t, 'factory-git-clone-retry');
-  const log = path.join(directory, 'git-calls.log');
-  const originMarker = path.join(directory, 'origin-configured');
-  const oid = '8'.repeat(40);
-  const fakeGit = await executable(directory, 'fake-git.mjs', `
-    import {access, appendFile, mkdir, writeFile} from 'node:fs/promises';
-    const args = process.argv.slice(2);
-    await appendFile(process.env.FAKE_GIT_LOG, JSON.stringify(args) + '\\n');
-    if (args[0] === 'init') await mkdir(args.at(-1), {recursive: true});
-    if (args.includes('remote.origin.url')) await writeFile(process.env.FAKE_ORIGIN_MARKER, 'origin');
-    if (args.includes('remote') && args.includes('add')) {
-      try {
-        await access(process.env.FAKE_ORIGIN_MARKER);
-        process.stderr.write('error: remote origin already exists.\\n');
-        process.exit(3);
-      } catch {
-        await writeFile(process.env.FAKE_ORIGIN_MARKER, 'origin');
-      }
-    }
-    if (args.includes('rev-parse')) process.stdout.write(process.env.FAKE_BASE_OID + '\\n');
-  `);
-  const destination = path.join(directory, 'checkout');
-  const transport = createGhCliTransport({gitExecutable: fakeGit,
-    env: {...process.env, FAKE_GIT_LOG: log, FAKE_ORIGIN_MARKER: originMarker, FAKE_BASE_OID: oid}});
-  const request = {operation: 'git_clone', repository: 'upstream/project', destination, base_oid: oid};
-  await transport(request);
-  const result = await transport(request);
-  assert.equal(result.repository_path, destination);
-  assert.equal(result.base_oid, oid);
-  assert.equal(result.head_oid, oid);
-  const calls = (await readFile(log, 'utf8')).trim().split('\n').map(JSON.parse);
-  assert.equal(calls.filter((args) => args.includes('remote.origin.url')).length, 2);
-  assert.equal(calls.filter((args) => args.includes('remote.origin.fetch')).length, 2);
-  assert.equal(calls.filter((args) => args.includes('remote') && args.includes('add')).length, 0);
-  assert.equal(calls.filter((args) => args.includes('fetch')).length, 2);
-  assert.equal(calls.filter((args) => args.includes('checkout')).length, 2);
+  assert.deepEqual(calls[2], ['-C', destination, 'fetch', '--no-tags', '--depth=1', '--', 'origin', oid]);
+  assert.deepEqual(calls[3], ['-C', destination, 'rev-parse', '--verify', `${oid}^{commit}`]);
+  assert.deepEqual(calls[4], ['-C', destination, 'checkout', '--detach', oid]);
+  assert.deepEqual(calls[5], ['-C', destination, 'rev-parse', '--verify', 'HEAD^{commit}']);
 });
 
 test('git fetch honors a validated positive integer depth', async (t) => {

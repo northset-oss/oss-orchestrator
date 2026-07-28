@@ -7,7 +7,6 @@ import test from 'node:test';
 import {approveBoard, createBoardIfDue} from './board.mjs';
 import {openFactoryDb} from './db.mjs';
 import {publishBoard} from './publisher.mjs';
-import {promotionFreePrBody} from './publication-policy.mjs';
 
 const OID = 'a'.repeat(40);
 const TREE = 'b'.repeat(40);
@@ -16,11 +15,6 @@ const PATCH = `sha256:${'c'.repeat(64)}`;
 async function fixture(t, suffix = 'one') {
   const root = await mkdtemp(path.join(os.tmpdir(), 'factory-real-integration-'));
   const db = openFactoryDb(path.join(root, 'factory.sqlite'));
-  db.resumePublication({
-    releasedBy: 'internal-user:test',
-    reason: 'isolated integration fixture',
-    now: '2026-07-19T11:00:00.000Z',
-  });
   t.after(async () => { db.close(); await rm(root, {recursive: true, force: true}); });
   const [task] = db.enqueueTasks([{
     candidate: `owner/${suffix}#1`, repository: `owner/${suffix}`, issue_number: 1,
@@ -39,7 +33,7 @@ async function fixture(t, suffix = 'one') {
     issue_number: 1,
     issue_url: `https://github.com/${task.repository}/issues/1`,
     base_branch: 'main',
-    branch: 'fix/bounded-correction',
+    branch: `northset/${missionId.toLowerCase()}`,
     base_oid: 'd'.repeat(40),
     patch_sha256: PATCH,
     tested_tree_oid: TREE,
@@ -50,36 +44,9 @@ async function fixture(t, suffix = 'one') {
       commit_oid: OID, base_observation: {exit_code: 1}, patched_observation: {exit_code: 0},
     },
     pr_title: 'fix: bounded correction',
-    pr_body: promotionFreePrBody('Fix the bounded issue.', ['node --test'], {
-      receiptUrl: `https://northset-oss.github.io/verification-pilot/receipts/${missionId}/`,
-    }),
+    pr_body: `Fix the bounded issue.\n\nhttps://northset-oss.github.io/verification-pilot/receipts/${missionId}/`,
     receipt_claim: {type: 'regression_fix', statement: 'The focused regression failed on base and passed after the patch.'},
     receipt_url: `https://northset-oss.github.io/verification-pilot/receipts/${missionId}/`,
-    receipt_visibility: 'public_opt_in',
-    consent_scopes: {
-      schema_version: 2,
-      mission_id: missionId,
-      scopes: {
-        contribution_invitation: {
-          status: 'granted',
-          evidence: {kind: 'public_url', value: `https://github.com/${task.repository}/issues/1`},
-          granted_at: '2026-07-19T10:00:00.000Z',
-          granted_by: `repository:${task.repository}`,
-        },
-        verification_execution_consent: {
-          status: 'absent', evidence: null, granted_at: null, granted_by: null,
-        },
-        receipt_publication_consent: {
-          status: 'granted',
-          evidence: {kind: 'public_url', value: `https://github.com/${task.repository}/issues/1`},
-          granted_at: '2026-07-19T10:00:00.000Z',
-          granted_by: 'maintainer',
-        },
-        marketing_reference_consent: {
-          status: 'absent', evidence: null, granted_at: null, granted_by: null,
-        },
-      },
-    },
     changed_files: [{path: 'src/index.mjs', status: 'M', class: 'production', lines: 2}],
     changed_lines: 2,
     risk_tier: 'GREEN',

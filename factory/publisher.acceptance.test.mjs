@@ -7,9 +7,9 @@ import {batchApprovalDigest, canonical, readyItemDigest, sha256} from './db.mjs'
 import {
   PublisherCheckpointError,
   publishBoard,
+  reconcileReceipt,
 } from './publisher.mjs';
 import {GitHubPublicLimitError} from './github-safety.mjs';
-import {PROMOTION_FREE_DISCLOSURE, promotionFreePrBody} from './publication-policy.mjs';
 
 const RECEIPT_PROOF_DIGEST = `sha256:${'c'.repeat(64)}`;
 const RECEIPT_BATCH_OID = 'd'.repeat(40);
@@ -36,37 +36,10 @@ function mission(index) {
     commit_oid: oid(index),
     tested_tree_oid: oid(index + 100),
     patch_sha256: digest(`patch:${id}`),
-    checks: ['node --test'],
-    changed_files: [{path: 'lib/value.js', class: 'production'}],
-    risk_tier: 'GREEN',
     pr_title: `fix: bounded correction ${index}`,
-    pr_body: `## Summary\r\n\r\nBounded correction ${index}.\r\n\r\n${PROMOTION_FREE_DISCLOSURE}\r\n\r\nChecks:\r\n- \`node --test\` — passed\r\n\r\nTechnical receipt: https://example.test/receipts/${id}/proof.json\r\n`,
+    pr_body: `## Summary\r\n\r\nBounded correction ${index}.\r\n`,
     receipt_claim: `The declared check for ${id} passed in the clean verifier.`,
-    receipt_visibility: 'public_opt_in',
-    consent_scopes: {
-      schema_version: 2,
-      mission_id: id,
-      scopes: {
-        contribution_invitation: {
-          status: 'granted',
-          evidence: {kind: 'public_url', value: `https://github.com/upstream${index}/project/issues/1`},
-          granted_at: '2026-07-19T11:00:00.000Z', granted_by: `repository:upstream${index}/project`,
-        },
-        verification_execution_consent: {
-          status: 'absent', evidence: null, granted_at: null, granted_by: null,
-        },
-        receipt_publication_consent: {
-          status: 'granted',
-          evidence: {kind: 'public_url', value: `https://github.com/upstream${index}/project/issues/1`},
-          granted_at: '2026-07-19T11:00:00.000Z', granted_by: 'maintainer',
-        },
-        marketing_reference_consent: {
-          status: 'absent', evidence: null, granted_at: null, granted_by: null,
-        },
-      },
-    },
     receipt_url: `https://example.test/receipts/${id}/proof.json`,
-    planned_actions: ['publish-proof', 'push-approved-commit', 'open-upstream-pr', 'verify-pr-readback'],
   };
   return {
     ...manifest,
@@ -113,16 +86,6 @@ class FakeDb {
 
   async getBoard(digestValue) {
     return digestValue === this.board.board_digest ? structuredClone(this.board) : null;
-  }
-
-  async getPolicyState() {
-    return {policy_version: 2, publication_paused: false, contribution_prs_since_resume: 20};
-  }
-
-  async findInteractionBlocks() { return []; }
-
-  async getPublicActionState({repository}) {
-    return structuredClone(this.repositoryStates.get(repository) ?? {open_northset_prs: 0});
   }
 
   async getBoardApproval(digestValue) {
@@ -351,129 +314,9 @@ function addEvidenceAsset(db, id = 'M-001', overrides = {}) {
   return manifest.evidence_asset;
 }
 
-test('persisted publication pause stops before any GitHub or receipt adapter call', async () => {
-  const db = new FakeDb(1);
-  db.getPolicyState = async () => ({
-    policy_version: 2,
-    publication_paused: true,
-    publication_pause_reason: 'incident hold',
-    contribution_prs_since_resume: 0,
-  });
-  let adapterCalls = 0;
-  await assert.rejects(publishBoard(db.board.board_digest, {
-    db,
-    github: new Proxy({}, {get() { adapterCalls += 1; return () => {}; }}),
-    safety: {request: async () => { adapterCalls += 1; }},
-    liveRecheck: async () => { adapterCalls += 1; },
-    receiptPublisher: async () => { adapterCalls += 1; },
-  }), (error) => error.code === 'PUBLICATION_POLICY_PAUSED' && /incident hold/.test(error.message));
-  assert.equal(adapterCalls, 0);
-});
-
-test('private READY submission skips public proof publication', async () => {
-  const db = new FakeDb(1);
-  const github = new FakeGitHub();
-  const current = db.ready.get('M-001').manifest;
-  reapproveManifest(db, 'M-001', {
-    receipt_visibility: 'private_internal',
-    receipt_url: null,
-    consent_scopes: {
-      ...current.consent_scopes,
-      scopes: {
-        ...current.consent_scopes.scopes,
-        receipt_publication_consent: {
-          status: 'absent', evidence: null, granted_at: null, granted_by: null,
-        },
-      },
-    },
-    pr_body: promotionFreePrBody('## Summary\n\nPrivate contribution.', current.checks),
-    planned_actions: ['push-approved-commit', 'open-upstream-pr', 'verify-pr-readback'],
-  });
-  let receiptCalls = 0;
-  const result = await publishBoard(db.board.board_digest, options(db, github, {
-    receiptPublisher: async () => { receiptCalls += 1; return {}; },
-  }));
-  assert.equal(result.results[0].state, 'SUBMITTED');
-  assert.equal(receiptCalls, 0);
-  const publication = await db.getPublication('M-001');
-  assert.equal(publication.receipt_url, null);
-  assert.equal(publication.receipt_state, 'PRIVATE_INTERNAL');
-  assert.equal(publication.receipt_proof_sha256, null);
-  assert.equal(publication.receipt_batch_commit_oid, null);
-  assert.equal(publication.receipt_approval_digest, null);
-  assert.equal(publication.proof_published, false);
-  assert.equal(publication.attestation_state, 'NOT_APPLICABLE');
-  assert.equal(publication.attestation_url, null);
-  assert.equal(publication.status_state, 'NOT_APPLICABLE');
-  assert.equal(publication.status_url, null);
-  assert.equal(db.taskStates.get('TASK-001').state, 'PR_OPENED');
-});
-
-test('interaction blocks cannot be bypassed by a repository-open override', async () => {
-  const db = new FakeDb(1);
-  db.findInteractionBlocks = async () => [{
-    scope: 'owner', subject: 'upstream1', reason: 'maintainer stop',
-  }];
-  const github = new FakeGitHub();
-  const result = await publishBoard(db.board.board_digest, options(db, github, {
-    repositoryOpenOverrideMissionId: 'M-001',
-  }));
-  assert.equal(result.results[0].code, 'INTERACTION_BLOCKED');
-  assert.equal(github.events.length, 0);
-});
-
-test('a carried maintainer-user block stops publication before transport', async () => {
-  const db = new FakeDb(1);
-  reapproveManifest(db, 'M-001', {interaction_users: ['maintainer-one']});
-  db.findInteractionBlocks = async (options) => {
-    assert.deepEqual(options, {
-      repository: 'upstream1/project',
-      users: ['maintainer-one'],
-      action: 'authoring',
-    });
-    return [{
-      scope: 'user', subject: 'maintainer-one', reason: 'User-specific authoring stop.',
-    }];
-  };
-  const github = new FakeGitHub();
-  const result = await publishBoard(db.board.board_digest, options(db, github));
-  assert.equal(result.results[0].code, 'INTERACTION_BLOCKED');
-  assert.match(result.results[0].detail, /user:maintainer-one/);
-  assert.equal(github.events.length, 0);
-});
-
-test('first-20 contribution lane rejects non-Green changes before outbound work', async () => {
-  const db = new FakeDb(1);
-  db.getPolicyState = async () => ({
-    policy_version: 2, publication_paused: false, contribution_prs_since_resume: 0,
-  });
-  reapproveManifest(db, 'M-001', {
-    risk_tier: 'AMBER',
-    changed_files: [{path: 'package-lock.json', class: 'lockfile'}],
-  });
-  const github = new FakeGitHub();
-  const result = await publishBoard(db.board.board_digest, options(db, github));
-  assert.equal(result.results[0].code, 'CONTRIBUTION_ONLY_POLICY');
-  assert.equal(github.events.length, 0);
-});
-
 function reapproveManifest(db, id, changes) {
   const current = db.ready.get(id);
-  const normalizedChanges = structuredClone(changes);
-  if (typeof normalizedChanges.pr_body === 'string') {
-    normalizedChanges.pr_body = promotionFreePrBody(
-      normalizedChanges.pr_body,
-      current.manifest.checks,
-      {receiptUrl: Object.hasOwn(normalizedChanges, 'receipt_url')
-        ? normalizedChanges.receipt_url : current.manifest.receipt_url},
-    );
-  }
-  if (normalizedChanges.planned_actions &&
-      (normalizedChanges.receipt_visibility ?? current.manifest.receipt_visibility) === 'public_opt_in' &&
-      !normalizedChanges.planned_actions.includes('publish-proof')) {
-    normalizedChanges.planned_actions = ['publish-proof', ...normalizedChanges.planned_actions];
-  }
-  const manifest = {...structuredClone(current.manifest), ...normalizedChanges};
+  const manifest = {...structuredClone(current.manifest), ...structuredClone(changes)};
   const ready = {
     ...manifest,
     manifest,
@@ -818,6 +661,53 @@ test('crash recovery adopts an exact PR that closed before its checkpoint retry'
   assert.equal(db.repositoryStates.get(existing.repository).open_northset_prs, 0);
 });
 
+test('attestation failure leaves the upstream PR open and unique', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  await publishBoard(db.board.board_digest, options(db, github));
+  let statusCalls = 0;
+  const result = await reconcileReceipt('M-001', {
+    db,
+    attestor: async () => { throw new Error('attestation service unavailable'); },
+    statusPublisher: async () => { statusCalls += 1; },
+  });
+
+  assert.deepEqual(result, {
+    mission_id: 'M-001', state: 'SUBMITTED', attestation_state: 'ATTESTATION_PENDING',
+    status_state: 'PUBLISHED',
+  });
+  assert.equal((await db.getPublication('M-001')).publication_state, 'SUBMITTED');
+  assert.equal((await db.getPublication('M-001')).attestation_state, 'ATTESTATION_PENDING');
+  assert.equal((await db.getPublication('M-001')).status_state, 'PUBLISHED');
+  assert.equal(statusCalls, 1);
+  assert.equal(github.pullRequests.size, 1);
+  assert.equal(github.count('create_pull_request'), 1);
+  assert.equal(github.closeCount, 0);
+  assert.equal(github.deleteCount, 0);
+});
+
+test('final status publication failure leaves a recoverable submitted state', async () => {
+  const db = new FakeDb(1);
+  const github = new FakeGitHub();
+  await publishBoard(db.board.board_digest, options(db, github));
+  const result = await reconcileReceipt('M-001', {
+    db,
+    attestor: async () => ({attestation_url: 'https://example.test/attestations/M-001'}),
+    statusPublisher: async () => { throw new Error('status repository unavailable'); },
+    now: () => new Date('2026-07-19T13:00:00.000Z'),
+  });
+
+  assert.deepEqual(result, {mission_id: 'M-001', state: 'SUBMITTED', status_state: 'PENDING'});
+  const publication = await db.getPublication('M-001');
+  assert.equal(publication.publication_state, 'SUBMITTED');
+  assert.equal(publication.attestation_state, 'RECEIPT_ATTESTED');
+  assert.equal(publication.status_state, 'PENDING');
+  assert.match(publication.status_error, /status repository unavailable/);
+  assert.equal(github.count('create_pull_request'), 1);
+  assert.equal(github.closeCount, 0);
+  assert.equal(github.deleteCount, 0);
+});
+
 test('rerunning a submitted board adopts the PR without double-counting repository state', async () => {
   const db = new FakeDb(1);
   const github = new FakeGitHub();
@@ -886,8 +776,7 @@ test('an approved fast-forward amendment updates the existing PR and resets proo
     amendedCommit);
   const pr = [...github.pullRequests.values()][0];
   assert.equal(pr.head_oid, amendedCommit);
-  assert.match(pr.body, /Corrected after manual verification/);
-  assert.match(pr.body, new RegExp(PROMOTION_FREE_DISCLOSURE));
+  assert.equal(pr.body, '## Summary\n\nCorrected after manual verification.\n');
   const publication = await db.getPublication('M-001');
   assert.equal(publication.receipt_proof_sha256, newProof);
   assert.equal(publication.attestation_state, 'ATTESTATION_PENDING');

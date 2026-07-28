@@ -5,8 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {buildProof} from './verifier.mjs';
 import {runBounded} from './node-worker.mjs';
 import {receiptUrlFor} from './receipt-publisher.mjs';
-import {descriptiveBranch, finalizePrBody} from './worker.mjs';
-import {assertPublicationManifest, normalizeConsentScopes} from './publication-policy.mjs';
+import {finalizePrBody} from './worker.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BUNDLED_WORKER = path.join(HERE, 'node-worker.mjs');
@@ -66,25 +65,17 @@ function replacementManifest(plan, manifest, artifact, refreshed) {
   const missionId = plan.mission_id ?? manifest.mission_id;
   if (typeof missionId !== 'string' || !missionId) throw new Error('stale refresh requires mission_id');
   if (!refreshed?.verification?.ok) throw new Error('stale refresh worker did not return verified bytes');
-  const issueUrl = manifest.issue_url ??
-    `https://github.com/${manifest.repository}/issues/${manifest.issue_number}`;
-  const consentScopes = manifest.consent_scopes ?? normalizeConsentScopes({
-    contribution_invitation: {
-      status: 'granted',
-      evidence: {kind: 'public_url', value: issueUrl},
-      granted_at: manifest.ready_at ?? refreshed.verification.verification_started_at,
-      granted_by: `repository:${manifest.repository}`,
-    },
-  }, {missionId});
-  const visibility = manifest.receipt_visibility === 'public_opt_in'
-    ? 'public_opt_in' : 'private_internal';
-  const receiptUrl = visibility === 'public_opt_in'
-    ? receiptUrlFor(missionId, refreshed.commit_oid) : null;
-  const previousReceiptUrl = manifest.receipt_url;
+  const receiptUrl = receiptUrlFor(missionId, refreshed.commit_oid);
+  const previousReceiptUrl = String(manifest.receipt_url ?? '');
   const prBody = String(manifest.pr_body ?? '');
-  const baseBody = previousReceiptUrl ? prBody.replaceAll(previousReceiptUrl, receiptUrl ?? '') : prBody;
-  const reboundPrBody = finalizePrBody(baseBody, missionId, receiptUrl, {
+  if (!previousReceiptUrl || !prBody.includes(previousReceiptUrl)) {
+    throw new Error('stale refresh requires the approved PR body receipt binding');
+  }
+  const reboundPrBody = finalizePrBody(prBody.replaceAll(previousReceiptUrl, receiptUrl), missionId, receiptUrl, {
     command: refreshed.verification.patched_observation?.command,
+    commitOid: refreshed.commit_oid,
+    changedFiles: refreshed.verification.changed_files,
+    replaceExisting: prBody.includes(`<!-- northset-receipt:${missionId}:start -->`),
   });
   const next = {
     ...manifest,
@@ -100,21 +91,12 @@ function replacementManifest(plan, manifest, artifact, refreshed) {
     verification: refreshed.verification,
     changed_files: refreshed.verification.changed_files,
     changed_lines: refreshed.verification.changed_lines,
-    branch: `${descriptiveBranch(manifest.pr_title, manifest.issue_number)
-      .replace(/^fix\//u, 'refresh/')}-${refreshed.commit_oid.slice(0, 12)}`,
-    receipt_visibility: visibility,
-    consent_scopes: consentScopes,
+    branch: `northset/${missionId.toLowerCase()}-r-${refreshed.commit_oid.slice(0, 12)}`,
     receipt_url: receiptUrl,
-    planned_actions: [
-      ...(visibility === 'public_opt_in' ? ['publish-proof'] : []),
-      ...(manifest.planned_actions ?? [])
-        .filter((action) => action !== 'publish-proof'),
-    ],
     pr_body: reboundPrBody,
   };
   const task = taskFor(plan, next, refreshed.base_oid);
   next.proof = buildProof({task, verification: refreshed.verification, manifest: next});
-  assertPublicationManifest(next);
   return next;
 }
 

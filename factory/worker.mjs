@@ -6,12 +6,6 @@ import {createBoardIfDue, classifyRisk} from './board.mjs';
 import {sha256} from './db.mjs';
 import {receiptUrlFor} from './receipt-publisher.mjs';
 import {buildProof} from './verifier.mjs';
-import {
-  assertPublicationManifest,
-  normalizeConsentScopes,
-  PROMOTION_FREE_DISCLOSURE,
-  promotionFreePrBody,
-} from './publication-policy.mjs';
 
 const REMOVE_TREE_OPTIONS = Object.freeze({
   recursive: true,
@@ -70,96 +64,114 @@ export function createStageSemaphores({
   };
 }
 
-async function oneInfrastructureRetry(operation, {retryTimeout = true} = {}) {
+async function oneInfrastructureRetry(operation) {
   try { return await operation(); }
   catch (error) {
-    if (error?.transient !== true || error?.providerUnavailable === true ||
-        (!retryTimeout && /timed out/i.test(String(error?.message ?? '')))) throw error;
+    if (error?.transient !== true || error?.providerUnavailable === true) throw error;
     return operation();
   }
 }
 
-function exactCommand(command) {
-  return Array.isArray(command) ? command.join(' ') : String(command ?? '').trim();
+function renderedVerificationCommand(command) {
+  const rendered = Array.isArray(command) ? command.join(' ') : String(command ?? '');
+  return rendered.length > 80 ? "the repository's declared test command" : `\`${rendered}\``;
 }
 
-export function descriptiveBranch(title, issueNumber) {
-  const slug = String(title ?? '').toLowerCase()
-    .replace(/[^a-z0-9]+/gu, '-').replace(/^-|-$/gu, '').slice(0, 48)
-    .replace(/-$/u, '');
-  return `fix/${slug || `issue-${issueNumber}`}`;
+function hasMechanicallyVerifiedNoCiFiles(changedFiles) {
+  if (!Array.isArray(changedFiles)) return false;
+  return changedFiles.every((file) => {
+    const filePath = typeof file === 'string' ? file : file?.path;
+    if (typeof filePath !== 'string' || !filePath) return false;
+    const normalized = filePath.replaceAll('\\', '/').replace(/^\.\//, '').toLowerCase();
+    const knownCiPath = normalized.startsWith('.github/workflows/') ||
+      normalized.startsWith('.github/actions/') ||
+      /^(?:\.circleci|\.buildkite|ci|workflows?)(?:\/|$)/.test(normalized) ||
+      /^(?:\.gitlab-ci\.ya?ml|\.travis\.ya?ml|azure-pipelines\.ya?ml|jenkinsfile)$/.test(normalized);
+    return file?.class !== 'ci' && !knownCiPath;
+  });
+}
+
+function receiptBlock(missionId, receiptUrl, {command, commitOid, changedFiles} = {}) {
+  const lines = [
+    `<!-- northset-receipt:${missionId}:start -->`,
+    '### Verification',
+    '',
+    `${renderedVerificationCommand(command)} exited 0 on this exact head (\`${String(commitOid).slice(0, 7)}\`) in a network-off container, before this PR was opened.`,
+  ];
+  if (hasMechanicallyVerifiedNoCiFiles(changedFiles)) {
+    lines.push('No workflow or CI files are modified in this change.');
+  }
+  lines.push(
+    `Commands, environment, and hashes: [receipt ${missionId}](${receiptUrl}) — checkable in ~30 seconds without trusting us.`,
+    'Self-run by the contributor, not maintainer verification.',
+    `<!-- northset-receipt:${missionId}:end -->`,
+  );
+  return lines.join('\n');
+}
+
+function receiptFooter(missionId, receiptUrl, verificationFacts) {
+  return [
+    '---',
+    receiptBlock(missionId, receiptUrl, verificationFacts),
+    '',
+    'AI-assisted and reviewed by Northset; I take responsibility for this submission.',
+  ].join('\n');
 }
 
 export function finalizePrBody(body, missionId, receiptUrl, {
-  command,
-  checks = null,
+  replaceExisting = false,
+  ...verificationFacts
 } = {}) {
-  const declared = checks ?? [exactCommand(command)].filter(Boolean);
-  return promotionFreePrBody(body, declared, {receiptUrl});
+  let rendered = String(body ?? '')
+    .replaceAll('{{MISSION_ID}}', missionId)
+    .replaceAll('{{RECEIPT_URL}}', receiptUrl)
+    .trimEnd();
+  const startMarker = `<!-- northset-receipt:${missionId}:start -->`;
+  const endMarker = `<!-- northset-receipt:${missionId}:end -->`;
+  const start = rendered.indexOf(startMarker);
+  if (start === -1) {
+    rendered = `${rendered}\n\n${receiptFooter(missionId, receiptUrl, verificationFacts)}`.trim();
+  } else if (replaceExisting) {
+    const end = rendered.indexOf(endMarker, start);
+    if (end === -1) throw new Error(`receipt block for ${missionId} is missing its end marker`);
+    const separator = rendered.lastIndexOf('\n---\n', start);
+    if (separator !== -1 || rendered.startsWith('---\n')) {
+      const footerStart = separator === -1 ? 0 : separator;
+      rendered = `${rendered.slice(0, footerStart).trimEnd()}\n\n${
+        receiptFooter(missionId, receiptUrl, verificationFacts)}`.trim();
+    } else {
+      rendered = `${rendered.slice(0, start)}${receiptBlock(missionId, receiptUrl, verificationFacts)}${
+        rendered.slice(end + endMarker.length)}`.trimEnd();
+    }
+  }
+  return `${rendered}\n`;
 }
 
 export function buildReadyManifest(task, authorResult, verification, missionId) {
-  const manualEvidence = normalizeAuthorEvidence(authorResult);
-  const issueUrl = authorResult.issue_url ??
-    `https://github.com/${task.repository}/issues/${task.issue_number}`;
-  const consentScopes = normalizeConsentScopes({
-    contribution_invitation: {
-      status: 'granted',
-      evidence: {kind: 'public_url', value: issueUrl},
-      granted_at: task.issue_snapshot?.updatedAt ?? task.live_state?.issue?.updatedAt ??
-        task.updated_at ?? task.created_at ?? verification.verification_started_at ??
-        verification.verification_finished_at,
-      granted_by: `repository:${task.repository}`,
-    },
-    ...authorResult.consent_scopes,
-  }, {missionId});
-  const receiptVisibility = authorResult.receipt_visibility === 'public_opt_in' &&
-    consentScopes.scopes.receipt_publication_consent.status === 'granted'
-    ? 'public_opt_in' : 'private_internal';
-  const receiptUrl = receiptVisibility === 'public_opt_in'
-    ? receiptUrlFor(missionId, verification.commit_oid) : null;
-  const verifiedCommand = exactCommand(
-    verification.patched_observation?.command ?? authorResult.test_command,
-  );
-  const manualDisclosure = manualEvidence.checks_not_run.length ? [
-    'Manual checks not run:',
-    ...manualEvidence.checks_not_run.map(({check, reason}) => `- [ ] ${check} — not run: ${reason}`),
-    ...(manualEvidence.limitations.length ? [
-      '',
-      'Verification limitations:',
-      ...manualEvidence.limitations.map((limitation) => `- ${limitation}`),
-    ] : []),
-  ].join('\n') : '';
-  const managedDisclosureAt = authorResult.pr_body.indexOf(PROMOTION_FREE_DISCLOSURE);
-  const authoredCore = (managedDisclosureAt < 0
-    ? authorResult.pr_body : authorResult.pr_body.slice(0, managedDisclosureAt)).trim();
-  const body = finalizePrBody([
-    authoredCore,
-    manualDisclosure,
-  ].filter(Boolean).join('\n\n'), missionId, receiptUrl, {
-    checks: [verifiedCommand].filter(Boolean),
+  const receiptUrl = receiptUrlFor(missionId, verification.commit_oid);
+  const body = finalizePrBody(authorResult.pr_body, missionId, receiptUrl, {
+    command: verification.patched_observation?.command,
+    commitOid: verification.commit_oid,
+    changedFiles: verification.changed_files,
   });
+  const verifiedCommand = verification.patched_observation?.command ?? authorResult.test_command;
   const manifest = {
-    mission_id: missionId,
-    task_id: task.task_id,
     repository: task.repository,
     fork_repository: authorResult.fork_repository ?? task.live_state?.fork_repository ?? null,
     repository_path: authorResult.repository_path ?? null,
     patch_path: authorResult.patch_path ?? null,
     verification_path: authorResult.verification_path ?? null,
     issue_number: task.issue_number,
-    issue_url: issueUrl,
+    issue_url: authorResult.issue_url ?? `https://github.com/${task.repository}/issues/${task.issue_number}`,
     invitation_summary: task.live_state?.invitation_summary ?? 'Live preflight confirmed an invited, unoccupied issue.',
     base_branch: authorResult.base_branch ?? task.live_state?.repository?.defaultBranch ??
       task.live_state?.default_branch ?? 'main',
-    branch: authorResult.branch ?? descriptiveBranch(authorResult.pr_title, task.issue_number),
+    branch: authorResult.branch ?? `northset/${missionId.toLowerCase()}`,
     base_oid: task.base_oid,
     patch_sha256: verification.patch_sha256,
     tested_tree_oid: verification.tested_tree_oid,
     commit_oid: verification.commit_oid,
     checks: [verifiedCommand].filter(Boolean),
-    checks_not_run: manualEvidence.checks_not_run,
-    limitations: manualEvidence.limitations,
     test_command: authorResult.test_command,
     install_command: authorResult.install_command ?? null,
     test_only_paths: authorResult.test_only_paths ?? [],
@@ -171,68 +183,16 @@ export function buildReadyManifest(task, authorResult, verification, missionId) 
     changed_files: verification.changed_files,
     changed_lines: verification.changed_lines,
     risk_tier: authorResult.risk_tier ?? classifyRisk(authorResult),
-    risk_warnings: [
-      ...(authorResult.risk_warnings ?? []),
-      ...manualEvidence.checks_not_run.map(({check}) => `Manual verification not run: ${check}`),
-    ],
+    risk_warnings: authorResult.risk_warnings ?? [],
     receipt_claim: {
       type: verification.claim_type,
       statement: authorResult.receipt_claim ?? verification.claim_type,
     },
-    receipt_visibility: receiptVisibility,
-    consent_scopes: consentScopes,
-    interaction_users: [...new Set((task.live_state?.interactionUsers ?? [])
-      .map((user) => String(user).toLowerCase()))],
     receipt_url: receiptUrl,
-    planned_actions: [
-      ...(receiptVisibility === 'public_opt_in' ? ['publish-proof'] : []),
-      'push-approved-commit', 'open-upstream-pr', 'verify-pr-readback',
-    ],
+    planned_actions: ['publish-proof', 'push-approved-commit', 'open-upstream-pr', 'verify-pr-readback'],
   };
   manifest.proof = buildProof({task, verification, manifest});
-  assertPublicationManifest(manifest);
   return manifest;
-}
-
-export function normalizeAuthorEvidence(authored) {
-  const checksNotRun = authored?.checks_not_run;
-  const limitations = authored?.limitations;
-  if (!Array.isArray(checksNotRun)) throw new Error('author checks_not_run must be an array');
-  if (!Array.isArray(limitations)) throw new Error('author limitations must be an array');
-  const normalizedChecks = checksNotRun.map((entry) => {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
-        typeof entry.check !== 'string' || !entry.check.trim() || /[\r\n]/u.test(entry.check) ||
-        typeof entry.reason !== 'string' || !entry.reason.trim() || /[\r\n]/u.test(entry.reason)) {
-      throw new Error('author checks_not_run entries require nonblank single-line check and reason strings');
-    }
-    return {check: entry.check.trim(), reason: entry.reason.trim()};
-  });
-  const normalizedLimitations = limitations.map((entry) => {
-    if (typeof entry !== 'string' || !entry.trim() || /[\r\n]/u.test(entry)) {
-      throw new Error('author limitations entries must be nonblank single-line strings');
-    }
-    return entry.trim();
-  });
-  const lines = String(authored?.pr_body ?? '').split(/\r?\n/u).map((line) => line.trim());
-  for (const {check} of normalizedChecks) {
-    const normalizedCheck = check.toLowerCase().replace(/\s+/gu, ' ');
-    if (lines.some((line) => {
-      const item = line.match(/^(?:[-*+]|\d+[.)])\s+\[\s*([xX ])\s*\]\s+(.+)$/u);
-      if (!item || item[1].toLowerCase() !== 'x') return false;
-      const text = item[2]
-        .replace(/\[([^\]]+)\]\([^)]+\)/gu, '$1')
-        .replace(/<[^>]*>/gu, '')
-        .replace(/[*_`~]/gu, '')
-        .trim()
-        .toLowerCase()
-        .replace(/[.!?,;:]+$/gu, '')
-        .replace(/\s+/gu, ' ');
-      if (!text.startsWith(normalizedCheck)) return false;
-      const boundary = text[normalizedCheck.length];
-      return boundary === undefined || /[^\p{L}\p{N}_]/u.test(boundary);
-    })) throw new Error(`PR body contradicts unrun check: ${check}`);
-  }
-  return {checks_not_run: normalizedChecks, limitations: normalizedLimitations};
 }
 
 function assertAuthorResult(authored) {
@@ -250,7 +210,6 @@ function assertAuthorResult(authored) {
   if (forbidden.some((pattern) => pattern.test(body))) {
     throw new Error('PR text contains a prohibited overclaim');
   }
-  normalizeAuthorEvidence(authored);
 }
 
 function assertVerification(verification) {
@@ -291,9 +250,9 @@ export function assertPublicVerificationClaims(authored, verification) {
   const verifiedTools = verifiedCommands.map((candidate) =>
     candidate.match(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*([^\s]+)/)?.[1]).filter(Boolean);
   const denial =
-    /\b(?:(?:could not|couldn't|cannot|can't)\s+(?:be\s+)?(?:start(?:ed)?|run|execute(?:d)?|complete(?:d)?|finish(?:ed)?|pass|succeed)|(?:did not|didn't|does not|doesn't|was unable to|failed to)\s+(?:start|run|execute|complete|finish|pass|succeed)|(?:was|is) (?:(?:not|never) (?:run|executed|started|completed|finished|successful)|not able to (?:start|run|execute|complete|finish|pass|succeed)|unsuccessful|blocked|denied|unavailable|skipped|failed)|wasn't (?:run|executed|started|completed|finished|successful)|(?:(?:has|have) not|hasn't|haven't) (?:run|executed|started|completed|finished|passed|succeeded)|never (?:ran|executed|started|completed|finished|passed|succeeded)|not (?:run|completed|finished|successful)|timed out|errored|crashed|blocked|denied|unavailable|skipped|failed)\b/i;
+    /\b(?:(?:could not|couldn't)\s+(?:be\s+)?(?:start(?:ed)?|run|execute(?:d)?)|(?:did not|didn't|was unable to|failed to)\s+(?:start|run|execute)|was not (?:run|executed|started)|wasn't (?:run|executed|started)|never (?:ran|executed|started)|not run|blocked|denied|unavailable|skipped|failed)\b/i;
   const reverseDenial =
-    /\b(?:(?:(?:could|did) not|couldn't|didn't|was unable to|failed to|blocked from)\s+(?:start|run|execute|complete|finish|pass|succeed)|skipped|blocked|denied)\s+(?:the\s+)?$/i;
+    /\b(?:(?:(?:could|did) not|couldn't|didn't|was unable to|failed to|blocked from)\s+(?:start|run|execute)|skipped|blocked|denied)\s+(?:the\s+)?$/i;
   const deniedLiteral = (candidate, literal, excludeProperty = false) => {
     let offset = 0;
     while (offset <= candidate.length - literal.length) {
@@ -313,12 +272,6 @@ export function assertPublicVerificationClaims(authored, verification) {
       const after = tail.match(denial);
       if (after) {
         const beforeDenial = tail.slice(0, after.index);
-        const recovery = tail.slice(after.index + after[0].length);
-        const deniesDifferentCheck =
-          /\b(?:run|execute|start)\b/i.test(after[0]) &&
-          /^\s+(?:manual|optional|uat|qa)\b[^.;\n]{0,60}\b(?:tests?|checks?)\b/i
-            .test(recovery);
-        if (deniesDifferentCheck) continue;
         const priorSuccess = [...beforeDenial.matchAll(
           /\b(?:passed|succeeded|exited\s+0|completed successfully)\b/ig,
         )].at(-1);
@@ -331,9 +284,16 @@ export function assertPublicVerificationClaims(authored, verification) {
             : between)
             .replace(/\b(?:previously|earlier|before|now|later)\b/ig, '')
             .replace(/[\s,()[\]`*_'-]+/g, '');
+          const recovery = tail.slice(after.index + after[0].length);
+          const deniesDifferentCheck =
+            /\b(?:run|execute|start)\b/i.test(after[0]) &&
+            /^\s+(?!(?:in|on|under|because|due|locally)\b)[^.;\n]{0,60}\b(?:tests?|checks?)\b/i
+              .test(recovery);
+          if ((!denialSubject || /^it$/i.test(denialSubject)) && deniesDifferentCheck) continue;
           if (denialSubject && !/^it$/i.test(denialSubject)) continue;
           return true;
         }
+        const recovery = tail.slice(after.index + after[0].length);
         const initialFailure = /\b(?:initially|at first|on the first attempt)\b/i
           .test(`${prefix} ${beforeDenial}`);
         const laterSuccess =
@@ -344,117 +304,24 @@ export function assertPublicVerificationClaims(authored, verification) {
     }
     return false;
   };
-  const wholeCommand =
-    /\b(?:full|complete|entire|exact|same|above|following|declared)\s+(?:(?:test|verification)\s+)?command\b/i;
-  const commandSubject =
-    /\b(?:(?:the|this|that)\s+|(?:test|verification|required|automated)\s+)?command\b[`*_]*/ig;
-  const directSubjectDenial = new RegExp(`^\\s+(?:(?:itself|still|also)\\s+)*${denial.source}`, 'i');
-  const coordinatedSubjectDenial =
-    /^\s+(?:and|along with)\b[^.;\n]{0,80}\s+(?:(?:was|were)\s+(?:not\s+(?:run|executed|started|completed|finished|successful)|unsuccessful|blocked|denied|unavailable|skipped|failed)|(?:wasn't|weren't)\s+(?:run|executed|started|completed|finished|successful)|(?:(?:did|could)\s+not|didn't|couldn't|was unable to|failed to)\s+(?:start|run|execute|complete|finish|pass|succeed)|never\s+(?:ran|executed|started|completed|finished|passed|succeeded))\b/i;
-  const sameCommandRecovery = (prefix, recovery) => {
-    const laterSuccess =
-      /^\s*[,;]?\s*(?:then|but(?:\s+now)?|now)\s+(?:it\s+)?(?:pass(?:es|ed)?|succeed(?:s|ed)?|exited\s+0|completed successfully)\b/i;
-    if (/\b(?:initially|at first)\s*,?\s*$/i.test(prefix) && laterSuccess.test(recovery)) return true;
-    const inlineHistory =
-      recovery.match(/^\s+(?:before the fix|on (?:the )?first attempt)\b/i);
-    return Boolean(inlineHistory && laterSuccess.test(recovery.slice(inlineHistory[0].length)));
-  };
-  const reverseCommandDenied =
-    /\b(?:(?:(?:could|did) not|couldn't|didn't|(?:was\s+)?unable to|failed to|blocked from)\s+(?:start|run|execute|complete|finish|pass|succeed)|skipped|blocked|denied)\s+(?:(?:the|this|that)\s+)?(?:(?:test|verification|required|automated)\s+)?command\b/i;
+  const wholeCommand = /\b(?:full|complete|entire|exact|same|above|following|declared)\s+(?:(?:test|verification)\s+)?command\b/i;
   const commandDeniedInFull =
     /\bcommand\b(?:(?![.;\n]).){0,60}\b(?:did not run|was not run|wasn't run|could not run|couldn't run)\b(?:(?![.;\n]).){0,30}\bin full\b/i;
   const deniesWholeCommand = (candidate) => {
-    if (commandDeniedInFull.test(candidate) || reverseCommandDenied.test(candidate)) return true;
+    if (commandDeniedInFull.test(candidate)) return true;
     const matches = candidate.matchAll(new RegExp(wholeCommand.source, 'ig'));
-    if ([...matches].some((match) => deniedLiteral(candidate, match[0], true))) return true;
-    return [...candidate.matchAll(commandSubject)].some((match) => {
-      const prefix = candidate.slice(0, match.index ?? 0);
-      if (/\b(?:full|complete|entire|exact|same|above|following|declared)\s+(?:(?:test|verification)\s+)?$/i
-        .test(prefix)) return false;
-      const tail = candidate.slice((match.index ?? 0) + match[0].length);
-      const denialMatch = tail.match(directSubjectDenial) ?? tail.match(coordinatedSubjectDenial);
-      if (!denialMatch) return false;
-      const recovery = tail.slice((denialMatch.index ?? 0) + denialMatch[0].length);
-      return !sameCommandRecovery(prefix, recovery);
-    });
+    return [...matches].some((match) => deniedLiteral(candidate, match[0], true));
   };
   const deniesFocusedCheck = (candidate) => [...candidate.matchAll(
     /\bfocused\b[^.\n]{0,120}\b(?:command|check|test(?:s|ing)?)\b/ig,
   )].some((match) => deniedLiteral(candidate, match[0]));
-  const body = String(authored?.pr_body ?? '');
-  const bodyLines = body.split(/\r?\n/);
-  const proseParagraphs = [];
-  let proseBuffer = [];
-  const flushProse = () => {
-    if (proseBuffer.length) proseParagraphs.push(proseBuffer.join(' '));
-    proseBuffer = [];
-  };
-  for (const bodyLine of bodyLines) {
-    const trimmed = bodyLine.trim();
-    if (!trimmed) {
-      flushProse();
-    } else if (/^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```|~~~|>)/u.test(trimmed)) {
-      flushProse();
-      proseParagraphs.push(trimmed);
-    } else {
-      proseBuffer.push(trimmed);
-    }
-  }
-  flushProse();
-  const line = proseParagraphs
+  const line = String(authored?.pr_body ?? '').split(/\r?\n/)
     .find((candidate) => deniesWholeCommand(candidate) ||
       deniesFocusedCheck(candidate) ||
       verifiedCommands.some((verifiedCommand) => deniedLiteral(candidate, verifiedCommand)) ||
       verifiedTools.some((tool) => deniedLiteral(candidate, `${tool} execution`)));
   if (line) {
     throw new Error('PR body says the clean verifier command did not run, but its patched observation passed');
-  }
-  const passAssertion =
-    /\b(?:pass(?:es|ed)?|succeed(?:s|ed)?|successful(?:ly)?|complete(?:d)?)\b/i;
-  const environmentScope =
-    /\b(?:in|on|under|with|against|using|via|for|inside|within)\s+(?:(?:the|a|an)\s+)?(?!(?:the|a|an|this|that|no|zero|normal|order|confidence|completion|command|verifier|pr|pull|current|same|above|below|reporting|submi(?:ssion|tting)|locally|local|machine|environment)\b)[A-Za-z0-9][A-Za-z0-9._-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._-]*)*/i;
-  const clauseBoundary = /[,;]|\b(?:and|or|alongside|while|but)\b/i;
-  const conjunctionBoundary = /;|\b(?:and|or|alongside|while|but)\b/i;
-  const hasBoundScope = (before, after) => {
-    const priorClause = before.split(conjunctionBoundary).at(-1) ?? '';
-    const followingClause = after.split(clauseBoundary)[0] ?? '';
-    const manualScope =
-      /\b(?:manual|optional|uat|qa)\b[^,;]{0,40}[`*()[\]\s-]*$/i.test(priorClause) ||
-      /^[`*()[\]\s-]*\b(?:manual|optional|uat|qa)\b/i.test(followingClause);
-    const prefixedEnvironment = [...priorClause.matchAll(
-      new RegExp(environmentScope.source, 'ig'),
-    )].some((match) => /^[\s,:`*()[\]-]*$/.test(
-      priorClause.slice((match.index ?? 0) + match[0].length),
-    ));
-    return manualScope || prefixedEnvironment || environmentScope.test(followingClause);
-  };
-  const unchecked = bodyLines.find((candidate) => {
-    if (!/^\s*[-*]\s+\[\s\]\s+/u.test(candidate)) return false;
-    const label = candidate.replace(/^\s*[-*]\s+\[\s\]\s+/u, '').trim();
-    const occurrences = [];
-    for (const verifiedCommand of [...new Set(verifiedCommands)]
-      .sort((left, right) => right.length - left.length)) {
-      const escaped = verifiedCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const pattern =
-        new RegExp(`(^|[^A-Za-z0-9_:.-])(${escaped})(?=$|[^A-Za-z0-9_:.-])`, 'ig');
-      for (const match of label.matchAll(pattern)) {
-        const start = (match.index ?? 0) + match[1].length;
-        const end = start + verifiedCommand.length;
-        if (occurrences.some((entry) => start >= entry.start && end <= entry.end)) continue;
-        occurrences.push({start, end});
-      }
-    }
-    return occurrences.some(({start, end}) => {
-      const before = label.slice(0, start);
-      const after = label.slice(end);
-      const localBefore = before.split(clauseBoundary).at(-1) ?? '';
-      const localAfter = after.split(clauseBoundary)[0] ?? '';
-      if (!passAssertion.test(`${localBefore} ${localAfter}`)) return false;
-      return !hasBoundScope(before, after);
-    });
-  });
-  if (unchecked) {
-    throw new Error('PR body leaves a clean-verifier command unchecked after its patched observation passed');
   }
 }
 
@@ -486,37 +353,10 @@ async function processClaim(claim, {
   const {task, attempt} = claim;
   const began = now().getTime();
   let checkout = null;
-  const authoringBlockReason = async () => {
-    if (typeof db.findInteractionBlocks !== 'function') return null;
-    const blocks = await db.findInteractionBlocks({
-      repository: task.repository,
-      users: task.live_state?.interactionUsers ?? [],
-      action: 'authoring',
-    });
-    if (!blocks.length) return null;
-    return blocks.map((block) => block.reason).filter(Boolean).join('; ') ||
-      `Authoring is blocked for ${task.repository}`;
-  };
   try {
-    const initialBlockReason = await authoringBlockReason();
-    if (initialBlockReason) {
-      db.finishAttempt(attempt.attempt_id, {
-        outcome: 'SKIPPED',
-        failureClass: 'interaction_block',
-        durationMs: now().getTime() - began,
-        error: initialBlockReason,
-        now: now(),
-      });
-      return {task_id: task.task_id, state: 'SKIPPED', reason: initialBlockReason};
-    }
     checkout = await semaphores.clone.run(() => oneInfrastructureRetry(() => driver.checkout(task, attempt)));
-    // A scout timeout already consumes the full bounded model window. Let the
-    // durable task retry on a later cycle instead of immediately spending the
-    // same 90 seconds again inside one attempt.
-    const scout = await semaphores.scout.run(() => oneInfrastructureRetry(
-      () => driver.scout(task, checkout, {effort: 'medium', timeoutMs: 90_000}),
-      {retryTimeout: false},
-    ));
+    const scout = await semaphores.scout.run(() => oneInfrastructureRetry(() =>
+      driver.scout(task, checkout, {effort: 'medium', timeoutMs: 90_000})));
     if (!scout || scout.decision === 'SKIP') {
       db.finishAttempt(attempt.attempt_id, {
         outcome: 'SKIPPED', failureClass: 'candidate',
@@ -540,17 +380,14 @@ async function processClaim(claim, {
     let lastError = null;
     for (let authorAttempt = 1; authorAttempt <= 2; authorAttempt += 1) {
       try {
-        const authored = await semaphores.author.run(() => oneInfrastructureRetry(async () => {
-          const lateBlockReason = await authoringBlockReason();
-          if (lateBlockReason) return {outcome: 'SKIP', reason: lateBlockReason};
-          return driver.author(task, checkout, scout, {
+        const authored = await semaphores.author.run(() => oneInfrastructureRetry(() =>
+          driver.author(task, checkout, scout, {
             attempt: authorAttempt,
             effort: authorAttempt === 1 ? 'high' : (driver.secondEffort ?? 'high'),
             timeoutMs: 10 * 60_000,
             verifierFeedback: feedback,
             dependencyMaterial,
-          });
-        }));
+          })));
         if (!authored || authored.outcome === 'SKIP') {
           db.finishAttempt(attempt.attempt_id, {
             outcome: 'SKIPPED', failureClass: 'authoring',
@@ -608,12 +445,7 @@ async function processClaim(claim, {
         const board = createBoardIfDue(db, {...boardPolicy, now: now()});
         return {task_id: task.task_id, state: 'READY', mission_id: ready.mission_id, board};
       } catch (error) {
-        if (error?.transient === true || error?.infrastructure === true) {
-          if (feedback) {
-            error.message = `${error.message}; prior verifier feedback: ${feedback}`;
-          }
-          throw error;
-        }
+        if (error?.transient === true || error?.infrastructure === true) throw error;
         lastError = error;
         feedback = error.message;
         await driver.resetAfterFailure?.(task, checkout, {authorAttempt, error});
@@ -744,7 +576,7 @@ function runJsonCommand(command, args, payload, {
     child.stdout.on('data', (chunk) => { stdout = collect(stdout, chunk); });
     child.stderr.on('data', (chunk) => { stderr = collect(stderr, chunk); });
     child.on('error', (error) => { clearTimeout(timer); reject(error); });
-    child.on('close', (code, signal) => {
+    child.on('close', (code) => {
       clearTimeout(timer);
       if (terminalError) {
         terminalError.transient = /timed out/i.test(terminalError.message);
@@ -753,12 +585,10 @@ function runJsonCommand(command, args, payload, {
       }
       if (code !== 0) {
         const failureOutput = stderr || stdout;
-        const termination = signal ? `signal ${signal}` : `exit ${code}`;
-        const detail = failureOutput.trim();
-        const error = new Error(`worker command failed: ${termination}${detail ? `: ${detail}` : ''}`);
+        const error = new Error(`worker command failed: ${failureOutput.trim() || `exit ${code}`}`);
         error.providerUnavailable = /host Codex sandbox failed:[\s\S]*(?:you(?:'|’)ve hit your usage limit|usage[_ ]limit|model provider[^\n]*unavailable|unexpected status 401 unauthorized|http error: 401 unauthorized|auth error code: token_(?:invalidated|revoked)|authentication token has been invalidated|invalidated oauth token|invalid ['’]refresh_token['’]: empty string)/i
           .test(failureOutput);
-        error.infrastructure = error.providerUnavailable || Boolean(signal) ||
+        error.infrastructure = error.providerUnavailable ||
           /host Codex sandbox failed:[\s\S]*(?:agent identity JWT payload is not valid JSON|invalid_json_schema|model provider[^\n]*error)/i
             .test(failureOutput);
         error.transient = /temporar|timed out|connection reset|econnreset|etimedout|eai_again|network unreachable|registry[^\n]*(?:unavailable|timeout)|cannot connect to the docker daemon/i

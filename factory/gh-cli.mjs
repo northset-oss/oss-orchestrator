@@ -358,10 +358,7 @@ export function createGhCliTransport({
         }
         const depth = Number.isInteger(request.depth) && request.depth > 0 ? request.depth : 1;
         const initialized = await git(['init', '--quiet', destination], {operation: 'git init exact base'});
-        await git(['-C', destination, 'config', '--local', '--replace-all', 'remote.origin.url', url],
-          {operation: 'git configure origin URL'});
-        await git(['-C', destination, 'config', '--local', '--replace-all', 'remote.origin.fetch',
-          '+refs/heads/*:refs/remotes/origin/*'], {operation: 'git configure origin fetch'});
+        await git(['-C', destination, 'remote', 'add', 'origin', url], {operation: 'git add origin'});
         await git(['-C', destination, 'fetch', '--no-tags', `--depth=${depth}`, '--', 'origin', baseOid],
           {operation: 'git fetch exact base'});
         const verified = await run(gitExecutable,

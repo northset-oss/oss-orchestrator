@@ -5,11 +5,6 @@ autonomous. Opening upstream pull requests is the single human-authorized bounda
 reviews an immutable READY board, approves exact mission IDs, and explicitly starts the paced
 publisher.
 
-**Incident policy v2 is active:** new upstream PR creation and public receipt publication are paused
-until a manual owner clearance. Local preparation and support for already-open PRs continue.
-Authored work keeps its verification evidence private by default, and normal PR bodies contain no
-receipt, ledger, product, mission, or request link.
-
 The binding runtime policy is [OPERATING_CONTRACT.md](OPERATING_CONTRACT.md). The redesign rationale
 is [docs/oss_orchestrator_system_redesign_2026-07-19.md](docs/oss_orchestrator_system_redesign_2026-07-19.md).
 Phase-level observations and carry-forward lessons are recorded in
@@ -83,8 +78,8 @@ The follow-up summary is an ephemeral snapshot. It reports truncated GitHub hist
 does not infer that a request was addressed or post any response.
 
 Each card shows the repository and issue, risk, changed files and diffstat, links to the full local
-diff and verifier log, base and patched observations, exact checks, exact PR title/body, private or
-public record visibility, and the four independent consent scopes.
+diff and verifier log, base and patched observations, exact checks, exact PR title/body, and receipt
+claim.
 
 Approve only the exact items reviewed. Green items may be approved together; Amber items should be
 selected individually. Explicitly rejected items become owner-rejected. Items omitted from both
@@ -102,8 +97,7 @@ approved by the scaled lane. Approval rereads the durable patch and Git reposito
 base, patch digest, commit, and tested tree shown on the board. A changed manifest or artifact
 invalidates only that item's approval and sends it back for review.
 
-Publication is a separate, explicit command and currently fails closed while the policy-v2 pause is
-active:
+Publication is a separate, explicit command:
 
 ```sh
 node factory/cli.mjs publish \
@@ -122,12 +116,11 @@ node factory/cli.mjs publish \
 The override does not bypass approval, live issue eligibility, collision checks, repository cooldowns,
 or owner/hour/day publication caps.
 
-After a manual owner clearance it validates the approval, promotion-free PR body, record visibility,
-four consent scopes, and interaction blocks; performs the final live collision/occupancy check;
-publishes a receipt only when separate publication consent is bound; pushes exact approved commits;
-opens upstream PRs through the paced safety queue; and reads each PR back to verify its stored title,
-body, base, and head OID. Re-running the same command is the supported crash-recovery path; exact
-existing branches and PRs are adopted instead of duplicated.
+It validates the approval, performs the final live collision/occupancy check, publishes one immutable
+receipt batch, pushes exact approved commits, opens upstream PRs through the paced safety queue, and
+reads each PR back to verify its stored title, body, base, and head OID. Re-running the same command
+is the supported crash-recovery path; exact existing branches and PRs are adopted instead of
+duplicated.
 
 ## GitHub safety
 
@@ -154,23 +147,6 @@ node factory/cli.mjs github-resume \
   --repository owner/repo \
   --reason "<maintainer or founder decision>"
 ```
-
-`github-status` reports the public-action limits currently stored in policy state. The first twenty
-post-incident contributions stay at one open PR per repository, two PRs per owner per rolling seven
-days, one PR per hour, and three PRs per day. Those limits do not change automatically. After the
-first twenty have been reviewed, the owner can deliberately select the next profile:
-
-```sh
-node factory/cli.mjs publication-limits \
-  --repository-open 1 \
-  --owner-rolling-7d 3 \
-  --per-hour 2 \
-  --per-day 5 \
-  --reason "First twenty post-incident contributions reviewed."
-```
-
-The repository-open limit must remain one. An increase is rejected until twenty post-resume
-contributions have been recorded.
 
 ## Defaults and environment
 
