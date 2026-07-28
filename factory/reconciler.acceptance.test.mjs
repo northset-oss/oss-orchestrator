@@ -25,11 +25,9 @@ function fakeDb(seed = publication()) {
   const publications = new Map([[seed.mission_id, {...seed}]]);
   let released = false;
   const taskStates = [];
-  const prospects = [];
   return {
     publications,
     taskStates,
-    prospects,
     async listReconciliationCandidates({limit}) {
       return [...publications.values()].filter((item) => item.publication_state === 'SUBMITTED').slice(0, limit);
     },
@@ -61,7 +59,6 @@ function fakeDb(seed = publication()) {
       publications.set(missionId, next);
       return {publication: next, repository_released: repositoryReleased};
     },
-    async recordVerificationProspect(record) { prospects.push(structuredClone(record)); return record; },
   };
 }
 
@@ -71,8 +68,6 @@ function harness({
   merged = false,
   attestor,
   statusPublisher,
-  appendDemand = () => {},
-  demandDir = 'runs/demand',
 } = {}) {
   const db = fakeDb(seed);
   const safetyCalls = [];
@@ -108,7 +103,6 @@ function harness({
   };
   return {
     db, safety, github, safetyCalls, releases, prohibited, attestor, statusPublisher,
-    appendDemand, demandDir,
   };
 }
 
@@ -359,7 +353,7 @@ test('follow-up summary exposes contributor comments without relabeling maintain
   assert.equal(fixture.prohibited.close, 0);
 });
 
-test('maintainer AI-policy rejection becomes telemetry and a repository verification prospect', async () => {
+test('maintainer AI-policy rejection remains factual outcome telemetry only', async () => {
   const fixture = harness({
     prState: 'closed',
     attestor: async () => ({found: false}),
@@ -381,99 +375,8 @@ test('maintainer AI-policy rejection becomes telemetry and a repository verifica
 
   const result = await reconcilePublicationBatch(fixture);
   assert.equal(result.results[0].reason_code, 'ai_policy_concern');
-  assert.equal(result.results[0].verification_prospect, true);
-  assert.deepEqual(fixture.db.prospects, [{
-    repository: 'upstream/project',
-    owner: 'upstream',
-    reasonCode: 'ai_policy_concern',
-    missionId: 'M-001',
-    observedAt: '2026-07-19T13:00:00.000Z',
-  }]);
   assert.equal(reasonCodeFromFollowUp({latest_reviews_by_maintainer: [], maintainer_comments: []}), 'unknown');
   assert.equal(reasonCodeFromFollowUp({latest_reviews_by_maintainer: [{
     body: 'AI-generated contributions are allowed if reviewed.',
   }]}), 'other');
-});
-
-test('terminal reconciliation emits exact shadow acceptance and merged demand signal schemas once', async () => {
-  const appended = [];
-  const fixture = harness({
-    prState: 'closed',
-    merged: true,
-    appendDemand: (file, record) => appended.push({file, record: structuredClone(record)}),
-    demandDir: '/tmp/factory-demand-test',
-    attestor: async () => ({found: false}),
-    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
-      status_url: `https://example.test/${item.mission_id}/publication.json`,
-    }])),
-  });
-  fixture.github.getCommitStatus = async () => ({
-    found: true, state: 'SUCCESS', total_count: 1, updated_at: '2026-07-19T11:59:00Z',
-  });
-  fixture.github.getPullRequestFollowUp = async () => ({
-    author_login: 'AysajanE', review_decision: 'APPROVED', comments: [],
-    reviews: [{
-      author_login: 'maintainer', author_type: 'User', author_association: 'MEMBER',
-      body: 'The verification receipt made this straightforward.', state: 'APPROVED',
-      submitted_at: '2026-07-19T12:30:00Z',
-    }],
-    threads: [],
-  });
-
-  await reconcilePublicationBatch(fixture);
-  await reconcilePublicationBatch(fixture);
-  const shadow = appended.filter((entry) => entry.file.endsWith('/shadow_acceptance.jsonl'));
-  const proto = appended.filter((entry) => entry.file.endsWith('/proto_signals.jsonl'));
-  assert.equal(shadow.length, 1);
-  assert.deepEqual(Object.keys(shadow[0].record), [
-    'ts', 'mission_id', 'repo', 'declared_check_passed', 'would_release',
-    'both_sides_would_accept', 'human_override', 'reason',
-  ]);
-  assert.equal(shadow[0].record.declared_check_passed, true);
-  assert.equal(shadow[0].record.would_release, null);
-  assert.equal(shadow[0].record.both_sides_would_accept, 'unknown');
-  assert.match(shadow[0].record.reason, /^not_assessed:/);
-  assert.deepEqual(proto.map((entry) => entry.record.signal), [
-    'merged_without_ci_rerun', 'maintainer_cited_receipt', 'fast_merge_after_receipt',
-  ]);
-  assert.equal(proto.find((entry) => entry.record.signal === 'merged_without_ci_rerun').record.confidence, 'low');
-  for (const entry of proto) {
-    assert.deepEqual(Object.keys(entry.record), [
-      'ts', 'mission_id', 'repo', 'signal', 'evidence', 'confidence',
-    ]);
-  }
-});
-
-test('missing CI evidence does not masquerade as a no-rerun delegation signal', async () => {
-  const appended = [];
-  const fixture = harness({
-    prState: 'closed',
-    merged: true,
-    appendDemand: (file, record) => appended.push({file, record: structuredClone(record)}),
-    demandDir: '/tmp/factory-demand-test',
-    attestor: async () => ({found: false}),
-    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
-      status_url: `https://example.test/${item.mission_id}/publication.json`,
-    }])),
-  });
-  fixture.github.getCommitStatus = async () => ({found: false});
-
-  await reconcilePublicationBatch(fixture);
-
-  assert.equal(appended.some((entry) => entry.record.signal === 'merged_without_ci_rerun'), false);
-});
-
-test('demand append failures remain non-blocking reconciliation telemetry', async () => {
-  const fixture = harness({
-    prState: 'closed',
-    merged: true,
-    appendDemand: () => { throw new Error('disk unavailable'); },
-    attestor: async () => ({found: false}),
-    statusPublisher: async (items) => Object.fromEntries(items.map((item) => [item.mission_id, {
-      status_url: `https://example.test/${item.mission_id}/publication.json`,
-    }])),
-  });
-  const result = await reconcilePublicationBatch(fixture);
-  assert.equal(result.results[0].pr_state, 'MERGED');
-  assert.ok(result.results[0].demand_errors.every((error) => error === 'disk unavailable'));
 });

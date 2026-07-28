@@ -1,16 +1,8 @@
-import {appendFileSync, mkdirSync} from 'node:fs';
-import path from 'node:path';
-
 import {receiptUrlFor} from './receipt-publisher.mjs';
 
 const RECONCILIATION_PRIORITY = 'reconciliation';
 const DEFAULT_ATTESTATION_REPOSITORY = 'northset-oss/verification-pilot';
 const MAINTAINER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
-
-function appendDemandRecord(filePath, object) {
-  mkdirSync(path.dirname(filePath), {recursive: true});
-  appendFileSync(filePath, `${JSON.stringify(object)}\n`);
-}
 
 function requiredMethod(value, name, label) {
   if (typeof value?.[name] !== 'function') throw new TypeError(`${label}.${name} is required`);
@@ -200,8 +192,6 @@ export async function reconcilePublicationBatch({
   attestationRepository = DEFAULT_ATTESTATION_REPOSITORY,
   limit = 30,
   now = () => new Date(),
-  demandDir = 'runs/demand',
-  appendDemand = appendDemandRecord,
 } = {}) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
     throw new TypeError('reconciliation limit must be an integer from 1 through 1000');
@@ -212,7 +202,6 @@ export async function reconcilePublicationBatch({
   requiredMethod(db, 'savePublication', 'db');
   const updateTaskState = requiredMethod(db, 'updateTaskState', 'db');
   const recordObservation = requiredMethod(db, 'recordPublicationObservation', 'db');
-  const recordVerificationProspect = requiredMethod(db, 'recordVerificationProspect', 'db');
   const getPullRequest = requiredMethod(github, 'getPullRequest', 'github');
   const getPullRequestFollowUp = requiredMethod(github, 'getPullRequestFollowUp', 'github');
   const getCommitStatus = requiredMethod(github, 'getCommitStatus', 'github');
@@ -222,7 +211,6 @@ export async function reconcilePublicationBatch({
   if (typeof safety?.request !== 'function') throw new TypeError('safety.request is required');
   if (typeof safety?.releaseRepository !== 'function') throw new TypeError('safety.releaseRepository is required');
   if (typeof statusPublisher !== 'function') throw new TypeError('statusPublisher is required');
-  if (typeof appendDemand !== 'function') throw new TypeError('appendDemand must be a function');
   if (typeof attestationRepository !== 'string' || !attestationRepository.includes('/')) {
     throw new TypeError('attestationRepository must be owner/name');
   }
@@ -325,87 +313,6 @@ export async function reconcilePublicationBatch({
         (followUp?.latest_reviews_by_maintainer ?? []).some((review) => review.state === 'CHANGES_REQUESTED');
       const rejected = (prState === 'CLOSED' && publication.merged !== true) || changesRequested;
       const reasonCode = rejected ? reasonCodeFromFollowUp(followUp) : null;
-      const verificationProspect = ['ai_policy_concern', 'not_wanted'].includes(reasonCode);
-      const demandErrors = [];
-      const emitDemand = (file, record) => {
-        try { appendDemand(file, record); }
-        catch (error) { demandErrors.push(message(error)); }
-      };
-      if (verificationProspect) {
-        await recordVerificationProspect({
-          repository,
-          owner: repository.split('/')[0],
-          reasonCode,
-          missionId,
-          observedAt: observed,
-        });
-      }
-
-      if (observation.repository_released) {
-        const verification = manifest?.verification ?? {};
-        const declaredCheckPassed = verification.ok === true;
-        const explicitShadow = manifest?.shadow_acceptance ?? null;
-        const wouldRelease = typeof explicitShadow?.would_release === 'boolean'
-          ? explicitShadow.would_release : null;
-        const bothSides = ['yes', 'no', 'unknown'].includes(explicitShadow?.both_sides_would_accept)
-          ? explicitShadow.both_sides_would_accept : 'unknown';
-        emitDemand(path.join(demandDir, 'shadow_acceptance.jsonl'), {
-          ts: observed,
-          mission_id: missionId,
-          repo: repository,
-          declared_check_passed: declaredCheckPassed,
-          would_release: wouldRelease,
-          both_sides_would_accept: bothSides,
-          human_override: explicitShadow?.human_override === true,
-          reason: typeof explicitShadow?.reason === 'string' && explicitShadow.reason.trim()
-            ? explicitShadow.reason.trim()
-            : 'not_assessed: no pre-agreed payment terms and counterparty responses were recorded',
-        });
-        if (publication.merged === true) {
-          const receiptAvailableBy = publicationBefore.submitted_at ?? null;
-          const receiptAt = Date.parse(receiptAvailableBy ?? '');
-          const ciAt = Date.parse(commitStatus?.updated_at ?? '');
-          const mergedAt = Date.parse(pr.merged_at ?? pr.closed_at ?? observed);
-          const noCiRerun = commitStatus?.found !== false && Number.isFinite(ciAt) &&
-            Number.isFinite(receiptAt) && ciAt <= receiptAt;
-          if (noCiRerun) {
-            emitDemand(path.join(demandDir, 'proto_signals.jsonl'), {
-              ts: observed,
-              mission_id: missionId,
-              repo: repository,
-              signal: 'merged_without_ci_rerun',
-              evidence: {
-                ci_found: commitStatus?.found !== false,
-                ci_updated_at: commitStatus?.updated_at ?? null,
-                receipt_available_by: receiptAvailableBy,
-              },
-              confidence: 'low',
-            });
-          }
-          const followUpText = maintainerText(followUp);
-          if (/\b(?:receipt|verification proof)\b|verification-pilot\/receipts\//i.test(followUpText)) {
-            emitDemand(path.join(demandDir, 'proto_signals.jsonl'), {
-              ts: observed,
-              mission_id: missionId,
-              repo: repository,
-              signal: 'maintainer_cited_receipt',
-              evidence: followUpText.slice(0, 500),
-              confidence: 'high',
-            });
-          }
-          if (Number.isFinite(receiptAt) && Number.isFinite(mergedAt) &&
-              mergedAt >= receiptAt && mergedAt - receiptAt <= 24 * 60 * 60_000) {
-            emitDemand(path.join(demandDir, 'proto_signals.jsonl'), {
-              ts: observed,
-              mission_id: missionId,
-              repo: repository,
-              signal: 'fast_merge_after_receipt',
-              evidence: {receipt_available_by: receiptAvailableBy, merged_at: pr.merged_at ?? observed},
-              confidence: 'med',
-            });
-          }
-        }
-      }
 
       if (publication.attestation_state !== 'RECEIPT_ATTESTED') {
         try {
@@ -472,8 +379,6 @@ export async function reconcilePublicationBatch({
         follow_up: followUp,
         follow_up_error: followUpError,
         reason_code: reasonCode,
-        verification_prospect: verificationProspect,
-        demand_errors: demandErrors,
       });
     } catch (error) {
       if (isPaused(error)) throw error;
