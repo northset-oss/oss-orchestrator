@@ -632,8 +632,6 @@ function statusFor(item) {
   if (merged !== (item.pr_state === 'MERGED')) {
     throw new TypeError(`${missionId} merged state is inconsistent`);
   }
-  const ciState = item.ci_state ?? null;
-  if (ciState !== null && !nonblank(ciState)) throw new TypeError(`${missionId} ci_state is invalid`);
   const prHeadOid = validOid(item.pr_head_oid ?? commitOid, `${missionId} pr_head_oid`);
   const mergeCommitOid = item.merge_commit_oid ?? null;
   if (mergeCommitOid !== null) validOid(mergeCommitOid, `${missionId} merge_commit_oid`);
@@ -654,7 +652,6 @@ function statusFor(item) {
     pr_number: prNumber,
     pr_state: item.pr_state,
     merged,
-    ci_state: ciState,
     attestation_state: item.attestation_state,
     attestation_url: attestationUrl,
     observed_at: item.observed_at,

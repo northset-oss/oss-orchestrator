@@ -369,7 +369,7 @@ test('receipt status reconciliation uses one non-force batch push, exact readbac
     assert.equal(status.pr_number, 100 + index);
     assert.equal(status.pr_state, index === 0 ? 'OPEN' : 'MERGED');
     assert.equal(status.merged, index === 1);
-    assert.equal(status.ci_state, 'SUCCESS');
+    assert.equal(status.ci_state, undefined);
     assert.equal(status.attestation_state,
       index === 0 ? 'ATTESTATION_PENDING' : 'RECEIPT_ATTESTED');
     assert.equal(published[entry.mission_id].status_url,
@@ -390,7 +390,7 @@ test('receipt status reconciliation uses one non-force batch push, exact readbac
   const updatedStatus = JSON.parse(await remoteBytes(bare,
     `receipts/M-1000/${first.commit_oid}/publication.json`));
   assert.equal(updatedStatus.pr_state, 'CLOSED');
-  assert.equal(updatedStatus.ci_state, 'FAILURE');
+  assert.equal(updatedStatus.ci_state, undefined);
   for (const [index, relativePath] of proofPaths.entries()) {
     assert.deepEqual(await remoteBytes(bare, relativePath), beforeProofs[index]);
   }

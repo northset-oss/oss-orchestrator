@@ -48,7 +48,6 @@ function statusFacts(publication) {
     pr_head_oid: publication.pr_head_oid ?? null,
     pr_state: publication.pr_state ?? null,
     merged: publication.merged === true,
-    ci_state: publication.ci_state ?? null,
     attestation_state: publication.attestation_state ?? null,
     attestation_url: publication.attestation_url ?? null,
   });
@@ -182,7 +181,6 @@ function statusItem(publication, observed, mergeCommitOid = null) {
     pr_url: publication.pr_url,
     pr_state: publication.pr_state,
     merged: publication.merged === true,
-    ci_state: publication.ci_state ?? null,
     attestation_state: publication.attestation_state,
     attestation_url: publication.attestation_url ?? null,
     observed_at: observed,
