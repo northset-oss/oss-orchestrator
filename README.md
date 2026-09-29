@@ -1,5 +1,8 @@
 # Northset OSS contribution factory
 
+> **Retired on July 28, 2026. Do not run.** This factory no longer opens pull requests or
+> publishes receipts, and this repository is kept only as a record.
+
 This repository runs an always-on, Node-only preparation factory. Local and reversible work is
 autonomous. Opening upstream pull requests is the single human-authorized boundary: an operator
 reviews an immutable READY board, approves exact mission IDs, and explicitly starts the paced
